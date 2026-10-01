@@ -123,9 +123,49 @@ payflow query -l ./ledger.json
 每条退款可追溯原结算（`settlement_id`），并记录退回的账户、资产、金额、
 手续费、退款总额与原因。
 
+### reconcile — 离线流水对账
+
+输入为 JSON，`entries` 是**有序**的流水列表，每条用 `kind` 区分 `payment`
+与 `refund`，`id` 是对应的付款或退款编号；退款还须提供 `settlement_id`
+（原付款编号）。付款与退款编号分别匹配，同名也不混为一笔。
+
+```bash
+payflow reconcile -l ./ledger.json <<'JSON'
+{
+  "entries": [
+    {"kind":"payment","id":"p1","account":"aa-1","asset":"usdc","amount":1500,"fee":4,"charged":1504},
+    {"kind":"refund","id":"r1","settlement_id":"p1","account":"aa-1","asset":"usdc","amount":1500,"fee":4,"charged":1504}
+  ]
+}
+JSON
+```
+
+报告逐条给出四种结果，保持输入顺序：
+
+- `matched`：账户、资产及三个金额均与账本一致（退款还核对原付款编号）；
+- `field_mismatch`：找到账本记录但字段不符，列出每个不同字段及账本值、流水值；
+- `missing_in_ledger`：账本中无对应成功记录；
+- `duplicate`：同类型同编号出现多次，整组标为重复并附全部输入位置，
+  不判断字段差异，该账本记录也不列为缺失。
+
+只核对成功记录：已退款的付款仍核对原扣款，退款单独核对。账本中有但流水
+未覆盖的记录另列缺失，先按付款成功顺序，再按退款成功顺序；所有能找到
+账本记录的结果都带原付款编号和相关结算、退款记录。
+
+同时按账户、资产排序列出账本与流水各自的扣款合计、退款合计、净扣款及
+净扣款差额（方向为流水减账本）。流水侧包括重复项和账本外的项；不同资产
+不相加，总额相等也不取消逐笔差异。汇总金额用十进制整数字符串，累计超过
+int64 仍精确。报告给出本次所见付款、退款的最大成功序号，空历史为零。
+
+流水编号、账户、资产和退款原付款编号不得为空，三个金额均须提供且为
+int64 整数，`amount`、`charged` 为正，`fee` 非负。字段缺失、类型不符、
+未知 kind、数值越界或非法 JSON 时整次返回 `invalid_parameter`，退出码 1，
+不输出部分报告；有效输入有差异仍正常输出并退出 0。空列表报告全部账本
+记录缺失。对账不改变余额、历史或账本文件，兼容旧版无退款账本。
+
 ### 标志与退出码
 
-- `-l, --ledger <path>`：账本路径（init/submit/refund/query 必需）；
+- `-l, --ledger <path>`：账本路径（init/submit/refund/query/reconcile 必需）；
   `-f, --file <path>`：从文件读 JSON 输入（缺省读标准输入）。
 - 成功退出码 0；批次级错误（如非法费率、账本不存在/损坏/已存在）退出码 1，
   stderr 输出 `{"error":{"kind":...,"message":...}}`。批次内逐项失败仍属正常结果。

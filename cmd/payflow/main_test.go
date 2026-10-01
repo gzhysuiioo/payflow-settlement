@@ -312,3 +312,190 @@ func TestCLIHelpListsRefund(t *testing.T) {
 		t.Fatalf("help does not mention refund:\n%s", r.out)
 	}
 }
+
+func TestCLIReconcile(t *testing.T) {
+	ledgerPath := t.TempDir() + "/ledger.json"
+
+	if r := runCLIWith(t, []string{"init", "-l", ledgerPath},
+		`{"balances":[{"account":"aa-1","asset":"usdc","balance":2000}]}`); r.code != 0 {
+		t.Fatalf("init: %s", r.err)
+	}
+	batch := `{"fee_bps":30,"intents":[
+	  {"id":"p1","account":"aa-1","paymaster":"pm","asset":"usdc","amount":1500,"nonce":1},
+	  {"id":"p2","account":"aa-1","asset":"usdc","amount":900}
+	]}`
+	if r := runCLIWith(t, []string{"submit", "-l", ledgerPath}, batch); r.code != 0 {
+		t.Fatalf("submit: %s", r.err)
+	}
+	if r := runCLIWith(t, []string{"refund", "-l", ledgerPath},
+		`{"refunds":[{"id":"r1","settlement_id":"p1","reason":"cancel"}]}`); r.code != 0 {
+		t.Fatalf("refund: %s", r.err)
+	}
+
+	// 正常对账：匹配、字段不符、账本不存在、重复四种结果，退出码 0。
+	stmt := `{"entries":[
+	  {"kind":"payment","id":"p1","account":"aa-1","asset":"usdc","amount":1500,"fee":4,"charged":1504},
+	  {"kind":"payment","id":"p2","account":"aa-1","asset":"usdc","amount":900,"fee":2,"charged":902},
+	  {"kind":"payment","id":"ghost","account":"aa-1","asset":"usdc","amount":1,"fee":0,"charged":1},
+	  {"kind":"payment","id":"p1","account":"aa-1","asset":"usdc","amount":1500,"fee":4,"charged":1504},
+	  {"kind":"refund","id":"r1","settlement_id":"p1","account":"aa-1","asset":"usdc","amount":1500,"fee":4,"charged":1504}
+	]}`
+	r := runCLIWith(t, []string{"reconcile", "-l", ledgerPath}, stmt)
+	if r.code != 0 {
+		t.Fatalf("reconcile code=%d err=%s", r.code, r.err)
+	}
+	var rep struct {
+		Entries []struct {
+			Kind   string `json:"kind"`
+			ID     string `json:"id"`
+			Status string `json:"status"`
+		} `json:"entries"`
+		Missing []struct {
+			Kind string `json:"kind"`
+			ID   string `json:"id"`
+		} `json:"missing"`
+	}
+	if err := json.Unmarshal([]byte(r.out), &rep); err != nil {
+		t.Fatal(err)
+	}
+	wantStatuses := []string{"duplicate", "missing_in_ledger", "missing_in_ledger", "duplicate", "matched"}
+	if len(rep.Entries) != len(wantStatuses) {
+		t.Fatalf("entries=%d want %d: %s", len(rep.Entries), len(wantStatuses), r.out)
+	}
+	for i, want := range wantStatuses {
+		if rep.Entries[i].Status != want {
+			t.Fatalf("entry %d status=%s want %s", i, rep.Entries[i].Status, want)
+		}
+	}
+	// p2 余额不足从未成功，不在缺失列表。
+	if len(rep.Missing) != 0 {
+		t.Fatalf("missing=%+v want empty (p2 never succeeded)", rep.Missing)
+	}
+
+	// 空列表：报告全部账本记录缺失。
+	r = runCLIWith(t, []string{"reconcile", "-l", ledgerPath}, `{"entries":[]}`)
+	if r.code != 0 {
+		t.Fatalf("empty reconcile code=%d err=%s", r.code, r.err)
+	}
+	if err := json.Unmarshal([]byte(r.out), &rep); err != nil {
+		t.Fatal(err)
+	}
+	if len(rep.Missing) != 2 {
+		t.Fatalf("empty statement missing=%+v want 2 (p1, r1)", rep.Missing)
+	}
+	if rep.Missing[0].ID != "p1" || rep.Missing[1].ID != "r1" {
+		t.Fatalf("missing order=%+v want p1 then r1", rep.Missing)
+	}
+
+	// 字段不符：列出差异。
+	r = runCLIWith(t, []string{"reconcile", "-l", ledgerPath},
+		`{"entries":[{"kind":"payment","id":"p1","account":"aa-1","asset":"usdc","amount":1501,"fee":4,"charged":1505}]}`)
+	if r.code != 0 {
+		t.Fatalf("mismatch code=%d err=%s", r.code, r.err)
+	}
+	var mismatch struct {
+		Entries []struct {
+			Status string `json:"status"`
+			Fields []struct {
+				Field     string `json:"field"`
+				Ledger    any    `json:"ledger"`
+				Statement any    `json:"statement"`
+			} `json:"fields"`
+		} `json:"entries"`
+	}
+	if err := json.Unmarshal([]byte(r.out), &mismatch); err != nil {
+		t.Fatal(err)
+	}
+	if mismatch.Entries[0].Status != "field_mismatch" {
+		t.Fatalf("status=%s want field_mismatch", mismatch.Entries[0].Status)
+	}
+	if len(mismatch.Entries[0].Fields) != 2 {
+		t.Fatalf("fields=%+v want amount and charged", mismatch.Entries[0].Fields)
+	}
+
+	// 非法 JSON：invalid_parameter，退出码 1。
+	r = runCLIWith(t, []string{"reconcile", "-l", ledgerPath}, `{bad`)
+	if r.code != 1 || decodeOut(t, r.err)["error"].(map[string]any)["kind"] != "invalid_parameter" {
+		t.Fatalf("bad json: code=%d err=%s", r.code, r.err)
+	}
+
+	// 空字段：invalid_parameter。
+	r = runCLIWith(t, []string{"reconcile", "-l", ledgerPath},
+		`{"entries":[{"kind":"payment","id":"","account":"aa-1","asset":"usdc","amount":1,"fee":0,"charged":1}]}`)
+	if r.code != 1 || decodeOut(t, r.err)["error"].(map[string]any)["kind"] != "invalid_parameter" {
+		t.Fatalf("empty id: code=%d err=%s", r.code, r.err)
+	}
+
+	// 未知 kind：invalid_parameter。
+	r = runCLIWith(t, []string{"reconcile", "-l", ledgerPath},
+		`{"entries":[{"kind":"transfer","id":"t","account":"aa-1","asset":"usdc","amount":1,"fee":0,"charged":1}]}`)
+	if r.code != 1 || decodeOut(t, r.err)["error"].(map[string]any)["kind"] != "invalid_parameter" {
+		t.Fatalf("unknown kind: code=%d err=%s", r.code, r.err)
+	}
+
+	// 金额为字符串（类型不符）：invalid_parameter。
+	r = runCLIWith(t, []string{"reconcile", "-l", ledgerPath},
+		`{"entries":[{"kind":"payment","id":"p1","account":"aa-1","asset":"usdc","amount":"1500","fee":4,"charged":1504}]}`)
+	if r.code != 1 || decodeOut(t, r.err)["error"].(map[string]any)["kind"] != "invalid_parameter" {
+		t.Fatalf("string amount: code=%d err=%s", r.code, r.err)
+	}
+
+	// 缺少 -l。
+	r = runCLIWith(t, []string{"reconcile"}, `{"entries":[]}`)
+	if r.code != 1 || decodeOut(t, r.err)["error"].(map[string]any)["kind"] != "invalid_parameter" {
+		t.Fatalf("reconcile without -l: %+v", r)
+	}
+
+	// 未初始化账本。
+	missing := t.TempDir() + "/nope.json"
+	if r = runCLIWith(t, []string{"reconcile", "-l", missing}, `{"entries":[]}`); r.code != 1 ||
+		decodeOut(t, r.err)["error"].(map[string]any)["kind"] != "ledger_not_initialized" {
+		t.Fatalf("reconcile on missing ledger: %+v", r)
+	}
+}
+
+func TestCLIReconcileFileInput(t *testing.T) {
+	ledgerPath := t.TempDir() + "/ledger.json"
+	if r := runCLIWith(t, []string{"init", "-l", ledgerPath},
+		`{"balances":[{"account":"aa-1","asset":"usdc","balance":1000}]}`); r.code != 0 {
+		t.Fatalf("init: %s", r.err)
+	}
+	if r := runCLIWith(t, []string{"submit", "-l", ledgerPath},
+		`{"fee_bps":0,"intents":[{"id":"p1","account":"aa-1","asset":"usdc","amount":100}]}`); r.code != 0 {
+		t.Fatalf("submit: %s", r.err)
+	}
+
+	// 通过 -f 从文件读取流水。
+	stmtPath := t.TempDir() + "/stmt.json"
+	if err := os.WriteFile(stmtPath, []byte(`{"entries":[
+	  {"kind":"payment","id":"p1","account":"aa-1","asset":"usdc","amount":100,"fee":0,"charged":100}
+	]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	r := runCLIWith(t, []string{"reconcile", "-l", ledgerPath, "-f", stmtPath}, "")
+	if r.code != 0 {
+		t.Fatalf("reconcile -f code=%d err=%s", r.code, r.err)
+	}
+	var rep struct {
+		Entries []struct {
+			Status string `json:"status"`
+		} `json:"entries"`
+	}
+	if err := json.Unmarshal([]byte(r.out), &rep); err != nil {
+		t.Fatal(err)
+	}
+	if rep.Entries[0].Status != "matched" {
+		t.Fatalf("file input reconcile: %+v", rep.Entries[0])
+	}
+}
+
+func TestCLIReconcileCorruptLedger(t *testing.T) {
+	path := t.TempDir() + "/corrupt.json"
+	if err := os.WriteFile(path, []byte(`{"version":1,`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	r := runCLIWith(t, []string{"reconcile", "-l", path}, `{"entries":[]}`)
+	if r.code != 1 || decodeOut(t, r.err)["error"].(map[string]any)["kind"] != "corrupt_ledger" {
+		t.Fatalf("reconcile on corrupt: code=%d err=%s", r.code, r.err)
+	}
+}

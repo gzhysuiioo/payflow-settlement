@@ -39,6 +39,8 @@ func runCLI(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return cmdRefund(args[1:], stdin, stdout, stderr)
 	case "query":
 		return cmdQuery(args[1:], stdout, stderr)
+	case "reconcile":
+		return cmdReconcile(args[1:], stdin, stdout, stderr)
 	default:
 		fmt.Fprintf(stderr, "unknown command %q\n", args[0])
 		usage(stderr)
@@ -50,17 +52,18 @@ func usage(w io.Writer) {
 	fmt.Fprintln(w, "usage: payflow <command> [flags]")
 	fmt.Fprintln(w, "")
 	fmt.Fprintln(w, "commands:")
-	fmt.Fprintln(w, "  init     initialize a ledger with starting balances")
-	fmt.Fprintln(w, "  submit   submit a JSON payment batch against a ledger")
-	fmt.Fprintln(w, "  refund   submit a JSON full-refund batch against a ledger")
-	fmt.Fprintln(w, "  query    print balances, settlement and refund records of a ledger")
-	fmt.Fprintln(w, "  demo     run the in-memory settlement demo")
-	fmt.Fprintln(w, "  version  print version")
-	fmt.Fprintln(w, "  help     show this help")
+	fmt.Fprintln(w, "  init       initialize a ledger with starting balances")
+	fmt.Fprintln(w, "  submit     submit a JSON payment batch against a ledger")
+	fmt.Fprintln(w, "  refund     submit a JSON full-refund batch against a ledger")
+	fmt.Fprintln(w, "  query      print balances, settlement and refund records of a ledger")
+	fmt.Fprintln(w, "  reconcile  reconcile a JSON statement against a ledger")
+	fmt.Fprintln(w, "  demo       run the in-memory settlement demo")
+	fmt.Fprintln(w, "  version    print version")
+	fmt.Fprintln(w, "  help       show this help")
 	fmt.Fprintln(w, "")
-	fmt.Fprintln(w, "ledger flags (init/submit/refund/query):")
+	fmt.Fprintln(w, "ledger flags (init/submit/refund/query/reconcile):")
 	fmt.Fprintln(w, "  -l, --ledger <path>   ledger file path (required)")
-	fmt.Fprintln(w, "  -f, --file <path>     JSON input file (init/submit/refund; default: stdin)")
+	fmt.Fprintln(w, "  -f, --file <path>     JSON input file (init/submit/refund/reconcile; default: stdin)")
 }
 
 // initRequest 是 init 的输入：{"balances":[...]}。
@@ -237,6 +240,44 @@ func cmdQuery(args []string, stdout, stderr io.Writer) int {
 		return failWithError(stderr, err)
 	}
 	writeJSON(stdout, snap)
+	return 0
+}
+
+func cmdReconcile(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
+	fs, ledgerPath, inputFile := ledgerFlagSet("reconcile")
+	if err := fs.Parse(args); err != nil {
+		return failEnvelope(stderr, payflow.ErrInvalid, err.Error())
+	}
+	if *ledgerPath == "" {
+		return failEnvelope(stderr, payflow.ErrInvalid, "reconcile requires --ledger <path>")
+	}
+	raw, err := readInput(*inputFile, stdin)
+	if err != nil {
+		return failEnvelope(stderr, payflow.ErrStorage, "read input: "+err.Error())
+	}
+	var req struct {
+		Entries []payflow.StatementEntry `json:"entries"`
+	}
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	if err := dec.Decode(&req); err != nil {
+		return failEnvelope(stderr, payflow.ErrInvalid, "parse reconcile JSON: "+err.Error())
+	}
+	if err := requireEOF(dec, "reconcile"); err != nil {
+		return failEnvelope(stderr, payflow.ErrInvalid, err.Error())
+	}
+
+	l, err := payflow.Open(*ledgerPath)
+	if err != nil {
+		return failWithError(stderr, err)
+	}
+	defer l.Close()
+
+	// 即使流水与账本存在差异，也是正常的对账结果，退出码仍为 0。
+	report, err := l.ReconcileStatement(req.Entries)
+	if err != nil {
+		return failWithError(stderr, err)
+	}
+	writeJSON(stdout, report)
 	return 0
 }
 
