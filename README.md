@@ -123,12 +123,65 @@ payflow query -l ./ledger.json
 每条退款可追溯原结算（`settlement_id`），并记录退回的账户、资产、金额、
 手续费、退款总额与原因。
 
+### reconcile — 离线流水对账
+
+把外部渠道的有序流水与指定账本逐笔核对。**只读**：不改变余额、历史或账本文件，
+与同一进程内并发的 submit/refund 串行，整份报告对应同一个完整账本状态。
+输入沿用 `-l/--ledger` 与 `-f/--file`（缺省读标准输入）。
+
+```bash
+payflow reconcile -l ./ledger.json <<'JSON'
+{
+  "entries": [
+    {"kind":"payment","id":"p1","account":"aa-1","asset":"usdc","amount":1500,"fee":4,"charged":1504},
+    {"kind":"refund","id":"r1","account":"aa-1","asset":"usdc","amount":1500,"fee":4,"charged":1504,"settlement_id":"p1"}
+  ]
+}
+JSON
+```
+
+- `entries` 是**有序**列表；`kind` 为 `payment` 或 `refund`，`id` 是对应的付款
+  或退款编号。付款编号与退款编号**分别匹配**，字符串相同也不会混为一笔。
+- 每条提供 `account`、`asset`、`amount`、`fee`、`charged`；退款还必须提供
+  `settlement_id`（原付款编号）。编号、账户、资产与退款原付款编号不得为空；
+  三个金额都必须提供且为 int64 整数，`amount`、`charged` 为正，`fee` 非负。
+- 只核对成功记录：已退款的付款仍按原扣款核对，退款单独核对。
+
+`results` 逐条对应输入顺序，四种状态：
+
+- `matched`：命中同类型同编号的成功记录，账户、资产、三个金额
+  （退款再加原付款编号）全部一致；
+- `field_mismatch`：命中记录但有字段不同，`diffs` 列出**每个**不同字段的
+  账本值与流水值；
+- `missing_in_ledger`：账本没有该编号的成功记录；
+- `duplicate`：同一类型和编号在输入中出现多次时，**整组**全部标为重复并附
+  全部输入位置 `positions`，不再判断字段差异，对应账本记录也不列为缺失。
+
+`missing_payments` / `missing_refunds` 另列账本中没有任何对应流水的成功记录
+（先按付款成功顺序，再按退款成功顺序）；空列表意味着全部账本记录缺失。
+所有能定位到账本记录的结果（匹配、字段不符、重复、缺失列表）都携带记录详情
+及关联：付款带 `refund_id`（若已退款），退款带 `settlement_id`。
+
+`totals` 按账户、资产排序，分别给出账本与流水的扣款合计、退款合计、净扣款
+（扣款减退款）；`net_diff` 给出逐组合的净扣款差额，方向为**流水减账本**。
+流水侧包含重复项与账本外的项；不同资产各自一行，绝不相加，总额相等也不能
+抵消逐笔差异。所有汇总金额都是十进制整数字符串，累计超过 int64 仍精确。
+`max_payment_seq` / `max_refund_seq` 是本次所见付款、退款的最大成功序号，
+空历史为零。
+
+字段缺失、类型不符、未知 kind、数值越界或非法 JSON 时，整次返回
+`invalid_parameter`、退出码 1，**不输出部分报告**；输入有效但有差异仍正常
+输出报告并退出 0。账本不存在（`ledger_not_initialized`）、损坏
+（`corrupt_ledger`）与输入文件读取失败（`storage_error`）沿用现有分类。
+兼容旧版无退款账本；旧的 `payflow.Execute` / `payflow.Reconcile` API 保持不变。
+
 ### 标志与退出码
 
-- `-l, --ledger <path>`：账本路径（init/submit/refund/query 必需）；
+- `-l, --ledger <path>`：账本路径（init/submit/refund/query/reconcile 必需）；
   `-f, --file <path>`：从文件读 JSON 输入（缺省读标准输入）。
-- 成功退出码 0；批次级错误（如非法费率、账本不存在/损坏/已存在）退出码 1，
-  stderr 输出 `{"error":{"kind":...,"message":...}}`。批次内逐项失败仍属正常结果。
+- 成功退出码 0；批次级错误（如非法费率、账本不存在/损坏/已存在、对账输入非法）
+  退出码 1，stderr 输出 `{"error":{"kind":...,"message":...}}`。批次内逐项失败、
+  对账发现差异仍属正常结果。
 
 ### 旧版账本兼容
 

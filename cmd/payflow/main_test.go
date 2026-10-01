@@ -312,3 +312,329 @@ func TestCLIHelpListsRefund(t *testing.T) {
 		t.Fatalf("help does not mention refund:\n%s", r.out)
 	}
 }
+
+func setupReconLedger(t *testing.T) string {
+	t.Helper()
+	ledgerPath := t.TempDir() + "/ledger.json"
+	if r := runCLIWith(t, []string{"init", "-l", ledgerPath},
+		`{"balances":[{"account":"aa-1","asset":"usdc","balance":100000000},{"account":"aa-2","asset":"eth","balance":100}]}`); r.code != 0 {
+		t.Fatalf("init: %s", r.err)
+	}
+	// 30bps：p1 amount 1000 -> fee 3, charged 1003；p2 amount 10 -> fee 0, charged 10。
+	if r := runCLIWith(t, []string{"submit", "-l", ledgerPath}, `{"fee_bps":30,"intents":[
+	  {"id":"p1","account":"aa-1","paymaster":"pm","asset":"usdc","amount":1000,"nonce":1},
+	  {"id":"p2","account":"aa-2","asset":"eth","amount":10}
+	]}`); r.code != 0 {
+		t.Fatalf("submit: %s", r.err)
+	}
+	return ledgerPath
+}
+
+func TestCLIReconcileHappyPath(t *testing.T) {
+	ledgerPath := t.TempDir() + "/ledger.json"
+	r := runCLIWith(t, []string{"init", "-l", ledgerPath},
+		`{"balances":[{"account":"aa-1","asset":"usdc","balance":100000000}]}`)
+	if r.code != 0 {
+		t.Fatalf("init: %s", r.err)
+	}
+	r = runCLIWith(t, []string{"submit", "-l", ledgerPath}, `{"fee_bps":30,"intents":[
+	  {"id":"p1","account":"aa-1","paymaster":"pm","asset":"usdc","amount":1000,"nonce":1}
+	]}`)
+	if r.code != 0 {
+		t.Fatalf("submit: %s", r.err)
+	}
+	r = runCLIWith(t, []string{"refund", "-l", ledgerPath},
+		`{"refunds":[{"id":"r1","settlement_id":"p1","reason":"cancel"}]}`)
+	if r.code != 0 {
+		t.Fatalf("refund: %s", r.err)
+	}
+
+	body := `{"entries":[
+	  {"kind":"payment","id":"p1","account":"aa-1","asset":"usdc","amount":1000,"fee":3,"charged":1003},
+	  {"kind":"payment","id":"pX","account":"aa-1","asset":"usdc","amount":9,"fee":0,"charged":9},
+	  {"kind":"refund","id":"r1","account":"aa-1","asset":"usdc","amount":1000,"fee":3,"charged":1003,"settlement_id":"p1"}
+	]}`
+	r = runCLIWith(t, []string{"reconcile", "-l", ledgerPath}, body)
+	if r.code != 0 {
+		t.Fatalf("reconcile exits 0 even with differences: %s", r.err)
+	}
+	var rep struct {
+		Results []struct {
+			Index     int    `json:"index"`
+			Kind      string `json:"kind"`
+			ID        string `json:"id"`
+			Status    string `json:"status"`
+			Positions []int  `json:"positions"`
+			Diffs     []struct {
+				Field  string `json:"field"`
+				Ledger string `json:"ledger"`
+				Flow   string `json:"flow"`
+			} `json:"diffs"`
+			Record *struct {
+				SettlementID string `json:"settlement_id"`
+				RefundID     string `json:"refund_id"`
+			} `json:"record"`
+		} `json:"results"`
+		MissingPayments []map[string]any `json:"missing_payments"`
+		MissingRefunds  []map[string]any `json:"missing_refunds"`
+		MaxPaymentSeq   int64            `json:"max_payment_seq"`
+		MaxRefundSeq    int64            `json:"max_refund_seq"`
+		Totals          struct {
+			Ledger []struct {
+				Account       string `json:"account"`
+				Asset         string `json:"asset"`
+				ChargedTotal  string `json:"charged_total"`
+				RefundedTotal string `json:"refunded_total"`
+				NetCharged    string `json:"net_charged"`
+			} `json:"ledger"`
+			Flow []struct {
+				NetCharged string `json:"net_charged"`
+			} `json:"flow"`
+		} `json:"totals"`
+		NetDiff []struct {
+			NetChargedDiff string `json:"net_charged_diff"`
+		} `json:"net_diff"`
+	}
+	if err := json.Unmarshal([]byte(r.out), &rep); err != nil {
+		t.Fatalf("decode report: %v\n%s", err, r.out)
+	}
+	if len(rep.Results) != 3 {
+		t.Fatalf("want 3 results, got %d", len(rep.Results))
+	}
+	want := []string{"matched", "missing_in_ledger", "matched"}
+	for i, x := range rep.Results {
+		if x.Status != want[i] {
+			t.Fatalf("result %d = %s want %s", i, x.Status, want[i])
+		}
+		if x.Index != i {
+			t.Fatalf("result %d index=%d", i, x.Index)
+		}
+	}
+	// 命中账本的结果都带关联记录：p1 已退款带 refund_id；r1 带 settlement_id。
+	if rep.Results[0].Record == nil || rep.Results[0].Record.RefundID != "r1" {
+		t.Fatalf("p1 record link: %+v", rep.Results[0].Record)
+	}
+	if rep.Results[2].Record == nil || rep.Results[2].Record.SettlementID != "p1" {
+		t.Fatalf("r1 record link: %+v", rep.Results[2].Record)
+	}
+	// 全部账本记录都被覆盖，缺失列表为空。
+	if len(rep.MissingPayments) != 0 || len(rep.MissingRefunds) != 0 {
+		t.Fatalf("missing=%+v/%+v", rep.MissingPayments, rep.MissingRefunds)
+	}
+	if rep.MaxPaymentSeq != 1 || rep.MaxRefundSeq != 1 {
+		t.Fatalf("max seqs=%d/%d", rep.MaxPaymentSeq, rep.MaxRefundSeq)
+	}
+	// 账本侧 usdc 扣款 1003、退款 1003、净 0；流水侧净扣款 = 1003+9-1003 = 9；差额 +9。
+	if len(rep.Totals.Ledger) != 1 || rep.Totals.Ledger[0].ChargedTotal != "1003" ||
+		rep.Totals.Ledger[0].RefundedTotal != "1003" || rep.Totals.Ledger[0].NetCharged != "0" {
+		t.Fatalf("ledger totals=%+v", rep.Totals.Ledger)
+	}
+	if rep.Totals.Flow[0].NetCharged != "9" || rep.NetDiff[0].NetChargedDiff != "9" {
+		t.Fatalf("flow net=%s diff=%s", rep.Totals.Flow[0].NetCharged, rep.NetDiff[0].NetChargedDiff)
+	}
+}
+
+func TestCLIReconcileFieldMismatchAndDuplicate(t *testing.T) {
+	ledgerPath := setupReconLedger(t)
+	// p2 出现两次（fee 都故意报错）：整组 duplicate，不判差异，账本记录不列为缺失。
+	// rX 引用账本中不存在的退款编号。
+	body := `{"entries":[
+	  {"kind":"payment","id":"p1","account":"aa-1","asset":"usdc","amount":1000,"fee":9,"charged":1003},
+	  {"kind":"payment","id":"p2","account":"aa-2","asset":"eth","amount":10,"fee":5,"charged":99},
+	  {"kind":"payment","id":"p2","account":"aa-2","asset":"eth","amount":10,"fee":5,"charged":99},
+	  {"kind":"refund","id":"rX","account":"aa-1","asset":"usdc","amount":1,"fee":0,"charged":1,"settlement_id":"p1"}
+	]}`
+	r := runCLIWith(t, []string{"reconcile", "-l", ledgerPath}, body)
+	if r.code != 0 {
+		t.Fatalf("reconcile: %s", r.err)
+	}
+	var rep struct {
+		Results []struct {
+			Status    string `json:"status"`
+			Positions []int  `json:"positions"`
+			Diffs     []struct {
+				Field string `json:"field"`
+			} `json:"diffs"`
+		} `json:"results"`
+		MissingPayments []struct {
+			ID string `json:"id"`
+		} `json:"missing_payments"`
+		MissingRefunds []struct {
+			ID string `json:"id"`
+		} `json:"missing_refunds"`
+	}
+	if err := json.Unmarshal([]byte(r.out), &rep); err != nil {
+		t.Fatalf("decode: %v\n%s", err, r.out)
+	}
+	if rep.Results[0].Status != "field_mismatch" {
+		t.Fatalf("p1 status=%s", rep.Results[0].Status)
+	}
+	var fields []string
+	for _, d := range rep.Results[0].Diffs {
+		fields = append(fields, d.Field)
+	}
+	if strings.Join(fields, ",") != "fee" {
+		t.Fatalf("p1 diffs=%v", fields)
+	}
+	for _, i := range []int{1, 2} {
+		if rep.Results[i].Status != "duplicate" {
+			t.Fatalf("result %d status=%s", i, rep.Results[i].Status)
+		}
+		pos := rep.Results[i].Positions
+		if len(pos) != 2 || pos[0] != 1 || pos[1] != 2 {
+			t.Fatalf("result %d positions=%v", i, pos)
+		}
+		if len(rep.Results[i].Diffs) != 0 {
+			t.Fatalf("duplicate must not list diffs: %+v", rep.Results[i].Diffs)
+		}
+	}
+	if rep.Results[3].Status != "missing_in_ledger" {
+		t.Fatalf("rX status=%s", rep.Results[3].Status)
+	}
+	// p2 重复组抑制缺失；p1 已覆盖（字段不符也算覆盖）。账本无退款 -> 无缺失退款。
+	if len(rep.MissingPayments) != 0 {
+		t.Fatalf("missing payments=%+v", rep.MissingPayments)
+	}
+	if len(rep.MissingRefunds) != 0 {
+		t.Fatalf("missing refunds=%+v", rep.MissingRefunds)
+	}
+}
+
+func TestCLIReconcileEmptyListsEverythingMissing(t *testing.T) {
+	ledgerPath := setupReconLedger(t)
+	// 空列表：全部账本成功记录缺失，先付款（p1,p2）后退款（无）。
+	r := runCLIWith(t, []string{"reconcile", "-l", ledgerPath}, `{"entries":[]}`)
+	if r.code != 0 {
+		t.Fatalf("reconcile: %s", r.err)
+	}
+	var rep struct {
+		Results         []any `json:"results"`
+		MissingPayments []struct {
+			ID  string `json:"id"`
+			Seq int64  `json:"seq"`
+		} `json:"missing_payments"`
+		MissingRefunds []any `json:"missing_refunds"`
+		MaxPaymentSeq  int64 `json:"max_payment_seq"`
+		MaxRefundSeq   int64 `json:"max_refund_seq"`
+	}
+	if err := json.Unmarshal([]byte(r.out), &rep); err != nil {
+		t.Fatal(err)
+	}
+	if len(rep.Results) != 0 {
+		t.Fatalf("results=%v", rep.Results)
+	}
+	if len(rep.MissingPayments) != 2 || rep.MissingPayments[0].ID != "p1" || rep.MissingPayments[1].ID != "p2" {
+		t.Fatalf("missing payments=%+v", rep.MissingPayments)
+	}
+	if rep.MissingPayments[0].Seq != 1 || rep.MissingPayments[1].Seq != 2 {
+		t.Fatalf("missing seqs=%d,%d", rep.MissingPayments[0].Seq, rep.MissingPayments[1].Seq)
+	}
+	if len(rep.MissingRefunds) != 0 || rep.MaxPaymentSeq != 2 || rep.MaxRefundSeq != 0 {
+		t.Fatalf("refunds=%+v seqs=%d/%d", rep.MissingRefunds, rep.MaxPaymentSeq, rep.MaxRefundSeq)
+	}
+
+	// 空历史账本：最大序号为零。
+	emptyPath := t.TempDir() + "/empty.json"
+	if r := runCLIWith(t, []string{"init", "-l", emptyPath}, `{"balances":[]}`); r.code != 0 {
+		t.Fatalf("init empty: %s", r.err)
+	}
+	r = runCLIWith(t, []string{"reconcile", "-l", emptyPath}, `{"entries":[]}`)
+	if !strings.Contains(r.out, `"max_payment_seq": 0`) || !strings.Contains(r.out, `"max_refund_seq": 0`) {
+		t.Fatalf("empty history seqs not zero: %s", r.out)
+	}
+}
+
+func TestCLIReconcileInvalidInputNoPartialReport(t *testing.T) {
+	ledgerPath := setupReconLedger(t)
+	bad := []string{
+		`{not json`,
+		`{}`,
+		`{"entries":[{"kind":"wire","id":"x","account":"a","asset":"z","amount":1,"fee":0,"charged":1}]}`,
+		`{"entries":[{"kind":"payment","id":"x","account":"a","asset":"z","amount":0,"fee":0,"charged":1}]}`,
+		`{"entries":[{"kind":"payment","id":"x","account":"a","asset":"z","amount":1,"fee":-2,"charged":1}]}`,
+		`{"entries":[{"kind":"payment","id":"x","account":"a","asset":"z","amount":1,"fee":0}]}`,
+		`{"entries":[{"kind":"payment","id":"x","account":"","asset":"z","amount":1,"fee":0,"charged":1}]}`,
+		`{"entries":[{"kind":"refund","id":"x","account":"a","asset":"z","amount":1,"fee":0,"charged":1}]}`,
+		`{"entries":[{"kind":"payment","id":"x","account":"a","asset":"z","amount":1,"fee":0,"charged":99999999999999999999999}]}`,
+	}
+	for i, body := range bad {
+		r := runCLIWith(t, []string{"reconcile", "-l", ledgerPath}, body)
+		if r.code != 1 {
+			t.Fatalf("case %d: exit code=%d want 1", i, r.code)
+		}
+		if r.out != "" {
+			t.Fatalf("case %d: invalid input must print no partial report: %q", i, r.out)
+		}
+		if env := decodeOut(t, r.err); env["error"].(map[string]any)["kind"] != "invalid_parameter" {
+			t.Fatalf("case %d envelope=%s", i, r.err)
+		}
+	}
+
+	// 缺 -l、账本不存在、损坏沿用现有分类。
+	if r := runCLIWith(t, []string{"reconcile"}, `{"entries":[]}`); r.code != 1 ||
+		decodeOut(t, r.err)["error"].(map[string]any)["kind"] != "invalid_parameter" {
+		t.Fatalf("no -l: %+v", r)
+	}
+	missing := t.TempDir() + "/nope.json"
+	if r := runCLIWith(t, []string{"reconcile", "-l", missing}, `{"entries":[]}`); r.code != 1 ||
+		decodeOut(t, r.err)["error"].(map[string]any)["kind"] != "ledger_not_initialized" {
+		t.Fatalf("missing ledger: %+v", r)
+	}
+	corrupt := t.TempDir() + "/corrupt.json"
+	if err := os.WriteFile(corrupt, []byte(`{"version":1,`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if r := runCLIWith(t, []string{"reconcile", "-l", corrupt}, `{"entries":[]}`); r.code != 1 ||
+		decodeOut(t, r.err)["error"].(map[string]any)["kind"] != "corrupt_ledger" {
+		t.Fatalf("corrupt ledger: %+v", r)
+	}
+}
+
+func TestCLIReconcileFromFileFlag(t *testing.T) {
+	ledgerPath := setupReconLedger(t)
+	inputPath := t.TempDir() + "/flow.json"
+	if err := os.WriteFile(inputPath, []byte(`{"entries":[
+	  {"kind":"payment","id":"p1","account":"aa-1","asset":"usdc","amount":1000,"fee":3,"charged":1003}
+	]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// -f 读取文件，stdin 给空内容也不影响。
+	r := runCLIWith(t, []string{"reconcile", "-l", ledgerPath, "-f", inputPath}, "")
+	if r.code != 0 {
+		t.Fatalf("reconcile -f: %s", r.err)
+	}
+	if !strings.Contains(r.out, `"status": "matched"`) {
+		t.Fatalf("report=%s", r.out)
+	}
+	// 读取不存在的输入文件按存储错误分类。
+	r = runCLIWith(t, []string{"reconcile", "-l", ledgerPath, "-f", t.TempDir() + "/missing.json"}, "")
+	if r.code != 1 || decodeOut(t, r.err)["error"].(map[string]any)["kind"] != "storage_error" {
+		t.Fatalf("missing input file: %+v", r)
+	}
+}
+
+func TestCLIReconcileDoesNotModifyLedger(t *testing.T) {
+	ledgerPath := setupReconLedger(t)
+	before, err := os.ReadFile(ledgerPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := `{"entries":[{"kind":"payment","id":"zzz","account":"aa-1","asset":"zzz","amount":1,"fee":0,"charged":1}]}`
+	if r := runCLIWith(t, []string{"reconcile", "-l", ledgerPath}, body); r.code != 0 {
+		t.Fatalf("reconcile: %s", r.err)
+	}
+	after, err := os.ReadFile(ledgerPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatalf("ledger file changed by reconcile")
+	}
+}
+
+func TestCLIHelpListsReconcile(t *testing.T) {
+	r := runCLIWith(t, []string{"help"}, "")
+	if !strings.Contains(r.out, "reconcile") {
+		t.Fatalf("help does not mention reconcile:\n%s", r.out)
+	}
+}
