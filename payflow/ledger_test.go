@@ -511,7 +511,7 @@ func TestValidateAndReplayRejectsSemanticCorruption(t *testing.T) {
 	}
 	for name, tc := range bad {
 		t.Run(name, func(t *testing.T) {
-			if err := validateAndReplay(tc.initial, tc.final, tc.records); err == nil || KindOf(err) != ErrCorrupt {
+			if err := validateAndReplay(tc.initial, tc.final, tc.records, nil); err == nil || KindOf(err) != ErrCorrupt {
 				t.Fatalf("%s: want ErrCorrupt, got %v", name, err)
 			}
 		})
@@ -522,6 +522,7 @@ func TestValidateAndReplayRejectsSemanticCorruption(t *testing.T) {
 			map[balanceKey]int64{k: 1000},
 			map[balanceKey]int64{k: 400},
 			[]Record{good, func() Record { r := good; r.Seq = 2; return r }()},
+			nil,
 		)
 		if err == nil || KindOf(err) != ErrCorrupt {
 			t.Fatalf("want ErrCorrupt, got %v", err)
@@ -529,7 +530,7 @@ func TestValidateAndReplayRejectsSemanticCorruption(t *testing.T) {
 	})
 
 	// 健康状态必须通过。
-	if err := validateAndReplay(initial, final, []Record{good}); err != nil {
+	if err := validateAndReplay(initial, final, []Record{good}, nil); err != nil {
 		t.Fatalf("healthy state rejected: %v", err)
 	}
 }
@@ -735,5 +736,648 @@ func TestLegacyExecuteAndReconcile(t *testing.T) {
 		[]Settlement{{Intent: "x", Status: "settled"}},
 	); len(gaps) != 1 || gaps[0] != "missing" {
 		t.Fatalf("legacy reconcile gaps=%v", gaps)
+	}
+}
+
+// ===========================================================================
+// 退款（refund）测试
+// ===========================================================================
+
+func refundReq(id, sid, reason string) RefundRequest {
+	return RefundRequest{ID: id, SettlementID: sid, Reason: reason}
+}
+
+// 成功全额退款：charged（含手续费）退回原账户、原资产；原结算保持不变；
+// query 按退款成功顺序返回可追溯原结算的记录。
+func TestRefundFullAmountIncludingFee(t *testing.T) {
+	path := newTestLedger(t, []BalanceInit{{Account: "aa", Asset: "usdc", Balance: 1010}})
+	l := openOrFail(t, path)
+	res, _ := l.Submit(FeeBatch{FeeBps: 100, Intents: []PaymentIntent{
+		{ID: "p1", Account: "aa", Paymaster: "pm", Asset: "usdc", Amount: i64p(1000), Nonce: 1, State: "pending"},
+	}})
+	if res.Results[0].Status != StatusSettled {
+		t.Fatalf("settle: %+v", res.Results[0])
+	}
+	if bal, _ := l.Balance("aa", "usdc"); bal != 0 {
+		t.Fatalf("balance after settle=%d want 0", bal)
+	}
+
+	rr, err := l.Refund(RefundBatch{Refunds: []RefundRequest{refundReq("r1", "p1", "cancel")}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := rr.Results[0]
+	if got.Status != StatusRefundSuccess {
+		t.Fatalf("status=%s want refunded: %+v", got.Status, got)
+	}
+	if got.SettlementID != "p1" || got.Account != "aa" || got.Asset != "usdc" || got.Charged != 1010 {
+		t.Fatalf("refund result fields: %+v", got)
+	}
+	if got.Record == nil || got.Record.Fee != 10 || got.Record.Amount != 1000 ||
+		got.Record.AfterSeq != 1 || got.Record.Seq != 1 {
+		t.Fatalf("refund record: %+v", got.Record)
+	}
+	// 全额（含手续费）退回。
+	if bal, _ := l.Balance("aa", "usdc"); bal != 1010 {
+		t.Fatalf("balance after refund=%d want 1010", bal)
+	}
+
+	snap, _ := l.Query()
+	// 原结算记录及其编号、顺序保持不变。
+	if len(snap.Settlements) != 1 || snap.Settlements[0].ID != "p1" || snap.Settlements[0].Charged != 1010 {
+		t.Fatalf("original settlement altered: %+v", snap.Settlements)
+	}
+	if len(snap.Refunds) != 1 {
+		t.Fatalf("want 1 refund, got %+v", snap.Refunds)
+	}
+	rf := snap.Refunds[0]
+	if rf.ID != "r1" || rf.SettlementID != "p1" || rf.Reason != "cancel" ||
+		rf.Account != "aa" || rf.Asset != "usdc" || rf.Charged != 1010 {
+		t.Fatalf("query refund not traceable to settlement: %+v", rf)
+	}
+}
+
+// 空退款批次返回空结果，且无退款时 query 为空列表。
+func TestRefundEmptyBatch(t *testing.T) {
+	path := newTestLedger(t, []BalanceInit{{Account: "aa", Asset: "usdc", Balance: 10}})
+	l := openOrFail(t, path)
+	rr, err := l.Refund(RefundBatch{Refunds: nil})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rr.Results) != 0 {
+		t.Fatalf("empty refund batch: %+v", rr.Results)
+	}
+	snap, _ := l.Query()
+	if len(snap.Refunds) != 0 {
+		t.Fatalf("refunds must be empty list, got %+v", snap.Refunds)
+	}
+}
+
+// 参数校验：三个字段缺一不可，失败不占用退款编号。
+func TestRefundInvalidParameters(t *testing.T) {
+	path := newTestLedger(t, []BalanceInit{{Account: "aa", Asset: "usdc", Balance: 100}})
+	l := openOrFail(t, path)
+	if _, err := l.Submit(FeeBatch{FeeBps: 0, Intents: []PaymentIntent{intent("p1", "aa", "usdc", 10)}}); err != nil {
+		t.Fatal(err)
+	}
+	rr, _ := l.Refund(RefundBatch{Refunds: []RefundRequest{
+		{ID: "", SettlementID: "p1", Reason: "x"},
+		{ID: "r", SettlementID: "", Reason: "x"},
+		{ID: "r", SettlementID: "p1", Reason: ""},
+	}})
+	for i, x := range rr.Results {
+		if x.Status != StatusInvalid {
+			t.Fatalf("item %d want invalid_parameter, got %s (%s)", i, x.Status, x.Reason)
+		}
+	}
+	// 失败申请不占用编号：同名编号随后可成功。
+	rr2, _ := l.Refund(RefundBatch{Refunds: []RefundRequest{refundReq("r", "p1", "now valid")}})
+	if rr2.Results[0].Status != StatusRefundSuccess {
+		t.Fatalf("failed id should be reusable, got %+v", rr2.Results[0])
+	}
+}
+
+// 已成功退款编号优先判定：目标与原因都相同 => duplicate 并返回原退款记录；
+// 目标或原因任一不同 => conflict。都不再入账。
+func TestRefundDuplicateAndConflict(t *testing.T) {
+	path := newTestLedger(t, []BalanceInit{{Account: "aa", Asset: "usdc", Balance: 1_000_000}})
+	l := openOrFail(t, path)
+	for _, id := range []string{"p1", "p2"} {
+		if _, err := l.Submit(FeeBatch{FeeBps: 0, Intents: []PaymentIntent{intent(id, "aa", "usdc", 100)}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	first, _ := l.Refund(RefundBatch{Refunds: []RefundRequest{refundReq("r1", "p1", "reason A")}})
+	if first.Results[0].Status != StatusRefundSuccess {
+		t.Fatalf("first: %+v", first.Results[0])
+	}
+	balAfter, _ := l.Balance("aa", "usdc")
+
+	// 完全相同：duplicate，带原退款记录，不再入账。
+	dup, _ := l.Refund(RefundBatch{Refunds: []RefundRequest{refundReq("r1", "p1", "reason A")}})
+	d := dup.Results[0]
+	if d.Status != StatusDuplicate || d.Record == nil || d.Record.Seq != 1 ||
+		d.SettlementID != "p1" || d.Charged != 100 || d.Account != "aa" || d.Asset != "usdc" {
+		t.Fatalf("duplicate refund: %+v", d)
+	}
+	if bal, _ := l.Balance("aa", "usdc"); bal != balAfter {
+		t.Fatalf("duplicate changed balance: %d vs %d", bal, balAfter)
+	}
+
+	// 原因不同 / 目标不同：conflict。
+	for i, req := range []RefundRequest{
+		refundReq("r1", "p1", "reason B"),
+		refundReq("r1", "p2", "reason A"),
+	} {
+		res, _ := l.Refund(RefundBatch{Refunds: []RefundRequest{req}})
+		if res.Results[0].Status != StatusConflict {
+			t.Fatalf("case %d want conflict, got %+v", i, res.Results[0])
+		}
+	}
+	snap, _ := l.Query()
+	if len(snap.Refunds) != 1 {
+		t.Fatalf("conflict must not add refund records: %+v", snap.Refunds)
+	}
+	if bal, _ := l.Balance("aa", "usdc"); bal != balAfter {
+		t.Fatalf("conflict changed balance: %d vs %d", bal, balAfter)
+	}
+}
+
+// 目标结算不存在（含原付款只曾失败）=> not_found；
+// 已被其他退款编号退回 => already_refunded，不增加余额。
+func TestRefundNotFoundAndAlreadyRefunded(t *testing.T) {
+	path := newTestLedger(t, []BalanceInit{{Account: "aa", Asset: "usdc", Balance: 100}})
+	l := openOrFail(t, path)
+	// pbad 只曾余额不足失败，从未成功。
+	fail, _ := l.Submit(FeeBatch{FeeBps: 0, Intents: []PaymentIntent{intent("pbad", "aa", "usdc", 200)}})
+	if fail.Results[0].Status != StatusFunds {
+		t.Fatalf("setup: %+v", fail.Results[0])
+	}
+	// pok 成功。
+	if _, err := l.Submit(FeeBatch{FeeBps: 0, Intents: []PaymentIntent{intent("pok", "aa", "usdc", 30)}}); err != nil {
+		t.Fatal(err)
+	}
+
+	rr, _ := l.Refund(RefundBatch{Refunds: []RefundRequest{
+		refundReq("r-missing", "ghost", "x"),
+		refundReq("r-failed", "pbad", "x"), // 原付款只曾失败
+		refundReq("r-ok", "pok", "x"),
+	}})
+	if rr.Results[0].Status != StatusNotFound || rr.Results[1].Status != StatusNotFound {
+		t.Fatalf("want not_found for missing/failed, got %+v", rr.Results)
+	}
+	if rr.Results[2].Status != StatusRefundSuccess {
+		t.Fatalf("valid refund: %+v", rr.Results[2])
+	}
+	balAfter, _ := l.Balance("aa", "usdc") // 100-30+30 = 100
+
+	// 新退款编号指向已退款结算：already_refunded，不加余额。
+	rr2, _ := l.Refund(RefundBatch{Refunds: []RefundRequest{refundReq("r-other", "pok", "again")}})
+	if rr2.Results[0].Status != StatusAlreadyRefunded {
+		t.Fatalf("want already_refunded, got %+v", rr2.Results[0])
+	}
+	if bal, _ := l.Balance("aa", "usdc"); bal != balAfter {
+		t.Fatalf("already_refunded changed balance: %d vs %d", bal, balAfter)
+	}
+	// not_found 的编号未被占用，可以换成存在的目标（p2）再成功。
+	if _, err := l.Submit(FeeBatch{FeeBps: 0, Intents: []PaymentIntent{intent("p2", "aa", "usdc", 10)}}); err != nil {
+		t.Fatal(err)
+	}
+	rr4, _ := l.Refund(RefundBatch{Refunds: []RefundRequest{refundReq("r-failed", "p2", "reused id")}})
+	if rr4.Results[0].Status != StatusRefundSuccess {
+		t.Fatalf("previously-not-found id should be reusable, got %+v", rr4.Results[0])
+	}
+}
+
+// 批次逐项独立、后项可见前项退款：前项退回的余额可供同批次后项/后续付款使用；
+// 前项成功后后项引用同一结算应得到 already_refunded。
+func TestRefundBatchOrdering(t *testing.T) {
+	path := newTestLedger(t, []BalanceInit{{Account: "aa", Asset: "usdc", Balance: 100}})
+	l := openOrFail(t, path)
+	// p1 扣 100，余额 0。
+	if _, err := l.Submit(FeeBatch{FeeBps: 0, Intents: []PaymentIntent{intent("p1", "aa", "usdc", 100)}}); err != nil {
+		t.Fatal(err)
+	}
+	rr, _ := l.Refund(RefundBatch{Refunds: []RefundRequest{
+		refundReq("r1", "p1", "first"),
+		refundReq("r2", "p1", "second"), // 后项看到前项已退
+	}})
+	if rr.Results[0].Status != StatusRefundSuccess || rr.Results[1].Status != StatusAlreadyRefunded {
+		t.Fatalf("batch ordering: %+v", rr.Results)
+	}
+	// 前项退回的余额可供后续付款使用。
+	pay, _ := l.Submit(FeeBatch{FeeBps: 0, Intents: []PaymentIntent{intent("p3", "aa", "usdc", 100)}})
+	if pay.Results[0].Status != StatusSettled {
+		t.Fatalf("refunded balance not reusable: %+v", pay.Results[0])
+	}
+}
+
+// 退款编号与付款编号分别使用：字符串相同也允许。
+func TestRefundIDIndependentOfSettlementID(t *testing.T) {
+	path := newTestLedger(t, []BalanceInit{{Account: "aa", Asset: "usdc", Balance: 100}})
+	l := openOrFail(t, path)
+	if _, err := l.Submit(FeeBatch{FeeBps: 0, Intents: []PaymentIntent{intent("same", "aa", "usdc", 40)}}); err != nil {
+		t.Fatal(err)
+	}
+	// 退款编号与原付款编号同名。
+	rr, _ := l.Refund(RefundBatch{Refunds: []RefundRequest{refundReq("same", "same", "x")}})
+	if rr.Results[0].Status != StatusRefundSuccess {
+		t.Fatalf("same-string ids must be allowed: %+v", rr.Results[0])
+	}
+}
+
+// 退款后原付款的幂等资格保留：相同付款重试仍返回原结算（duplicate），
+// 合法字段有变为 conflict，都不能再次扣款。
+func TestSettlementIdempotencySurvivesRefund(t *testing.T) {
+	path := newTestLedger(t, []BalanceInit{{Account: "aa", Asset: "usdc", Balance: 1000}})
+	l := openOrFail(t, path)
+	base := PaymentIntent{ID: "p1", Account: "aa", Paymaster: "pm", Asset: "usdc", Amount: i64p(300), Nonce: 1, State: "pending"}
+	if _, err := l.Submit(FeeBatch{FeeBps: 0, Intents: []PaymentIntent{base}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := l.Refund(RefundBatch{Refunds: []RefundRequest{refundReq("r1", "p1", "x")}}); err != nil {
+		t.Fatal(err)
+	}
+	balAfterRefund, _ := l.Balance("aa", "usdc") // 1000
+
+	dup, _ := l.Submit(FeeBatch{FeeBps: 0, Intents: []PaymentIntent{base}})
+	if dup.Results[0].Status != StatusDuplicate {
+		t.Fatalf("original payment retry want duplicate, got %+v", dup.Results[0])
+	}
+	if bal, _ := l.Balance("aa", "usdc"); bal != balAfterRefund {
+		t.Fatalf("duplicate re-charged after refund: %d", bal)
+	}
+	changed := base
+	changed.Amount = i64p(301)
+	cf, _ := l.Submit(FeeBatch{FeeBps: 0, Intents: []PaymentIntent{changed}})
+	if cf.Results[0].Status != StatusConflict {
+		t.Fatalf("changed payment want conflict, got %+v", cf.Results[0])
+	}
+	if bal, _ := l.Balance("aa", "usdc"); bal != balAfterRefund {
+		t.Fatalf("conflict changed balance: %d", bal)
+	}
+}
+
+// 存储失败：该项 storage_error，既不加余额也不留退款记录；前项保留，后项继续。
+func TestRefundStorageFailureRollsBackItemOnly(t *testing.T) {
+	path := newTestLedger(t, []BalanceInit{{Account: "aa", Asset: "usdc", Balance: 1000}})
+	l := openOrFail(t, path)
+	for _, id := range []string{"a", "b", "c"} {
+		if _, err := l.Submit(FeeBatch{FeeBps: 0, Intents: []PaymentIntent{intent(id, "aa", "usdc", 100)}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// 三笔各扣 100，余额 700。第 2 次持久化（rb）失败。
+	SetFailHook(l, &failNth{nth: 2})
+	t.Cleanup(func() { SetFailHook(l, nil) })
+	rr, err := l.Refund(RefundBatch{Refunds: []RefundRequest{
+		refundReq("ra", "a", "x"),
+		refundReq("rb", "b", "x"),
+		refundReq("rc", "c", "x"),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{StatusRefundSuccess, StatusStorage, StatusRefundSuccess}
+	if got := refundStatuses(rr); fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("statuses=%v want %v", got, want)
+	}
+	// ra、rc 各退 100，rb 回滚：700+200=900。
+	if bal, _ := l.Balance("aa", "usdc"); bal != 900 {
+		t.Fatalf("balance=%d want 900", bal)
+	}
+	snap, _ := l.Query()
+	if len(snap.Refunds) != 2 || snap.Refunds[0].ID != "ra" || snap.Refunds[1].ID != "rc" {
+		t.Fatalf("refund records after storage failure: %+v", snap.Refunds)
+	}
+	// rb 编号未占用，且结算 b 未被标记退款，可重新提交成功。
+	rr2, _ := l.Refund(RefundBatch{Refunds: []RefundRequest{refundReq("rb", "b", "retry")}})
+	if rr2.Results[0].Status != StatusRefundSuccess {
+		t.Fatalf("rb retry: %+v", rr2.Results[0])
+	}
+	if bal, _ := l.Balance("aa", "usdc"); bal != 1000 {
+		t.Fatalf("balance after rb retry=%d want 1000", bal)
+	}
+
+	// 关闭重开后磁盘状态与内存一致。
+	l2 := openOrFail(t, path)
+	snap2, _ := l2.Query()
+	if len(snap2.Settlements) != 3 || len(snap2.Refunds) != 3 {
+		t.Fatalf("reopen history: settlements=%d refunds=%d", len(snap2.Settlements), len(snap2.Refunds))
+	}
+	if bal, _ := l2.Balance("aa", "usdc"); bal != 1000 {
+		t.Fatalf("reopen balance=%d want 1000", bal)
+	}
+}
+
+// 关闭后重开：余额、两类历史、重复申请（duplicate/conflict/already_refunded）一致。
+func TestRefundPersistenceAcrossReopen(t *testing.T) {
+	path := newTestLedger(t, []BalanceInit{{Account: "aa", Asset: "usdc", Balance: 1000}})
+	l1 := openOrFail(t, path)
+	if _, err := l1.Submit(FeeBatch{FeeBps: 0, Intents: []PaymentIntent{intent("p1", "aa", "usdc", 250)}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := l1.Refund(RefundBatch{Refunds: []RefundRequest{refundReq("r1", "p1", "why")}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := l1.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	l2 := openOrFail(t, path)
+	if bal, _ := l2.Balance("aa", "usdc"); bal != 1000 {
+		t.Fatalf("reopen balance=%d want 1000", bal)
+	}
+	snap, _ := l2.Query()
+	if len(snap.Settlements) != 1 || snap.Settlements[0].ID != "p1" {
+		t.Fatalf("reopen settlements: %+v", snap.Settlements)
+	}
+	if len(snap.Refunds) != 1 || snap.Refunds[0].SettlementID != "p1" || snap.Refunds[0].Charged != 250 {
+		t.Fatalf("reopen refunds: %+v", snap.Refunds)
+	}
+	// 重复申请：相同 => duplicate；不同 => conflict；同结算他编号 => already_refunded。
+	dup, _ := l2.Refund(RefundBatch{Refunds: []RefundRequest{refundReq("r1", "p1", "why")}})
+	if dup.Results[0].Status != StatusDuplicate {
+		t.Fatalf("reopen duplicate: %+v", dup.Results[0])
+	}
+	cf, _ := l2.Refund(RefundBatch{Refunds: []RefundRequest{refundReq("r1", "p1", "other")}})
+	if cf.Results[0].Status != StatusConflict {
+		t.Fatalf("reopen conflict: %+v", cf.Results[0])
+	}
+	ar, _ := l2.Refund(RefundBatch{Refunds: []RefundRequest{refundReq("r9", "p1", "x")}})
+	if ar.Results[0].Status != StatusAlreadyRefunded {
+		t.Fatalf("reopen already_refunded: %+v", ar.Results[0])
+	}
+}
+
+// 付款 → 退款 → 再付款的账本能正常恢复，交错顺序被正确校验。
+func TestRefundPayRefundPayReplay(t *testing.T) {
+	path := newTestLedger(t, []BalanceInit{{Account: "aa", Asset: "usdc", Balance: 100}})
+	l := openOrFail(t, path)
+	must := func(batch FeeBatch) {
+		t.Helper()
+		res, err := l.Submit(batch)
+		if err != nil || res.Results[0].Status != StatusSettled {
+			t.Fatalf("submit: %+v err=%v", res.Results, err)
+		}
+	}
+	must(FeeBatch{FeeBps: 0, Intents: []PaymentIntent{intent("p1", "aa", "usdc", 100)}})                   // 0
+	if _, err := l.Refund(RefundBatch{Refunds: []RefundRequest{refundReq("r1", "p1", "x")}}); err != nil { // 100
+		t.Fatal(err)
+	}
+	must(FeeBatch{FeeBps: 0, Intents: []PaymentIntent{intent("p2", "aa", "usdc", 60)}})                    // 40
+	if _, err := l.Refund(RefundBatch{Refunds: []RefundRequest{refundReq("r2", "p2", "x")}}); err != nil { // 100
+		t.Fatal(err)
+	}
+	must(FeeBatch{FeeBps: 0, Intents: []PaymentIntent{intent("p3", "aa", "usdc", 100)}}) // 0
+
+	if err := l.Close(); err != nil {
+		t.Fatal(err)
+	}
+	l2 := openOrFail(t, path)
+	if bal, _ := l2.Balance("aa", "usdc"); bal != 0 {
+		t.Fatalf("final balance=%d want 0", bal)
+	}
+	snap, _ := l2.Query()
+	if len(snap.Settlements) != 3 || len(snap.Refunds) != 2 {
+		t.Fatalf("history: %d settlements, %d refunds", len(snap.Settlements), len(snap.Refunds))
+	}
+	if snap.Refunds[0].AfterSeq != 1 || snap.Refunds[1].AfterSeq != 2 {
+		t.Fatalf("after_seq interleaving lost: %+v", snap.Refunds)
+	}
+}
+
+// 并发：多个句柄并发退款，每笔原付款最多退回一次（唯一退款编号下恰一笔成功，
+// 其余 already_refunded），查询看不到半更新状态。
+func TestRefundConcurrentSettlesRefundOnce(t *testing.T) {
+	path := newTestLedger(t, []BalanceInit{{Account: "aa", Asset: "usdc", Balance: 1000}})
+	lc := openOrFail(t, path)
+	if _, err := lc.Submit(FeeBatch{FeeBps: 0, Intents: []PaymentIntent{intent("only", "aa", "usdc", 1000)}}); err != nil {
+		t.Fatal(err)
+	}
+
+	const n = 40
+	var wg sync.WaitGroup
+	c2 := map[string]int{}
+	var m2 sync.Mutex
+	for i := 0; i < n; i++ {
+		i := i
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			h, err := Open(path)
+			if err != nil {
+				t.Errorf("Open: %v", err)
+				return
+			}
+			defer h.Close()
+			rr, err := h.Refund(RefundBatch{Refunds: []RefundRequest{refundReq(fmt.Sprintf("rid-%d", i), "only", "x")}})
+			if err != nil {
+				t.Errorf("Refund: %v", err)
+				return
+			}
+			m2.Lock()
+			c2[rr.Results[0].Status]++
+			m2.Unlock()
+		}()
+	}
+	wg.Wait()
+	if c2[StatusRefundSuccess] != 1 {
+		t.Fatalf("refunded=%d want 1 (counts=%v)", c2[StatusRefundSuccess], c2)
+	}
+	if c2[StatusAlreadyRefunded] != n-1 {
+		t.Fatalf("already_refunded=%d want %d (counts=%v)", c2[StatusAlreadyRefunded], n-1, c2)
+	}
+	snap, _ := lc.Query()
+	if len(snap.Refunds) != 1 {
+		t.Fatalf("refund records=%d want 1", len(snap.Refunds))
+	}
+	if bal, _ := lc.Balance("aa", "usdc"); bal != 1000 {
+		t.Fatalf("balance=%d want 1000", bal)
+	}
+}
+
+// 并发退款后余额立即可供并发付款使用，且总额守恒、无半更新可见。
+func TestRefundedBalanceReusedConcurrently(t *testing.T) {
+	path := newTestLedger(t, []BalanceInit{{Account: "aa", Asset: "usdc", Balance: 1000}})
+	l := openOrFail(t, path)
+	if _, err := l.Submit(FeeBatch{FeeBps: 0, Intents: []PaymentIntent{intent("seed", "aa", "usdc", 1000)}}); err != nil {
+		t.Fatal(err)
+	}
+
+	// 先全额退款（唯一一笔）。
+	done := make(chan struct{})
+	go func() {
+		h, _ := Open(path)
+		defer h.Close()
+		_, _ = h.Refund(RefundBatch{Refunds: []RefundRequest{refundReq("rseed", "seed", "x")}})
+		close(done)
+	}()
+	<-done
+
+	// 退回的 1000 余额上并发发起 40 笔各 1000 的付款：恰有一笔成功。
+	const n = 40
+	var wg sync.WaitGroup
+	c := map[string]int{}
+	var mu sync.Mutex
+	for i := 0; i < n; i++ {
+		i := i
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			h, err := Open(path)
+			if err != nil {
+				t.Errorf("Open: %v", err)
+				return
+			}
+			defer h.Close()
+			res, err := h.Submit(FeeBatch{FeeBps: 0, Intents: []PaymentIntent{
+				intent(fmt.Sprintf("grab-%d", i), "aa", "usdc", 1000),
+			}})
+			if err != nil {
+				t.Errorf("Submit: %v", err)
+				return
+			}
+			mu.Lock()
+			c[res.Results[0].Status]++
+			mu.Unlock()
+		}()
+	}
+	wg.Wait()
+	if c[StatusSettled] != 1 || c[StatusFunds] != n-1 {
+		t.Fatalf("counts=%v want exactly 1 settled", c)
+	}
+	if bal, _ := l.Balance("aa", "usdc"); bal != 0 {
+		t.Fatalf("balance=%d want 0", bal)
+	}
+}
+
+// 损坏检测：篡改退款相关语义均拒绝为损坏账本。
+func TestCorruptRefundLedgerRejected(t *testing.T) {
+	k := balanceKey{"aa", "usdc"}
+	initial := map[balanceKey]int64{k: 1000}
+	rec := Record{ID: "p1", Account: "aa", Paymaster: "pm", Asset: "usdc", Amount: 300, Nonce: 1, FeeBps: 0, Fee: 0, Charged: 300, Seq: 1}
+	goodRF := RefundRecord{ID: "r1", SettlementID: "p1", Reason: "x", Account: "aa", Asset: "usdc", Amount: 300, Fee: 0, Charged: 300, AfterSeq: 1, Seq: 1}
+	finalBack := map[balanceKey]int64{k: 1000} // 退完回到初始
+
+	mkRF := func(mut func(*RefundRecord)) []RefundRecord {
+		r := goodRF
+		mut(&r)
+		return []RefundRecord{r}
+	}
+
+	cases := map[string]struct {
+		final   map[balanceKey]int64
+		records []Record
+		refunds []RefundRecord
+	}{
+		"missing settlement": {finalBack, []Record{rec}, mkRF(func(r *RefundRecord) { r.SettlementID = "ghost" })},
+		"double refund": {finalBack, []Record{rec}, []RefundRecord{
+			goodRF,
+			func() RefundRecord { r := goodRF; r.ID = "r2"; r.Seq = 2; return r }(),
+		}},
+		"amount differs":      {finalBack, []Record{rec}, mkRF(func(r *RefundRecord) { r.Amount = 299; r.Charged = 299 })},
+		"charged differs":     {finalBack, []Record{rec}, mkRF(func(r *RefundRecord) { r.Charged = 301 })},
+		"asset differs":       {finalBack, []Record{rec}, mkRF(func(r *RefundRecord) { r.Asset = "eth" })},
+		"empty reason":        {finalBack, []Record{rec}, mkRF(func(r *RefundRecord) { r.Reason = "" })},
+		"seq gap":             {finalBack, []Record{rec}, mkRF(func(r *RefundRecord) { r.Seq = 2 })},
+		"after_seq too large": {finalBack, []Record{rec}, mkRF(func(r *RefundRecord) { r.AfterSeq = 2 })},
+		"balance mismatch":    {map[balanceKey]int64{k: 999}, []Record{rec}, mkRF(func(r *RefundRecord) {})},
+	}
+
+	// “duplicate refund id”：两笔不同结算各退一次，但两条退款记录共用编号 r1。
+	rec2 := Record{ID: "p2", Account: "aa", Paymaster: "pm", Asset: "usdc", Amount: 1, Nonce: 2, FeeBps: 0, Fee: 0, Charged: 1, Seq: 2}
+	rf2 := goodRF
+	rf2.Seq = 2
+	rf2.SettlementID = "p2"
+	rf2.Amount, rf2.Fee, rf2.Charged = 1, 0, 1
+	rf2.AfterSeq = 2
+	cases["duplicate refund id"] = struct {
+		final   map[balanceKey]int64
+		records []Record
+		refunds []RefundRecord
+	}{
+		final:   map[balanceKey]int64{k: 1000 - 1},
+		records: []Record{rec, rec2},
+		refunds: []RefundRecord{goodRF, rf2},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			if err := validateAndReplay(initial, tc.final, tc.records, tc.refunds); err == nil || KindOf(err) != ErrCorrupt {
+				t.Fatalf("%s: want ErrCorrupt, got %v", name, err)
+			}
+		})
+	}
+
+	// 健康的付款→退款账本必须通过。
+	if err := validateAndReplay(finalBack, finalBack, []Record{rec}, []RefundRecord{goodRF}); err != nil {
+		t.Fatalf("healthy refund ledger rejected: %v", err)
+	}
+}
+
+func refundStatuses(r *RefundBatchResult) []string {
+	out := make([]string, len(r.Results))
+	for i, x := range r.Results {
+		out[i] = x.Status
+	}
+	return out
+}
+
+// 旧版账本（没有 refunds 字段）无需转换即可查询、付款和退款；
+// 读取与仅付款都不改写文件（保持无 refunds 键），首次退款才引入该字段。
+func TestLegacyFileWithoutRefundsField(t *testing.T) {
+	// 按磁盘文档规范字段顺序构造一个带合法 checksum 的旧版文档。
+	legacy := func(balance int64, records ...Record) []byte {
+		type doc struct {
+			Version     int           `json:"version"`
+			Initial     []BalanceView `json:"initial_balances"`
+			Balances    []BalanceView `json:"balances"`
+			Settlements []Record      `json:"settlements"`
+		}
+		d := doc{
+			Version:     1,
+			Initial:     []BalanceView{{Account: "aa", Asset: "usdc", Balance: 1000}},
+			Balances:    []BalanceView{{Account: "aa", Asset: "usdc", Balance: balance}},
+			Settlements: records,
+		}
+		payload, err := json.Marshal(d)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sum := checksumHex(payload)
+		return append(append(payload[:len(payload)-1], []byte(`,"checksum":"`+sum+`"}`)...), '\n')
+	}
+	rec := Record{ID: "p1", Account: "aa", Paymaster: "pm", Asset: "usdc", Amount: 300, Nonce: 1, FeeBps: 0, Fee: 0, Charged: 300, Seq: 1}
+	path := filepath.Join(t.TempDir(), "old.json")
+	if err := os.WriteFile(path, legacy(700, rec), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	l := openOrFail(t, path)
+	snap, err := l.Query()
+	if err != nil {
+		t.Fatalf("query legacy: %v", err)
+	}
+	if len(snap.Refunds) != 0 || snap.Balances[0].Balance != 700 {
+		t.Fatalf("legacy query: %+v", snap)
+	}
+
+	// 再付款一笔：无退款，文件必须保持不含 refunds 键。
+	if _, err := l.Submit(FeeBatch{FeeBps: 0, Intents: []PaymentIntent{intent("p2", "aa", "usdc", 100)}}); err != nil {
+		t.Fatal(err)
+	}
+	if data, _ := os.ReadFile(path); bytes.Contains(data, []byte(`"refunds"`)) {
+		t.Fatalf("submit on refund-less ledger must not add refunds key:\n%s", data)
+	}
+
+	// 首次退款引入 refunds 键并全额回到 900（700-100+300）。
+	rr, err := l.Refund(RefundBatch{Refunds: []RefundRequest{refundReq("r1", "p1", "legacy")}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rr.Results[0].Status != StatusRefundSuccess || rr.Results[0].Charged != 300 {
+		t.Fatalf("legacy refund: %+v", rr.Results[0])
+	}
+	data, _ := os.ReadFile(path)
+	if !bytes.Contains(data, []byte(`"refunds"`)) {
+		t.Fatalf("refund must persist refunds key:\n%s", data)
+	}
+	if bal, _ := l.Balance("aa", "usdc"); bal != 900 {
+		t.Fatalf("balance after legacy refund=%d want 900", bal)
+	}
+
+	// 关闭重开（新进程语义）应正常恢复付款→退款→付款账本。
+	if err := l.Close(); err != nil {
+		t.Fatal(err)
+	}
+	l2 := openOrFail(t, path)
+	snap2, _ := l2.Query()
+	if len(snap2.Settlements) != 2 || len(snap2.Refunds) != 1 {
+		t.Fatalf("reopen legacy: %+v", snap2)
+	}
+	if bal, _ := l2.Balance("aa", "usdc"); bal != 900 {
+		t.Fatalf("reopen balance=%d want 900", bal)
 	}
 }

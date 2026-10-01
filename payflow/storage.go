@@ -70,11 +70,17 @@ func atomicWrite(path string, v any) error {
 	return nil
 }
 
-// validateAndReplay 校验全部成功记录并从冻结的初始余额重放：
-// ID 唯一、序列连续、费用一致、int64 不溢出、任一时点余额非负，
+// validateAndReplay 校验全部成功记录并从冻结的初始余额重放结算与退款：
+// ID 唯一、序列连续、费用一致、int64 不溢出、退款只能引用此前存在的结算且
+// 每笔结算最多退回一次、退款金额必须等于原扣款、任一时点余额非负，
 // 且重放结果必须等于文件中的最终余额。任何不符都判定账本损坏。
-func validateAndReplay(initial, final map[balanceKey]int64, records []Record) error {
-	charged := make(map[balanceKey]int64)
+//
+// 结算与退款按各自成功历史交错：退款 r 只允许发生在序号 <= r.AfterSeq 的
+// 结算之后（AfterSeq 是退款落账时结算历史的长度）。这保留了
+// “付款 → 退款 → 再付款”的真实时间顺序，使中间余额与最终余额都可验证。
+func validateAndReplay(initial, final map[balanceKey]int64, records []Record, refunds []RefundRecord) error {
+	// 先校验结算自身的结构不变式（余额相关的判定由后面的交错重放完成，
+	// 因为退款回收的余额允许同一笔钱被再次扣出，累计毛扣款可能超过初始余额）。
 	seen := map[string]bool{}
 	for i, r := range records {
 		if r.ID == "" {
@@ -105,35 +111,93 @@ func validateAndReplay(initial, final map[balanceKey]int64, records []Record) er
 		if int64(i)+1 != r.Seq {
 			return ledgerError(ErrCorrupt, "settlement %q sequence gap", r.ID)
 		}
+	}
+
+	// 校验退款自身的不变式：字段非空、序列连续、引用的结算在退款时点已存在、
+	// 金额与去向与原结算逐字一致、每笔结算最多退回一次、退款编号全局唯一。
+	seenRefund := map[string]bool{}
+	refundedBy := map[string]string{} // 结算编号 -> 首个退回它的退款编号
+	for i, rf := range refunds {
+		if rf.ID == "" {
+			return ledgerError(ErrCorrupt, "refund %d has empty id", i)
+		}
+		if seenRefund[rf.ID] {
+			return ledgerError(ErrCorrupt, "duplicate refund id %q", rf.ID)
+		}
+		seenRefund[rf.ID] = true
+		if rf.SettlementID == "" || rf.Reason == "" {
+			return ledgerError(ErrCorrupt, "refund %q missing settlement_id or reason", rf.ID)
+		}
+		if int64(i)+1 != rf.Seq {
+			return ledgerError(ErrCorrupt, "refund %q sequence gap", rf.ID)
+		}
+		if rf.AfterSeq < 0 || rf.AfterSeq > int64(len(records)) {
+			return ledgerError(ErrCorrupt, "refund %q references settlement outside history (after_seq=%d)", rf.ID, rf.AfterSeq)
+		}
+		var target *Record
+		for j := range records {
+			if records[j].Seq <= rf.AfterSeq && records[j].ID == rf.SettlementID {
+				target = &records[j]
+				break
+			}
+		}
+		if target == nil {
+			return ledgerError(ErrCorrupt, "refund %q references non-existent settlement %q", rf.ID, rf.SettlementID)
+		}
+		if rf.Account != target.Account || rf.Asset != target.Asset ||
+			rf.Amount != target.Amount || rf.Fee != target.Fee || rf.Charged != target.Charged {
+			return ledgerError(ErrCorrupt, "refund %q amount or destination differs from settlement %q", rf.ID, rf.SettlementID)
+		}
+		if rf.Charged <= 0 {
+			return ledgerError(ErrCorrupt, "refund %q has non-positive charged amount", rf.ID)
+		}
+		if other, dup := refundedBy[rf.SettlementID]; dup {
+			return ledgerError(ErrCorrupt, "settlement %q refunded twice: %q and %q", rf.SettlementID, other, rf.ID)
+		}
+		refundedBy[rf.SettlementID] = rf.ID
+	}
+
+	// 按成功时间交错重放：第 s 笔结算之后落入 after_seq==s 的全部退款
+	// （退款之间按其自身序号；用分桶而非假定 after_seq 单调，以抵抗篡改数据）。
+	// net[k] 为该组合截至当前时点的“净扣款”（扣款增加、退款减少），
+	// 必须始终落在 [0, initial]，且不发生 int64 溢出。
+	buckets := make([][]int, len(records)+1) // after_seq -> refunds 下标
+	for i := range refunds {
+		buckets[refunds[i].AfterSeq] = append(buckets[refunds[i].AfterSeq], i)
+	}
+	net := make(map[balanceKey]int64)
+	for s := range records {
+		r := &records[s]
 		k := balanceKey{r.Account, r.Asset}
-		sum := charged[k]
+		sum := net[k]
 		if r.Charged > math.MaxInt64-sum {
 			return ledgerError(ErrCorrupt, "settlement %q cumulative charges overflow int64", r.ID)
 		}
-		charged[k] = sum + r.Charged
-	}
+		sum += r.Charged
+		if sum > initial[k] {
+			return ledgerError(ErrCorrupt, "settlement %q drives %s/%s negative during replay", r.ID, r.Account, r.Asset)
+		}
+		net[k] = sum
 
-	// 初始余额由初始化数据冻结；累计扣款不得超过它。
-	for k, start := range initial {
-		if charged[k] > start {
-			// 找到第一笔导致负余额的记录以给出更明确的报错。
-			var running int64
-			for _, r := range records {
-				if r.Account != k.account || r.Asset != k.asset {
-					continue
-				}
-				if r.Charged > start-running {
-					return ledgerError(ErrCorrupt, "settlement %q drives %s/%s negative", r.ID, r.Account, r.Asset)
-				}
-				running += r.Charged
+		for _, ri := range buckets[int64(s)+1] {
+			rf := &refunds[ri]
+			rk := balanceKey{rf.Account, rf.Asset}
+			cur := net[rk]
+			if rf.Charged > cur {
+				return ledgerError(ErrCorrupt, "refund %q exceeds charged amount for %s/%s at its time", rf.ID, rf.Account, rf.Asset)
 			}
-			return ledgerError(ErrCorrupt, "total charges for %s/%s exceed initial balance %d", k.account, k.asset, start)
+			net[rk] = cur - rf.Charged
 		}
 	}
+	// after_seq==0 的退款不可能引用任何已存在结算，前面理应已拒绝；
+	// 此处兜底，任何未被消费的退款都视为顺序损坏。
+	if len(buckets[0]) != 0 {
+		return ledgerError(ErrCorrupt, "refund %q precedes every settlement", refunds[buckets[0][0]].ID)
+	}
 
-	// 按记录顺序重放，末态必须与文件中的最终余额逐组合一致。
+	// 交错重放后的末态必须与文件中的最终余额逐组合一致。
 	for k, start := range initial {
-		got := start - charged[k]
+		got := start - net[k]
 		if want, present := final[k]; !present || got != want {
 			return ledgerError(ErrCorrupt, "final balance mismatch for %s/%s: replay %d, file %v", k.account, k.asset, got, want)
 		}

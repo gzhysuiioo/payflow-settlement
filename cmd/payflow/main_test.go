@@ -185,3 +185,130 @@ func TestCLIRequiresLedgerFlag(t *testing.T) {
 		t.Fatalf("query without -l: %+v", r)
 	}
 }
+
+func TestCLIRefundLifecycle(t *testing.T) {
+	ledgerPath := t.TempDir() + "/ledger.json"
+
+	if r := runCLIWith(t, []string{"init", "-l", ledgerPath},
+		`{"balances":[{"account":"aa-1","asset":"usdc","balance":2000}]}`); r.code != 0 {
+		t.Fatalf("init: %s", r.err)
+	}
+	// p1 成功（charged 1504），p2 余额不足失败。
+	batch := `{"fee_bps":30,"intents":[
+	  {"id":"p1","account":"aa-1","paymaster":"pm","asset":"usdc","amount":1500,"nonce":1},
+	  {"id":"p2","account":"aa-1","asset":"usdc","amount":900}
+	]}`
+	if r := runCLIWith(t, []string{"submit", "-l", ledgerPath}, batch); r.code != 0 {
+		t.Fatalf("submit: %s", r.err)
+	}
+
+	// 退款批次：成功 / 重复 / 冲突 / 已退款 / 目标不存在 / 参数非法，逐项返回且退出码 0。
+	refunds := `{"refunds":[
+	  {"id":"r1","settlement_id":"p1","reason":"cancel"},
+	  {"id":"r1","settlement_id":"p1","reason":"cancel"},
+	  {"id":"r1","settlement_id":"p1","reason":"changed"},
+	  {"id":"r2","settlement_id":"p1","reason":"again"},
+	  {"id":"r3","settlement_id":"ghost","reason":"x"},
+	  {"id":"r4","settlement_id":"p2","reason":"x"},
+	  {"id":"","settlement_id":"p1","reason":"x"}
+	]}`
+	r := runCLIWith(t, []string{"refund", "-l", ledgerPath}, refunds)
+	if r.code != 0 {
+		t.Fatalf("refund batch must exit 0 even with per-item failures: %s", r.err)
+	}
+	var res struct {
+		Results []struct {
+			ID           string `json:"id"`
+			Status       string `json:"status"`
+			SettlementID string `json:"settlement_id"`
+			Account      string `json:"account"`
+			Asset        string `json:"asset"`
+			Charged      int64  `json:"charged"`
+		} `json:"results"`
+	}
+	if err := json.Unmarshal([]byte(r.out), &res); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"refunded", "duplicate", "conflict", "already_refunded", "not_found", "not_found", "invalid_parameter"}
+	if len(res.Results) != len(want) {
+		t.Fatalf("got %d results, want %d: %s", len(res.Results), len(want), r.out)
+	}
+	for i, x := range res.Results {
+		if x.Status != want[i] {
+			t.Fatalf("item %d status=%s want %s", i, x.Status, want[i])
+		}
+	}
+	// 成功与重复必须回传原付款编号、账户、资产、总额。
+	for _, i := range []int{0, 1} {
+		x := res.Results[i]
+		if x.SettlementID != "p1" || x.Account != "aa-1" || x.Asset != "usdc" || x.Charged != 1504 {
+			t.Fatalf("item %d missing trace fields: %+v", i, x)
+		}
+	}
+
+	// 退款后余额恢复为 2000（全额含手续费）。
+	r = runCLIWith(t, []string{"query", "-l", ledgerPath}, "")
+	var snap struct {
+		Balances []struct {
+			Balance int64 `json:"balance"`
+		} `json:"balances"`
+		Refunds []struct {
+			ID           string `json:"id"`
+			SettlementID string `json:"settlement_id"`
+			Reason       string `json:"reason"`
+			Charged      int64  `json:"charged"`
+		} `json:"refunds"`
+	}
+	if err := json.Unmarshal([]byte(r.out), &snap); err != nil {
+		t.Fatal(err)
+	}
+	if len(snap.Balances) != 1 || snap.Balances[0].Balance != 2000 {
+		t.Fatalf("balance after refund=%+v", snap.Balances)
+	}
+	if len(snap.Refunds) != 1 || snap.Refunds[0].SettlementID != "p1" || snap.Refunds[0].Charged != 1504 {
+		t.Fatalf("query refunds=%+v", snap.Refunds)
+	}
+
+	// 空列表返回空结果。
+	if r := runCLIWith(t, []string{"refund", "-l", ledgerPath}, `{"refunds":[]}`); r.code != 0 ||
+		strings.TrimSpace(r.out) != "{\n  \"results\": []\n}" {
+		t.Fatalf("empty refund batch: code=%d out=%q err=%s", r.code, r.out, r.err)
+	}
+
+	// 非法 JSON 走批次级错误信封。
+	if r := runCLIWith(t, []string{"refund", "-l", ledgerPath}, `{bad`); r.code != 1 ||
+		decodeOut(t, r.err)["error"].(map[string]any)["kind"] != "invalid_parameter" {
+		t.Fatalf("bad refund json: code=%d err=%s", r.code, r.err)
+	}
+
+	// 缺少 -l。
+	if r := runCLIWith(t, []string{"refund"}, `{"refunds":[]}`); r.code != 1 ||
+		decodeOut(t, r.err)["error"].(map[string]any)["kind"] != "invalid_parameter" {
+		t.Fatalf("refund without -l: %+v", r)
+	}
+
+	// 未初始化账本。
+	missing := t.TempDir() + "/nope.json"
+	if r := runCLIWith(t, []string{"refund", "-l", missing}, `{"refunds":[]}`); r.code != 1 ||
+		decodeOut(t, r.err)["error"].(map[string]any)["kind"] != "ledger_not_initialized" {
+		t.Fatalf("refund on missing ledger: %+v", r)
+	}
+}
+
+func TestCLIRefundOnCorruptLedger(t *testing.T) {
+	path := t.TempDir() + "/corrupt.json"
+	if err := os.WriteFile(path, []byte(`{"version":1,`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	r := runCLIWith(t, []string{"refund", "-l", path}, `{"refunds":[]}`)
+	if r.code != 1 || decodeOut(t, r.err)["error"].(map[string]any)["kind"] != "corrupt_ledger" {
+		t.Fatalf("refund on corrupt: code=%d err=%s", r.code, r.err)
+	}
+}
+
+func TestCLIHelpListsRefund(t *testing.T) {
+	r := runCLIWith(t, []string{"help"}, "")
+	if !strings.Contains(r.out, "refund") {
+		t.Fatalf("help does not mention refund:\n%s", r.out)
+	}
+}

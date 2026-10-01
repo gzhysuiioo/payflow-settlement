@@ -19,38 +19,52 @@ import (
 //	 "initial_balances":[{"account":"aa","asset":"usdc","balance":1000}],
 //	 "balances":[{"account":"aa","asset":"usdc","balance":700}],
 //	 "settlements":[{...一笔成功结算及其当时费率...}],
+//	 "refunds":[{...一笔成功全额退款...}],
 //	 "checksum":"<sha256 of the document without checksum>"}
 //
 // initial_balances 在初始化时冻结，用于检测任何对历史余额/记录的篡改；
 // checksum 覆盖截断、比特翻转与所有语义编辑。
 //
+// refunds 字段缺省（旧版账本没有该字段）即视为空列表：旧文件可直接打开；
+// 只要账本没有发生退款，写回时该字段继续缺省，读取旧账本不会改写文件。
+//
 // 写入采用“临时文件 + fsync + 原子 rename + 目录 fsync”，
 // 因此崩溃后磁盘上只会存在完整的旧版本或完整新版本，
-// 不会出现“扣款无记录”或“记录未扣款”的中间状态。
+// 不会出现“扣款/退款无记录”或“记录未改余额”的中间状态。
 const ledgerVersion = 1
 
 // 结算结果状态，与命令行输出一一对应，可分别识别。
 const (
-	StatusSettled   = "settled"              // 成功扣款
-	StatusDuplicate = "duplicate"            // 幂等重试：字段与原记录一致，返回原结算，不再扣款
-	StatusConflict  = "conflict"             // 编号冲突：编号已成功但字段或费率不同
-	StatusState     = "state_error"          // 非 pending
-	StatusFunds     = "insufficient_balance" // 余额不足（含不存在的账户/资产组合）
-	StatusInvalid   = "invalid_parameter"
-	StatusStorage   = "storage_error"
+	StatusSettled         = "settled"              // 成功扣款
+	StatusDuplicate       = "duplicate"            // 幂等重试：字段与原记录一致，返回原结算/原退款，不再入账
+	StatusConflict        = "conflict"             // 编号冲突：编号已成功但字段或费率/目标或原因不同
+	StatusState           = "state_error"          // 非 pending
+	StatusFunds           = "insufficient_balance" // 余额不足（含不存在的账户/资产组合）
+	StatusInvalid         = "invalid_parameter"
+	StatusStorage         = "storage_error"
+	StatusRefundSuccess   = "refunded"         // 成功全额退回
+	StatusNotFound        = "not_found"        // 退款目标结算不存在（含原付款只曾失败）
+	StatusAlreadyRefunded = "already_refunded" // 原付款已被其他退款编号全额退回
 )
 
 // 拒绝原因。
 const (
-	reasonEmptyID      = "intent id must not be empty"
-	reasonEmptyAccount = "account must not be empty"
-	reasonEmptyAsset   = "asset must not be empty"
-	reasonBadAmount    = "amount must be a positive int64"
-	reasonOverflow     = "amount plus fee overflows int64"
-	reasonNotPending   = "intent is not pending"
-	reasonFunds        = "insufficient balance for amount plus fee"
-	reasonDuplicate    = "duplicate settlement attempt"
-	reasonConflict     = "settlement id conflicts with a different request"
+	reasonEmptyID         = "intent id must not be empty"
+	reasonEmptyAccount    = "account must not be empty"
+	reasonEmptyAsset      = "asset must not be empty"
+	reasonBadAmount       = "amount must be a positive int64"
+	reasonOverflow        = "amount plus fee overflows int64"
+	reasonNotPending      = "intent is not pending"
+	reasonFunds           = "insufficient balance for amount plus fee"
+	reasonDuplicate       = "duplicate settlement attempt"
+	reasonConflict        = "settlement id conflicts with a different request"
+	reasonEmptyRefundID   = "refund id must not be empty"
+	reasonEmptySettlement = "settlement_id must not be empty"
+	reasonEmptyReason     = "refund reason must not be empty"
+	reasonSettlementGone  = "settlement %q not found"
+	reasonAlreadyRefunded = "settlement %q has already been refunded by %q"
+	reasonRefundConflict  = "refund id conflicts with a different request"
+	reasonDuplicateRefund = "duplicate refund attempt"
 )
 
 // BalanceInit 是初始化时一个 (账户, 资产) 组合的起始余额。
@@ -104,6 +118,53 @@ type BatchResult struct {
 	Results []ItemResult `json:"results"`
 }
 
+// RefundRequest 是退款批次中的一项：退款编号、原付款编号、退款原因，三者均须非空。
+type RefundRequest struct {
+	ID           string `json:"id"`
+	SettlementID string `json:"settlement_id"`
+	Reason       string `json:"reason"`
+}
+
+// RefundBatch 是一次退款提交：有序的退款请求列表。
+type RefundBatch struct {
+	Refunds []RefundRequest `json:"refunds"`
+}
+
+// RefundRecord 是一笔成功全额退款留下的永久记录，按退款成功先后顺序保存。
+// 退款金额与去向（账户/资产/总额）全部由原结算记录确定，因此一并冗余记录，
+// 使每条退款都能脱离上下文自解释、可追溯原结算。
+// AfterSeq 是退款落账时结算历史的长度：余额校验要求该结算在此时点之前发生。
+type RefundRecord struct {
+	ID           string `json:"id"`
+	SettlementID string `json:"settlement_id"`
+	Reason       string `json:"reason"`
+	Account      string `json:"account"`
+	Asset        string `json:"asset"`
+	Amount       int64  `json:"amount"`
+	Fee          int64  `json:"fee"`
+	Charged      int64  `json:"charged"`
+	AfterSeq     int64  `json:"after_seq"`
+	Seq          int64  `json:"seq"`
+}
+
+// RefundResult 是一项退款的处理结果。成功与幂等重复携带原付款编号、账户、
+// 资产、退款总额与原因；失败只带状态与说明。
+type RefundResult struct {
+	ID           string        `json:"id"`
+	Status       string        `json:"status"`
+	Reason       string        `json:"reason,omitempty"`
+	SettlementID string        `json:"settlement_id,omitempty"`
+	Account      string        `json:"account,omitempty"`
+	Asset        string        `json:"asset,omitempty"`
+	Charged      int64         `json:"charged,omitempty"`
+	Record       *RefundRecord `json:"record,omitempty"`
+}
+
+// RefundBatchResult 是一次退款提交的结果，顺序与输入逐项对应。
+type RefundBatchResult struct {
+	Results []RefundResult `json:"results"`
+}
+
 // BalanceView 是一个 (账户, 资产) 组合的当前余额。
 type BalanceView struct {
 	Account string `json:"account"`
@@ -111,10 +172,11 @@ type BalanceView struct {
 	Balance int64  `json:"balance"`
 }
 
-// Snapshot 是账本查询结果。
+// Snapshot 是账本查询结果。Refunds 按退款成功先后排列，无退款时为空列表。
 type Snapshot struct {
-	Balances    []BalanceView `json:"balances"`
-	Settlements []Record      `json:"settlements"`
+	Balances    []BalanceView  `json:"balances"`
+	Settlements []Record       `json:"settlements"`
+	Refunds     []RefundRecord `json:"refunds"`
 }
 
 // LedgerError 携带可机读分类（与 ItemResult.Status 对齐）和说明。
@@ -164,14 +226,18 @@ type ledgerState struct {
 	Initial     map[balanceKey]int64 // 初始化时冻结的起始余额，仅用于完整性校验
 	Balances    map[balanceKey]int64 // 当前余额
 	Settlements []Record
+	Refunds     []RefundRecord
 }
 
 // 磁盘文档字段（顺序即签名时的规范顺序，不得调整，否则旧文件校验失败）。
+// Refunds 使用 omitempty：旧版账本缺省该字段即可读入为 nil（视为空），
+// 且无退款的账本写回时继续省略该字段。
 type unsignedDoc struct {
-	Version     int           `json:"version"`
-	Initial     []BalanceView `json:"initial_balances"`
-	Balances    []BalanceView `json:"balances"`
-	Settlements []Record      `json:"settlements"`
+	Version     int            `json:"version"`
+	Initial     []BalanceView  `json:"initial_balances"`
+	Balances    []BalanceView  `json:"balances"`
+	Settlements []Record       `json:"settlements"`
+	Refunds     []RefundRecord `json:"refunds,omitempty"`
 }
 
 type signedDoc struct {
@@ -217,6 +283,7 @@ func (s *ledgerState) MarshalJSON() ([]byte, error) {
 		Initial:     balanceList(s.Initial),
 		Balances:    balanceList(s.Balances),
 		Settlements: settlements,
+		Refunds:     s.Refunds, // nil 时因 omitempty 省略，保持无退款账本的旧格式
 	}
 	payload, err := json.Marshal(doc)
 	if err != nil {
@@ -260,13 +327,18 @@ func (s *ledgerState) UnmarshalJSON(data []byte) error {
 	if records == nil {
 		records = []Record{}
 	}
-	if err := validateAndReplay(initial, current, records); err != nil {
+	refunds := doc.Refunds // 旧版账本缺省该字段，nil 视为空列表
+	if refunds == nil {
+		refunds = []RefundRecord{}
+	}
+	if err := validateAndReplay(initial, current, records, refunds); err != nil {
 		return err
 	}
 	s.Version = doc.Version
 	s.Initial = initial
 	s.Balances = current
 	s.Settlements = records
+	s.Refunds = refunds
 	return nil
 }
 
@@ -310,6 +382,7 @@ func CreateLedger(path string, init []BalanceInit) error {
 		Initial:     make(map[balanceKey]int64, len(init)),
 		Balances:    make(map[balanceKey]int64, len(init)),
 		Settlements: []Record{},
+		Refunds:     []RefundRecord{},
 	}
 	for _, b := range init {
 		k := balanceKey{b.Account, b.Asset}
@@ -597,6 +670,162 @@ func (l *Ledger) stage(key balanceKey, newBal int64, rec Record) func() {
 	}
 }
 
+// Refund 按输入顺序处理一个退款批次。各项独立处理：后项能看到前项成功退回的
+// 余额；任一项失败不影响其余项（存储错误只回滚出错项本身，前项保留，后项继续）。
+// 结果与输入逐项对应，空批次返回空结果。
+//
+// 语义：
+//   - 参数合法时，已成功的退款编号优先判定：目标结算与原因都相同返回 duplicate
+//     及原退款记录（不再入账）；任一不同返回 conflict。
+//   - 新退款编号：找不到成功结算（含原付款只曾失败）返回 not_found；
+//     该结算已被其他退款编号退回返回 refunded，不增加余额。
+//   - 成功时把原记录的 charged（含当时已扣手续费）全额退回原账户、原资产；
+//     退款金额与去向完全由原结算确定，原结算记录及其编号、顺序保持不变。
+//   - 失败申请不占用退款编号，之后可修改原因或目标再提交。
+func (l *Ledger) Refund(batch RefundBatch) (*RefundBatchResult, error) {
+	if err := l.beginOp(); err != nil {
+		return nil, err
+	}
+	defer l.endOp()
+	out := &RefundBatchResult{Results: make([]RefundResult, 0, len(batch.Refunds))}
+
+	l.reg.mu.Lock()
+	defer l.reg.mu.Unlock()
+
+	for i := range batch.Refunds {
+		req := &batch.Refunds[i]
+		res := RefundResult{ID: req.ID}
+
+		// 1. 参数校验：退款编号、原付款编号、原因三者都必须非空。
+		//    未通过的编号不占用退款资格。
+		if req.ID == "" {
+			res.Status = StatusInvalid
+			res.Reason = reasonEmptyRefundID
+			out.Results = append(out.Results, res)
+			continue
+		}
+		if req.SettlementID == "" {
+			res.Status = StatusInvalid
+			res.Reason = reasonEmptySettlement
+			out.Results = append(out.Results, res)
+			continue
+		}
+		if req.Reason == "" {
+			res.Status = StatusInvalid
+			res.Reason = reasonEmptyReason
+			out.Results = append(out.Results, res)
+			continue
+		}
+
+		// 2. 已成功退款编号优先判定：目标与原因都相同则幂等返回原退款记录；
+		//    任一不同则冲突。两者都不再入账。本批次内先成功的同编号项也在此可见。
+		if prior, exists := l.findRefund(req.ID); exists {
+			if prior.SettlementID == req.SettlementID && prior.Reason == req.Reason {
+				cp := prior
+				res.Status = StatusDuplicate
+				res.Reason = prior.Reason
+				res.SettlementID = prior.SettlementID
+				res.Account = prior.Account
+				res.Asset = prior.Asset
+				res.Charged = prior.Charged
+				res.Record = &cp
+			} else {
+				res.Status = StatusConflict
+				res.Reason = reasonRefundConflict
+			}
+			out.Results = append(out.Results, res)
+			continue
+		}
+
+		// 3. 新退款编号：目标必须是一笔成功结算（原付款只曾失败也算不存在）。
+		target, exists := l.findRecord(req.SettlementID)
+		if !exists {
+			res.Status = StatusNotFound
+			res.Reason = fmt.Sprintf(reasonSettlementGone, req.SettlementID)
+			out.Results = append(out.Results, res)
+			continue
+		}
+
+		// 4. 每笔原付款最多退回一次：已被其他退款编号退回则报告已退款，不加余额。
+		if prior, refunded := l.findRefundOfSettlement(req.SettlementID); refunded {
+			res.Status = StatusAlreadyRefunded
+			res.Reason = fmt.Sprintf(reasonAlreadyRefunded, req.SettlementID, prior.ID)
+			out.Results = append(out.Results, res)
+			continue
+		}
+
+		// 5. 全额退回原账户、原资产（amount 与当时手续费一并退回），
+		//    与退款记录在同一个原子写入中落盘；保存失败回滚该项。
+		rec := RefundRecord{
+			ID:           req.ID,
+			SettlementID: target.ID,
+			Reason:       req.Reason,
+			Account:      target.Account,
+			Asset:        target.Asset,
+			Amount:       target.Amount,
+			Fee:          target.Fee,
+			Charged:      target.Charged,
+			AfterSeq:     int64(len(l.reg.state.Settlements)),
+			Seq:          int64(len(l.reg.state.Refunds)) + 1,
+		}
+		key := balanceKey{target.Account, target.Asset}
+		bal := l.reg.state.Balances[key]
+		rollback := l.stageRefund(key, bal+target.Charged, rec)
+		if err := l.persistLocked(); err != nil {
+			rollback()
+			res.Status = StatusStorage
+			res.Reason = err.Error()
+		} else {
+			cp := rec
+			res.Status = StatusRefundSuccess
+			res.Reason = rec.Reason
+			res.SettlementID = rec.SettlementID
+			res.Account = rec.Account
+			res.Asset = rec.Asset
+			res.Charged = rec.Charged
+			res.Record = &cp
+		}
+		out.Results = append(out.Results, res)
+	}
+	return out, nil
+}
+
+// stageRefund 应用一笔退款（余额增加 + 记录追加），返回回滚函数。
+func (l *Ledger) stageRefund(key balanceKey, newBal int64, rec RefundRecord) func() {
+	oldBal, hadKey := l.reg.state.Balances[key]
+	oldLen := len(l.reg.state.Refunds)
+	l.reg.state.Balances[key] = newBal
+	l.reg.state.Refunds = append(l.reg.state.Refunds, rec)
+	return func() {
+		if hadKey {
+			l.reg.state.Balances[key] = oldBal
+		} else {
+			delete(l.reg.state.Balances, key)
+		}
+		l.reg.state.Refunds = l.reg.state.Refunds[:oldLen]
+	}
+}
+
+func (l *Ledger) findRefund(id string) (RefundRecord, bool) {
+	// 退款按成功顺序追加且 ID 唯一；单机账本量级直接扫描。
+	for _, r := range l.stateView().Refunds {
+		if r.ID == id {
+			return r, true
+		}
+	}
+	return RefundRecord{}, false
+}
+
+// findRefundOfSettlement 返回退回指定结算的那笔退款（每笔结算最多一笔）。
+func (l *Ledger) findRefundOfSettlement(settlementID string) (RefundRecord, bool) {
+	for _, r := range l.stateView().Refunds {
+		if r.SettlementID == settlementID {
+			return r, true
+		}
+	}
+	return RefundRecord{}, false
+}
+
 func (l *Ledger) stateView() *ledgerState { return l.reg.state }
 
 func (l *Ledger) findRecord(id string) (Record, bool) {
@@ -636,7 +865,9 @@ func (l *Ledger) Query() (*Snapshot, error) {
 	sortBalances(bals)
 	recs := make([]Record, len(st.Settlements))
 	copy(recs, st.Settlements)
-	return &Snapshot{Balances: bals, Settlements: recs}, nil
+	refunds := make([]RefundRecord, len(st.Refunds))
+	copy(refunds, st.Refunds)
+	return &Snapshot{Balances: bals, Settlements: recs, Refunds: refunds}, nil
 }
 
 // Balance 返回单个 (账户, 资产) 组合的余额；组合不存在按 0 处理。

@@ -35,6 +35,8 @@ func runCLI(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return cmdInit(args[1:], stdin, stdout, stderr)
 	case "submit":
 		return cmdSubmit(args[1:], stdin, stdout, stderr)
+	case "refund":
+		return cmdRefund(args[1:], stdin, stdout, stderr)
 	case "query":
 		return cmdQuery(args[1:], stdout, stderr)
 	default:
@@ -50,14 +52,15 @@ func usage(w io.Writer) {
 	fmt.Fprintln(w, "commands:")
 	fmt.Fprintln(w, "  init     initialize a ledger with starting balances")
 	fmt.Fprintln(w, "  submit   submit a JSON payment batch against a ledger")
-	fmt.Fprintln(w, "  query    print balances and settlement records of a ledger")
+	fmt.Fprintln(w, "  refund   submit a JSON full-refund batch against a ledger")
+	fmt.Fprintln(w, "  query    print balances, settlement and refund records of a ledger")
 	fmt.Fprintln(w, "  demo     run the in-memory settlement demo")
 	fmt.Fprintln(w, "  version  print version")
 	fmt.Fprintln(w, "  help     show this help")
 	fmt.Fprintln(w, "")
-	fmt.Fprintln(w, "ledger flags (init/submit/query):")
+	fmt.Fprintln(w, "ledger flags (init/submit/refund/query):")
 	fmt.Fprintln(w, "  -l, --ledger <path>   ledger file path (required)")
-	fmt.Fprintln(w, "  -f, --file <path>     JSON input file (init/submit; default: stdin)")
+	fmt.Fprintln(w, "  -f, --file <path>     JSON input file (init/submit/refund; default: stdin)")
 }
 
 // initRequest 是 init 的输入：{"balances":[...]}。
@@ -173,6 +176,42 @@ func cmdSubmit(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 
 	// 即使批次内全部项都失败，也是正常的逐项结果，退出码仍为 0。
 	result, err := l.Submit(batch)
+	if err != nil {
+		return failWithError(stderr, err)
+	}
+	writeJSON(stdout, result)
+	return 0
+}
+
+func cmdRefund(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
+	fs, ledgerPath, inputFile := ledgerFlagSet("refund")
+	if err := fs.Parse(args); err != nil {
+		return failEnvelope(stderr, payflow.ErrInvalid, err.Error())
+	}
+	if *ledgerPath == "" {
+		return failEnvelope(stderr, payflow.ErrInvalid, "refund requires --ledger <path>")
+	}
+	raw, err := readInput(*inputFile, stdin)
+	if err != nil {
+		return failEnvelope(stderr, payflow.ErrStorage, "read input: "+err.Error())
+	}
+	var batch payflow.RefundBatch
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	if err := dec.Decode(&batch); err != nil {
+		return failEnvelope(stderr, payflow.ErrInvalid, "parse refund batch JSON: "+err.Error())
+	}
+	if err := requireEOF(dec, "refund"); err != nil {
+		return failEnvelope(stderr, payflow.ErrInvalid, err.Error())
+	}
+
+	l, err := payflow.Open(*ledgerPath)
+	if err != nil {
+		return failWithError(stderr, err)
+	}
+	defer l.Close()
+
+	// 即使批次内全部项都失败，也是正常的逐项结果，退出码仍为 0。
+	result, err := l.Refund(batch)
 	if err != nil {
 		return failWithError(stderr, err)
 	}
