@@ -2,6 +2,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 
@@ -18,6 +19,14 @@ func main() {
 		runDemo()
 	case "version":
 		fmt.Println("payflow 0.1.0")
+	case "init":
+		runInit()
+	case "submit":
+		runSubmit()
+	case "balance":
+		runBalance()
+	case "records":
+		runRecords()
 	case "help", "-h", "--help":
 		usage()
 	default:
@@ -28,7 +37,86 @@ func main() {
 }
 
 func usage() {
-	fmt.Println("usage: payflow [demo|version|help]")
+	fmt.Println("usage: payflow [demo|version|init|submit|balance|records|help]")
+}
+
+func runInit() {
+	if len(os.Args) < 3 {
+		fatal("usage: payflow init <ledger-path>")
+	}
+	path := os.Args[2]
+	var balances []payflow.Balance
+	if err := json.NewDecoder(os.Stdin).Decode(&balances); err != nil {
+		fatal("invalid init data: %v", err)
+	}
+	if err := payflow.Init(path, balances); err != nil {
+		fatal("init failed: %v", err)
+	}
+	fmt.Printf("ledger initialized at %s\n", path)
+}
+
+func runSubmit() {
+	if len(os.Args) < 3 {
+		fatal("usage: payflow submit <ledger-path>")
+	}
+	path := os.Args[2]
+	var batch payflow.Batch
+	if err := json.NewDecoder(os.Stdin).Decode(&batch); err != nil {
+		fatal("invalid batch: %v", err)
+	}
+	ledger, err := payflow.Open(path)
+	if err != nil {
+		fatal("cannot open ledger: %v", err)
+	}
+	defer ledger.Close()
+	results, err := ledger.Submit(batch)
+	if err != nil {
+		fatal("submit failed: %v", err)
+	}
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(results); err != nil {
+		fatal("cannot write results: %v", err)
+	}
+}
+
+func runBalance() {
+	if len(os.Args) < 3 {
+		fatal("usage: payflow balance <ledger-path>")
+	}
+	path := os.Args[2]
+	ledger, err := payflow.Open(path)
+	if err != nil {
+		fatal("cannot open ledger: %v", err)
+	}
+	defer ledger.Close()
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(ledger.Balances()); err != nil {
+		fatal("cannot write balances: %v", err)
+	}
+}
+
+func runRecords() {
+	if len(os.Args) < 3 {
+		fatal("usage: payflow records <ledger-path>")
+	}
+	path := os.Args[2]
+	ledger, err := payflow.Open(path)
+	if err != nil {
+		fatal("cannot open ledger: %v", err)
+	}
+	defer ledger.Close()
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(ledger.Records()); err != nil {
+		fatal("cannot write records: %v", err)
+	}
+}
+
+func fatal(format string, args ...any) {
+	fmt.Fprintf(os.Stderr, format+"\n", args...)
+	os.Exit(1)
 }
 
 func runDemo() {
