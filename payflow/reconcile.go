@@ -207,18 +207,7 @@ func ParseReconcileRequest(raw []byte) ([]FlowEntry, error) {
 		at := func(msg string) error {
 			return ledgerError(ErrInvalid, "reconcile entry %d: %s", i, msg)
 		}
-		if e.Kind != "payment" && e.Kind != "refund" {
-			return nil, at(fmt.Sprintf("unknown kind %q (want payment or refund)", e.Kind))
-		}
-		if e.ID == "" {
-			return nil, at("id must not be empty")
-		}
-		if e.Account == "" {
-			return nil, at("account must not be empty")
-		}
-		if e.Asset == "" {
-			return nil, at("asset must not be empty")
-		}
+		// 金额字段必须显式提供且为 int64 整数（区分缺省/null/非数字/越界）。
 		if e.Amount == nil {
 			return nil, at("amount is required and must be an int64 integer")
 		}
@@ -227,18 +216,6 @@ func ParseReconcileRequest(raw []byte) ([]FlowEntry, error) {
 		}
 		if e.Charged == nil {
 			return nil, at("charged is required and must be an int64 integer")
-		}
-		if e.Amount.v <= 0 {
-			return nil, at("amount must be a positive int64")
-		}
-		if e.Fee.v < 0 {
-			return nil, at("fee must be a non-negative int64")
-		}
-		if e.Charged.v <= 0 {
-			return nil, at("charged must be a positive int64")
-		}
-		if e.Kind == "refund" && e.SettlementID == "" {
-			return nil, at("settlement_id must not be empty for a refund")
 		}
 		entries = append(entries, FlowEntry{
 			Index:        i,
@@ -252,7 +229,53 @@ func ParseReconcileRequest(raw []byte) ([]FlowEntry, error) {
 			SettlementID: e.SettlementID,
 		})
 	}
+	// 余下的取值校验与 Go 入口直接接收流水时完全一致，两种提交方式对
+	// 相同流水内容给出一致判断。
+	if err := validateFlowEntries(entries); err != nil {
+		return nil, err
+	}
 	return entries, nil
+}
+
+// validateFlowEntries 校验外部流水条目的取值。kind 只能是 payment 或 refund；
+// 编号、账户、资产不能为空；amount 与 charged 必须大于零，fee 必须非负；
+// refund 还必须有非空 settlement_id。任一条目不合法即整次拒绝，返回第一条
+// 非法流水在列表中的位置及出错字段；前面已有合法条目也不产生部分结果或汇总。
+// 这是对账的只读前置校验，不触碰账本状态，因此不改变余额、历史或文件。
+// 金额与账本是否一致（amount 加 fee 是否等于 charged、退款引用的原付款是否
+// 与账本相符）不在此校验：不一致仍按现有核对规则给出字段差异，不是参数错误。
+func validateFlowEntries(entries []FlowEntry) error {
+	for i := range entries {
+		e := &entries[i]
+		at := func(msg string) error {
+			return ledgerError(ErrInvalid, "reconcile entry %d: %s", i, msg)
+		}
+		if e.Kind != "payment" && e.Kind != "refund" {
+			return at(fmt.Sprintf("unknown kind %q (want payment or refund)", e.Kind))
+		}
+		if e.ID == "" {
+			return at("id must not be empty")
+		}
+		if e.Account == "" {
+			return at("account must not be empty")
+		}
+		if e.Asset == "" {
+			return at("asset must not be empty")
+		}
+		if e.Amount <= 0 {
+			return at("amount must be a positive int64")
+		}
+		if e.Fee < 0 {
+			return at("fee must be a non-negative int64")
+		}
+		if e.Charged <= 0 {
+			return at("charged must be a positive int64")
+		}
+		if e.Kind == "refund" && e.SettlementID == "" {
+			return at("settlement_id must not be empty for a refund")
+		}
+	}
+	return nil
 }
 
 // reconSide 累计单侧（账本或流水）的金额。流水侧可能包含账本外的组合，
@@ -331,6 +354,12 @@ func (l *Ledger) ReconcileFlowRanged(entries []FlowEntry, bounds ReconcileBounds
 		return nil, err
 	}
 	defer l.endOp()
+	// 与 JSON 解析入口一致的取值校验：非法流水整次拒绝（invalid_parameter），
+	// 报告为空，且不让范围外或重复等核对状态掩盖参数错误。校验只读、不触碰
+	// 账本状态，因此参数错误返回后同一句柄可继续接受后续合法对账。
+	if err := validateFlowEntries(entries); err != nil {
+		return nil, err
+	}
 	l.reg.mu.Lock()
 	defer l.reg.mu.Unlock()
 
