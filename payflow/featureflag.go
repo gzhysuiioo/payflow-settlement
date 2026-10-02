@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strconv"
 	"unicode/utf8"
 )
 
@@ -98,6 +99,9 @@ func ParseConfig(raw []byte) (*Config, error) {
 	if !utf8.Valid(raw) {
 		return nil, fmt.Errorf("config: file is not valid UTF-8")
 	}
+	if err := rejectDuplicateFields(raw, "config"); err != nil {
+		return nil, err
+	}
 	var doc any
 	if err := json.Unmarshal(raw, &doc); err != nil {
 		return nil, fmt.Errorf("config: invalid JSON: %w", err)
@@ -137,6 +141,9 @@ func ParseConfig(raw []byte) (*Config, error) {
 func ParseContext(raw []byte) (*Context, error) {
 	if !utf8.Valid(raw) {
 		return nil, fmt.Errorf("context: file is not valid UTF-8")
+	}
+	if err := rejectDuplicateFields(raw, "context"); err != nil {
+		return nil, err
 	}
 	var doc any
 	if err := json.Unmarshal(raw, &doc); err != nil {
@@ -239,6 +246,83 @@ func MarshalResult(r EvalResult) ([]byte, error) {
 }
 
 // --- strict parsing helpers -------------------------------------------------
+
+// rejectDuplicateFields 按文件原文顺序扫描 JSON 令牌流，拒绝任何在同一对象内
+// 重复声明的字段名。字段名按解码后的字符串比较（"enabled" 与 "énabled"
+// 同名），大小写不同仍是不同字段，名字中的空白不裁剪。检查覆盖所有对象，
+// 包括附加字段里嵌套的对象；数组元素不属于这一检查。label 是根对象的位置
+// 前缀（"config" 或 "context"）。JSON 语法错误不在此报告，留给 Unmarshal。
+func rejectDuplicateFields(raw []byte, label string) error {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	type frame struct {
+		path      string
+		object    bool
+		keys      map[string]struct{}
+		lastKey   string
+		expectKey bool
+		nextIndex int
+	}
+	var stack []*frame
+	// valueDone 在栈顶容器完成一个值（对象的一个字段值或数组的一个元素）后调用。
+	valueDone := func() {
+		if len(stack) == 0 {
+			return
+		}
+		top := stack[len(stack)-1]
+		if top.object {
+			top.expectKey = true
+		} else {
+			top.nextIndex++
+		}
+	}
+	childPath := func() string {
+		top := stack[len(stack)-1]
+		if top.object {
+			return top.path + "." + top.lastKey
+		}
+		return top.path + "[" + strconv.Itoa(top.nextIndex) + "]"
+	}
+	for {
+		tok, err := dec.Token()
+		if err != nil {
+			// io.EOF 或语法错误；语法错误由后续 Unmarshal 报告。
+			break
+		}
+		switch t := tok.(type) {
+		case json.Delim:
+			switch t {
+			case '{', '[':
+				path := label
+				if len(stack) > 0 {
+					path = childPath()
+				}
+				f := &frame{path: path, object: t == '{', expectKey: true}
+				if f.object {
+					f.keys = make(map[string]struct{})
+				}
+				stack = append(stack, f)
+			case '}', ']':
+				stack = stack[:len(stack)-1]
+				valueDone()
+			}
+		case string:
+			if len(stack) > 0 && stack[len(stack)-1].object && stack[len(stack)-1].expectKey {
+				top := stack[len(stack)-1]
+				if _, dup := top.keys[t]; dup {
+					return fmt.Errorf("%s.%s: duplicate field %q", top.path, t, t)
+				}
+				top.keys[t] = struct{}{}
+				top.lastKey = t
+				top.expectKey = false
+			} else {
+				valueDone()
+			}
+		default:
+			valueDone()
+		}
+	}
+	return nil
+}
 
 func parseFlag(raw any, index int) (Flag, error) {
 	loc := fmt.Sprintf("config.flags[%d]", index)

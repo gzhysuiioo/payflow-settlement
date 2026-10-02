@@ -335,6 +335,133 @@ func TestInvalidUTF8(t *testing.T) {
 	}
 }
 
+func TestDuplicateFieldsRejected(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  string
+		want string // 错误信息需包含的定位片段
+	}{
+		{"flag enabled", `{"flags":[{"key":"f","enabled":false,"enabled":true,"default":false,"rules":[]}]}`,
+			`config.flags[0].enabled`},
+		{"second flag", `{"flags":[
+			{"key":"f","enabled":true,"default":false,"rules":[]},
+			{"key":"g","enabled":true,"enabled":false,"default":false,"rules":[]}]}`,
+			`config.flags[1].enabled`},
+		{"top level", `{"flags":[],"flags":[]}`, `config.flags`},
+		{"rule value", `{"flags":[{"key":"f","enabled":true,"default":false,"rules":[
+			{"id":"r","value":true,"value":false,"conditions":[{"attribute":"a","op":"eq","value":"x"}]}]}]}`,
+			`config.flags[0].rules[0].value`},
+		{"condition op", `{"flags":[{"key":"f","enabled":true,"default":false,"rules":[
+			{"id":"r","value":true,"conditions":[{"attribute":"a","op":"eq","op":"in","value":"x"}]}]}]}`,
+			`config.flags[0].rules[0].conditions[0].op`},
+		{"nested extra field", `{"flags":[{"key":"f","enabled":true,"default":false,"rules":[],
+			"meta":{"owner":"a","owner":"b"}}]}`,
+			`config.flags[0].meta.owner`},
+		{"deeply nested extra field", `{"flags":[{"key":"f","enabled":true,"default":false,"rules":[],
+			"meta":{"team":{"name":"x","name":"y"}}}]}`,
+			`config.flags[0].meta.team.name`},
+		{"extra field nested in array", `{"flags":[{"key":"f","enabled":true,"default":false,"rules":[],
+			"tags":[{"v":1,"v":2}]}]}`,
+			`config.flags[0].tags[0].v`},
+		{"identical values still duplicate", `{"flags":[{"key":"f","enabled":true,"default":false,"default":false,"rules":[]}]}`,
+			`config.flags[0].default`},
+		{"duplicate in extra top-level field", `{"flags":[],"x":1,"x":2}`, `config.x`},
+		{"disabled flag not exempt", `{"flags":[{"key":"f","enabled":false,"enabled":false,"default":false,"rules":[]}]}`,
+			`config.flags[0].enabled`},
+		{"unselected flag not exempt", `{"flags":[
+			{"key":"good","enabled":true,"default":false,"rules":[]},
+			{"key":"bad","enabled":true,"default":false,"default":true,"rules":[]}]}`,
+			`config.flags[1].default`},
+		{"first duplicate in file order wins", `{"flags":[
+			{"key":"f","enabled":true,"default":false,"rules":[]},
+			{"key":"g","enabled":true,"enabled":true,"default":false,"default":false,"rules":[]}]}`,
+			`config.flags[1].enabled`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := ParseConfig([]byte(tc.raw))
+			if err == nil {
+				t.Fatalf("expected duplicate field error, got nil\nconfig: %s", tc.raw)
+			}
+			if !strings.Contains(err.Error(), "duplicate field") {
+				t.Fatalf("error = %q, want %q wording", err.Error(), "duplicate field")
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("error = %q, want location %q", err.Error(), tc.want)
+			}
+		})
+	}
+}
+
+func TestDuplicateFieldEscapedName(t *testing.T) {
+	// 字段名按解码后的字符串比较："enabled" 与 "énabled" 是同名。
+	raw := `{"flags":[{"key":"f","enabled":false,"\u0065nabled":true,"default":false,"rules":[]}]}`
+	_, err := ParseConfig([]byte(raw))
+	if err == nil || !strings.Contains(err.Error(), `config.flags[0].enabled`) {
+		t.Fatalf("escaped duplicate: err=%v", err)
+	}
+	if !strings.Contains(err.Error(), "duplicate field") {
+		t.Fatalf("escaped duplicate wording: err=%v", err)
+	}
+}
+
+func TestDuplicateFieldsInContext(t *testing.T) {
+	_, err := ParseContext([]byte(`{"plan":"free","plan":"pro"}`))
+	if err == nil || !strings.Contains(err.Error(), `context.plan`) ||
+		!strings.Contains(err.Error(), "duplicate field") {
+		t.Fatalf("context duplicate: err=%v", err)
+	}
+	// 转义后同名也算重复。
+	_, err = ParseContext([]byte(`{"plan":"free","\u0070lan":"pro"}`))
+	if err == nil || !strings.Contains(err.Error(), `context.plan`) {
+		t.Fatalf("context escaped duplicate: err=%v", err)
+	}
+}
+
+func TestDuplicateFieldLookalikesAllowed(t *testing.T) {
+	// 大小写不同的字段名是不同字段。
+	cfg := mustParseConfig(t, `{"flags":[{"key":"f","enabled":true,"Enabled":false,"default":false,"rules":[]}]}`)
+	if !cfg.Flags[0].Enabled {
+		t.Fatal("lowercase enabled should win as the real field")
+	}
+	// 名字中的空白不裁剪，"enabled " 与 "enabled" 不同名。
+	mustParseConfig(t, `{"flags":[{"key":"f","enabled":true,"enabled ":false,"default":false,"rules":[]}]}`)
+	// 同名字段分别出现在不同开关、不同规则里是合法的。
+	mustParseConfig(t, `{"flags":[
+		{"key":"f","enabled":true,"default":false,"rules":[
+			{"id":"r","value":true,"conditions":[{"attribute":"a","op":"eq","value":"x"}]}]},
+		{"key":"g","enabled":true,"default":false,"rules":[
+			{"id":"r","value":true,"conditions":[{"attribute":"a","op":"eq","value":"x"}]}]}]}`)
+	// 字符串数组中的重复元素不属于重复字段。
+	mustParseConfig(t, `{"flags":[{"key":"f","enabled":true,"default":false,"rules":[
+		{"id":"r","value":true,"conditions":[{"attribute":"a","op":"in","value":["x","x"]}]}]}]}`)
+	// 上下文中不同名的字段互不影响。
+	mustParseContext(t, `{"plan":"pro","Plan":"free"}`)
+}
+
+func TestUniquenessErrorsDistinctFromDuplicateFields(t *testing.T) {
+	// 两个开关使用相同 key 仍按唯一性规则报告，措辞与重复字段不同。
+	_, err := ParseConfig([]byte(`{"flags":[
+		{"key":"f","enabled":true,"default":false,"rules":[]},
+		{"key":"f","enabled":true,"default":false,"rules":[]}]}`))
+	if err == nil || !strings.Contains(err.Error(), "duplicate flag key") {
+		t.Fatalf("flag key uniqueness: err=%v", err)
+	}
+	if strings.Contains(err.Error(), "duplicate field") {
+		t.Fatalf("uniqueness error must not read as duplicate field: %v", err)
+	}
+	// 同一开关内两条规则使用相同 id 同理。
+	_, err = ParseConfig([]byte(`{"flags":[{"key":"f","enabled":true,"default":false,"rules":[
+		{"id":"r","value":true,"conditions":[{"attribute":"a","op":"eq","value":"x"}]},
+		{"id":"r","value":false,"conditions":[{"attribute":"a","op":"eq","value":"y"}]}]}]}`))
+	if err == nil || !strings.Contains(err.Error(), "duplicate rule id") {
+		t.Fatalf("rule id uniqueness: err=%v", err)
+	}
+	if strings.Contains(err.Error(), "duplicate field") {
+		t.Fatalf("uniqueness error must not read as duplicate field: %v", err)
+	}
+}
+
 func TestEmptyFlagListAndFind(t *testing.T) {
 	cfg := mustParseConfig(t, `{"flags":[]}`)
 	if cfg.Find("missing") != nil {

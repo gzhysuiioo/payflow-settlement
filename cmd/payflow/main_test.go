@@ -192,6 +192,24 @@ func TestCLIErrorCases(t *testing.T) {
 			"duplicate flag key",
 		},
 		{
+			"duplicate field in config",
+			func(t *testing.T) []string {
+				h := newHarness(t, `{"flags":[
+					{"key":"f","enabled":true,"default":false,"rules":[]},
+					{"key":"g","enabled":false,"enabled":true,"default":false,"rules":[]}]}`, goodCtx)
+				return h.evalArgs("f")
+			},
+			`config.flags[1].enabled: duplicate field "enabled"`,
+		},
+		{
+			"duplicate field in context",
+			func(t *testing.T) []string {
+				h := newHarness(t, goodCfg, `{"plan":"free","plan":"pro"}`)
+				return h.evalArgs("feature-a")
+			},
+			`context.plan: duplicate field "plan"`,
+		},
+		{
 			"empty conditions on disabled flag",
 			func(t *testing.T) []string {
 				// 已关闭的开关也要完整校验。
