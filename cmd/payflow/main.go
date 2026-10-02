@@ -65,6 +65,9 @@ func usage(w io.Writer) {
 	fmt.Fprintln(w, "  -l, --ledger <path>   ledger file path (required)")
 	fmt.Fprintln(w, "  -f, --file <path>     JSON input file (init/submit/refund/reconcile; default: stdin)")
 	fmt.Fprintln(w, "")
+	fmt.Fprintln(w, "submit flags:")
+	fmt.Fprintln(w, "  --dry-run             preview settlement results without writing the ledger")
+	fmt.Fprintln(w, "")
 	fmt.Fprintln(w, "reconcile range flags (seq bounds, after < seq <= through; default: full history):")
 	fmt.Fprintln(w, "  --payment-after <n>    payment seq lower bound (exclusive)")
 	fmt.Fprintln(w, "  --payment-through <n>  payment seq upper bound (inclusive)")
@@ -158,6 +161,8 @@ func cmdInit(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 
 func cmdSubmit(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	fs, ledgerPath, inputFile := ledgerFlagSet("submit")
+	var dryRun bool
+	fs.BoolVar(&dryRun, "dry-run", false, "preview settlement results without writing the ledger")
 	if err := fs.Parse(args); err != nil {
 		return failEnvelope(stderr, payflow.ErrInvalid, err.Error())
 	}
@@ -184,6 +189,15 @@ func cmdSubmit(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	defer l.Close()
 
 	// 即使批次内全部项都失败，也是正常的逐项结果，退出码仍为 0。
+	// --dry-run 只预测业务结果：不写入账本，输出带 dry_run:true 标记。
+	if dryRun {
+		result, err := l.Preview(batch)
+		if err != nil {
+			return failWithError(stderr, err)
+		}
+		writeJSON(stdout, result)
+		return 0
+	}
 	result, err := l.Submit(batch)
 	if err != nil {
 		return failWithError(stderr, err)

@@ -132,6 +132,16 @@ type BatchResult struct {
 	Results []ItemResult `json:"results"`
 }
 
+// PreviewResult 是一次提交预览（--dry-run）的结果。DryRun 恒为 true，
+// 用于与真实提交输出区分；Results 与输入逐项对应，状态、失败原因与结算
+// 记录格式与 Submit 完全一致——其中 settled 表示“按当前账本预计能够成功”，
+// 携带的记录使用从当前最大付款序号之后连续递增的预计序号。
+// 预览不写入账本，序号、余额与本批次额度都不会被预留。
+type PreviewResult struct {
+	DryRun  bool         `json:"dry_run"`
+	Results []ItemResult `json:"results"`
+}
+
 // RefundRequest 是退款批次中的一项：退款编号、原付款编号、退款原因，三者均须非空。
 type RefundRequest struct {
 	ID           string `json:"id"`
@@ -609,20 +619,72 @@ func (l *Ledger) Submit(batch FeeBatch) (*BatchResult, error) {
 		return nil, err
 	}
 	defer l.endOp()
-	if batch.FeeBps < 0 || batch.FeeBps > 10000 {
-		return nil, ledgerError(ErrInvalid, "fee_bps must be within [0,10000], got %d", batch.FeeBps)
-	}
-	// 限额非法是批次级错误：任何意图都不执行（空意图列表同样检查）。
-	limits, err := validateLimits(batch.Limits)
+	limits, err := validateBatch(batch)
 	if err != nil {
 		return nil, err
 	}
-	out := &BatchResult{Results: make([]ItemResult, 0, len(batch.Intents))}
 
 	l.reg.mu.Lock()
 	defer l.reg.mu.Unlock()
 
-	// 本次提交内各组合已消耗的额度，从零开始，仅成功落账的扣款计入。
+	results := l.runBatch(batch, limits, l.reg.state, true)
+	return &BatchResult{Results: results}, nil
+}
+
+// Preview 在不写入账本的前提下，按当前账本预计算一个批次的结算结果，
+// 语义与 Submit 逐项一致（状态、失败原因、结算记录格式均相同）：
+//   - 后项看到前项“预计成功”后的可用余额与本批次已用限额；
+//   - 预计成功的新付款使用从当前最大付款序号之后连续递增的序号，
+//     失败、重复、冲突不消耗序号；
+//   - 已有成功编号仍按原付款字段与费率判断重复或冲突（原付款已退款也一样），
+//     重复项携带原记录，不占余额与本批次额度；本批次首次预计成功的编号对
+//     后续项同样生效（相同请求重复、字段不同冲突），失败项不占编号；
+//   - 手续费、金额溢出、状态与限额判断沿用实际提交规则，同时超限与余额不足
+//     仍先报告超限，限额只累计本次预计成功的扣款（含手续费）。
+//
+// 预览全程在当前状态的深拷贝上进行：不持久化、不修改真实余额与历史，
+// 任何编号、序号和额度都不被预留；连续预览相同批次（账本未变化）结果一致，
+// 随后真实提交仍按首次提交处理。预览只预测业务结果，不承诺真实提交时的
+// 写入成功（因此预览结果中不会出现 storage_error）。费率或限额非法属于
+// 批次级错误，返回 invalid_parameter 且不产生部分结果（空批次同样检查）。
+func (l *Ledger) Preview(batch FeeBatch) (*PreviewResult, error) {
+	if err := l.beginOp(); err != nil {
+		return nil, err
+	}
+	defer l.endOp()
+	limits, err := validateBatch(batch)
+	if err != nil {
+		return nil, err
+	}
+
+	l.reg.mu.Lock()
+	defer l.reg.mu.Unlock()
+
+	// 在快照副本上模拟：预览结束后真实状态与磁盘文件保持原样。
+	sim := cloneState(l.reg.state)
+	results := l.runBatch(batch, limits, sim, false)
+	return &PreviewResult{DryRun: true, Results: results}, nil
+}
+
+// validateBatch 执行批次级校验：费率范围与本次扣款上限。任一不合法都返回
+// 批次级错误（invalid_parameter），调用方不得执行任何意图（空批次同样检查）。
+func validateBatch(batch FeeBatch) (map[balanceKey]int64, error) {
+	if batch.FeeBps < 0 || batch.FeeBps > 10000 {
+		return nil, ledgerError(ErrInvalid, "fee_bps must be within [0,10000], got %d", batch.FeeBps)
+	}
+	// 限额非法是批次级错误：任何意图都不执行（空意图列表同样检查）。
+	return validateLimits(batch.Limits)
+}
+
+// runBatch 按输入顺序在给定状态 st 上处理整个批次，返回逐项结果。
+// persist 为 true 时（真实提交）每笔预计成功都先写入 st 再原子落盘，
+// 落盘失败回滚该项并报告 storage_error；为 false 时（预览）只在 st
+// （应为独立副本）上推进内存状态、绝不触碰磁盘，因此不会产生存储错误。
+// 调用方必须持有 reg.mu。
+func (l *Ledger) runBatch(batch FeeBatch, limits map[balanceKey]int64, st *ledgerState, persist bool) []ItemResult {
+	out := make([]ItemResult, 0, len(batch.Intents))
+
+	// 本次批次内各组合已消耗的额度，从零开始，仅预计成功的扣款计入。
 	used := make(map[balanceKey]int64, len(limits))
 
 	for i := range batch.Intents {
@@ -634,14 +696,14 @@ func (l *Ledger) Submit(batch FeeBatch) (*BatchResult, error) {
 		if !ok {
 			res.Status = StatusInvalid
 			res.Reason = reason
-			out.Results = append(out.Results, res)
+			out = append(out, res)
 			continue
 		}
 
 		// 2. 已成功编号：字段与费率完全一致则幂等返回原记录；
 		//    任一不同则编号冲突。两者都不再扣款、不改原记录。
-		//    本批次内先成功的同编号项也在此被看到。
-		if rec, exists := l.findRecord(it.ID); exists {
+		//    本批次内先（预计）成功的同编号项也在此被看到。
+		if rec, exists := findRecordIn(st.Settlements, it.ID); exists {
 			if sameRequest(rec, it, amount, batch.FeeBps) {
 				cp := rec
 				res.Status = StatusDuplicate
@@ -651,7 +713,7 @@ func (l *Ledger) Submit(batch FeeBatch) (*BatchResult, error) {
 				res.Status = StatusConflict
 				res.Reason = reasonConflict
 			}
-			out.Results = append(out.Results, res)
+			out = append(out, res)
 			continue
 		}
 
@@ -659,7 +721,7 @@ func (l *Ledger) Submit(batch FeeBatch) (*BatchResult, error) {
 		if it.State != "" && it.State != "pending" {
 			res.Status = StatusState
 			res.Reason = reasonNotPending
-			out.Results = append(out.Results, res)
+			out = append(out, res)
 			continue
 		}
 
@@ -668,7 +730,7 @@ func (l *Ledger) Submit(batch FeeBatch) (*BatchResult, error) {
 		if fee > math.MaxInt64-amount {
 			res.Status = StatusInvalid
 			res.Reason = reasonOverflow
-			out.Results = append(out.Results, res)
+			out = append(out, res)
 			continue
 		}
 		total := amount + fee
@@ -682,21 +744,21 @@ func (l *Ledger) Submit(batch FeeBatch) (*BatchResult, error) {
 			if u := used[key]; total > max-u {
 				res.Status = StatusLimitExceeded
 				res.Reason = fmt.Sprintf(reasonLimitExceeded, it.Account, it.Asset, max, u, total)
-				out.Results = append(out.Results, res)
+				out = append(out, res)
 				continue
 			}
 		}
 
 		// 6. 余额校验。不存在的账户/资产组合余额视为 0（不足）。
-		bal := l.reg.state.Balances[key]
+		bal := st.Balances[key]
 		if total > bal {
 			res.Status = StatusFunds
 			res.Reason = reasonFunds
-			out.Results = append(out.Results, res)
+			out = append(out, res)
 			continue
 		}
 
-		// 7. 先在内存生效，再原子持久化；保存失败回滚该项，不留成功记录。
+		// 7. 预计成功：构造记录（序号按当前模拟历史长度连续递增）。
 		rec := Record{
 			ID:        it.ID,
 			Account:   it.Account,
@@ -707,38 +769,79 @@ func (l *Ledger) Submit(batch FeeBatch) (*BatchResult, error) {
 			FeeBps:    batch.FeeBps,
 			Fee:       fee,
 			Charged:   total,
-			Seq:       int64(len(l.reg.state.Settlements)) + 1,
+			Seq:       int64(len(st.Settlements)) + 1,
 		}
-		rollback := l.stage(key, bal-total, rec)
-		if err := l.persistLocked(); err != nil {
-			rollback()
-			res.Status = StatusStorage
-			res.Reason = err.Error()
+
+		if persist {
+			// 真实提交：先在内存生效，再原子持久化；保存失败回滚该项，
+			// 不留成功记录、不占额度。
+			rollback := stageOn(st, key, bal-total, rec)
+			if err := l.persistLocked(); err != nil {
+				rollback()
+				res.Status = StatusStorage
+				res.Reason = err.Error()
+				out = append(out, res)
+				continue
+			}
 		} else {
-			// 只有成功落账的扣款消耗额度；保存失败回滚后额度自然未占用。
-			used[key] += total
-			cp := rec
-			res.Status = StatusSettled
-			res.Record = &cp
+			// 预览：只推进副本状态，绝不落盘。
+			st.Balances[key] = bal - total
+			st.Settlements = append(st.Settlements, rec)
 		}
-		out.Results = append(out.Results, res)
+
+		// 只有（预计）成功的扣款消耗额度；预览同样如此。
+		used[key] += total
+		cp := rec
+		res.Status = StatusSettled
+		res.Record = &cp
+		out = append(out, res)
 	}
-	return out, nil
+	return out
 }
 
-// stage 应用一笔扣款与记录，返回回滚函数（恢复该项执行前的余额与记录长度）。
-func (l *Ledger) stage(key balanceKey, newBal int64, rec Record) func() {
-	oldBal, hadKey := l.reg.state.Balances[key]
-	oldLen := len(l.reg.state.Settlements)
-	l.reg.state.Balances[key] = newBal
-	l.reg.state.Settlements = append(l.reg.state.Settlements, rec)
+// cloneState 返回账本状态的独立深拷贝，供预览在副本上模拟而不触碰真实状态。
+func cloneState(st *ledgerState) *ledgerState {
+	cp := &ledgerState{
+		Version:     st.Version,
+		Initial:     make(map[balanceKey]int64, len(st.Initial)),
+		Balances:    make(map[balanceKey]int64, len(st.Balances)),
+		Settlements: append([]Record(nil), st.Settlements...),
+		Refunds:     append([]RefundRecord(nil), st.Refunds...),
+	}
+	for k, v := range st.Initial {
+		cp.Initial[k] = v
+	}
+	for k, v := range st.Balances {
+		cp.Balances[k] = v
+	}
+	return cp
+}
+
+// findRecordIn 在给定结算历史中按编号查找成功记录。
+func findRecordIn(records []Record, id string) (Record, bool) {
+	// 记录按成功顺序追加且 ID 唯一；单机账本量级直接扫描。
+	for _, r := range records {
+		if r.ID == id {
+			return r, true
+		}
+	}
+	return Record{}, false
+}
+
+// stageOn 在指定状态上应用一笔扣款与记录，返回回滚函数（恢复该项执行前的
+// 余额与记录长度）。
+func stageOn(st *ledgerState, key balanceKey, newBal int64, rec Record) func() {
+	oldBal, hadKey := st.Balances[key]
+	oldLen := len(st.Settlements)
+	st.Balances[key] = newBal
+	st.Settlements = append(st.Settlements, rec)
 	return func() {
 		if hadKey {
-			l.reg.state.Balances[key] = oldBal
+			st.Balances[key] = oldBal
 		} else {
-			delete(l.reg.state.Balances, key)
+			delete(st.Balances, key)
 		}
-		l.reg.state.Settlements = l.reg.state.Settlements[:oldLen]
+		st.Settlements = st.Settlements[:oldLen]
 	}
 }
 
