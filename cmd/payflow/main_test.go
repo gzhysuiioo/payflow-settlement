@@ -254,6 +254,107 @@ func TestCLIErrorCases(t *testing.T) {
 	}
 }
 
+func TestCLIDuplicateFieldsRejected(t *testing.T) {
+	cases := []struct {
+		name      string
+		config    string
+		context   string
+		wantSubs  []string // stderr must contain each of these
+	}{
+		{
+			"duplicate enabled in config",
+			`{"flags":[{"key":"f","enabled":true,"enabled":false,"default":false,"rules":[]}]}`,
+			`{}`,
+			[]string{"config", `duplicate field "enabled"`, "flags[0]"},
+		},
+		{
+			"duplicate field in second flag",
+			`{"flags":[{"key":"f","enabled":true,"default":false,"rules":[]},{"key":"g","enabled":true,"default":false,"rules":[],"meta":{"a":1,"a":2}}]}`,
+			`{}`,
+			[]string{"config", `duplicate field "a"`, "flags[1].meta"},
+		},
+		{
+			"duplicate field in unselected flag",
+			`{"flags":[{"key":"good","enabled":true,"default":false,"rules":[]},{"key":"bad","enabled":true,"enabled":false,"default":false,"rules":[]}]}`,
+			`{}`,
+			[]string{"config", `duplicate field "enabled"`, "flags[1]"},
+		},
+		{
+			"duplicate field in disabled flag",
+			`{"flags":[{"key":"off","enabled":false,"enabled":true,"default":false,"rules":[]}]}`,
+			`{}`,
+			[]string{"config", `duplicate field "enabled"`, "flags[0]"},
+		},
+		{
+			"duplicate plan in context",
+			`{"flags":[{"key":"f","enabled":true,"default":false,"rules":[]}]}`,
+			`{"plan":"pro","plan":"free"}`,
+			[]string{"context", `duplicate field "plan"`},
+		},
+		{
+			"duplicate in nested context object",
+			`{"flags":[{"key":"f","enabled":true,"default":false,"rules":[]}]}`,
+			`{"plan":"pro","attrs":{"k":"1","k":"2"}}`,
+			[]string{"context", `duplicate field "k"`, "attrs"},
+		},
+		{
+			"unicode escape collision in config",
+			"{\"flags\":[{\"key\":\"f\",\"enabled\":true,\"en\\u0061bled\":false,\"default\":false,\"rules\":[]}]}",
+			`{}`,
+			[]string{"config", `duplicate field "enabled"`},
+		},
+		{
+			"first duplicate in file order reported",
+			`{"flags":[{"key":"f","enabled":true,"enabled":false,"default":false,"rules":[{"id":"r","id":"s","value":true,"conditions":[{"attribute":"a","op":"eq","value":"x"}]}]}]}`,
+			`{}`,
+			[]string{"config", `duplicate field "enabled"`, "flags[0]"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t, tc.config, tc.context)
+			var stdout, stderr bytes.Buffer
+			code := run(h.evalArgs("f"), &stdout, &stderr)
+			if code == 0 {
+				t.Fatalf("expected non-zero exit, got 0")
+			}
+			if stdout.Len() != 0 {
+				t.Fatalf("stdout must be empty on error, got: %q", stdout.String())
+			}
+			errMsg := stderr.String()
+			for _, sub := range tc.wantSubs {
+				if !strings.Contains(errMsg, sub) {
+					t.Fatalf("stderr=%q, want substring %q", errMsg, sub)
+				}
+			}
+		})
+	}
+}
+
+// TestCLIDuplicateFieldDoesNotProduceResult confirms a duplicate-field
+// failure never emits an evaluation result, even when the requested flag
+// exists and would otherwise evaluate.
+func TestCLIDuplicateFieldDoesNotProduceResult(t *testing.T) {
+	// The requested flag f is valid and would hit, but the config has a
+	// duplicate in a different (unselected) flag — no result may be emitted.
+	cfg := `{"flags":[
+		{"key":"f","enabled":true,"default":false,"rules":[
+			{"id":"r","value":true,"conditions":[{"attribute":"plan","op":"eq","value":"pro"}]}]},
+		{"key":"bad","enabled":true,"enabled":false,"default":false,"rules":[]}]}`
+	h := newHarness(t, cfg, `{"plan":"pro"}`)
+	var stdout, stderr bytes.Buffer
+	code := run(h.evalArgs("f"), &stdout, &stderr)
+	if code == 0 {
+		t.Fatalf("expected non-zero exit")
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("stdout must be empty, got: %q", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "duplicate") {
+		t.Fatalf("stderr must explain the ambiguity, got: %q", stderr.String())
+	}
+}
+
 func TestCLILegacyCommandsPreserved(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	if code := run([]string{"version"}, &stdout, &stderr); code != 0 || strings.TrimSpace(stdout.String()) != "payflow 0.1.0" {

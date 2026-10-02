@@ -98,6 +98,11 @@ func ParseConfig(raw []byte) (*Config, error) {
 	if !utf8.Valid(raw) {
 		return nil, fmt.Errorf("config: file is not valid UTF-8")
 	}
+	// 先按原文顺序检查重复字段：任何对象内同名字段（含 unicode 转义
+	// 还原后同名）都视为歧义，未选中或已关闭的开关也不例外。
+	if err := rejectDuplicateFields(raw, "config"); err != nil {
+		return nil, err
+	}
 	var doc any
 	if err := json.Unmarshal(raw, &doc); err != nil {
 		return nil, fmt.Errorf("config: invalid JSON: %w", err)
@@ -137,6 +142,10 @@ func ParseConfig(raw []byte) (*Config, error) {
 func ParseContext(raw []byte) (*Context, error) {
 	if !utf8.Valid(raw) {
 		return nil, fmt.Errorf("context: file is not valid UTF-8")
+	}
+	// 上下文同样拒绝同一对象内的重复字段。
+	if err := rejectDuplicateFields(raw, "context"); err != nil {
+		return nil, err
 	}
 	var doc any
 	if err := json.Unmarshal(raw, &doc); err != nil {
