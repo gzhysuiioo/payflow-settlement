@@ -46,6 +46,9 @@ JSON
 payflow submit -l ./ledger.json <<'JSON'
 {
   "fee_bps": 30,
+  "limits": [
+    {"account": "aa-1", "asset": "usdc", "max_charged": 2000}
+  ],
   "intents": [
     {"id":"p1","account":"aa-1","paymaster":"pm-1","asset":"usdc","amount":1500,"nonce":1,"state":"pending"},
     {"id":"p2","account":"aa-1","asset":"usdc","amount":900}
@@ -60,7 +63,22 @@ JSON
 - `state` 缺省视为 `"pending"`；非 pending 返回 `state_error`。
 - 不存在的账户/资产组合按余额 0 处理，返回 `insufficient_balance`。
 - 每项状态可分别识别：`settled` / `duplicate` / `conflict` /
-  `state_error` / `insufficient_balance` / `invalid_parameter` / `storage_error`。
+  `state_error` / `insufficient_balance` / `limit_exceeded` /
+  `invalid_parameter` / `storage_error`。
+
+**本次批次扣款上限（可选）**：`limits` 为本次提交设置按 (账户, 资产) 组合的
+扣款上限，`max_charged` 计入付款金额和手续费，各组合分别计算、互不通借。
+上限仅对本次提交有效：每次提交从零计算，历史扣款和退款都不占本次额度；
+只有成功落账的付款消耗额度，累计恰好等于上限仍允许成功。某项会使累计
+扣款超出上限时返回 `limit_exceeded`（原因含该组合的上限、已用额度与本项
+需扣金额），该项不扣余额、不留记录、不占编号与额度，后项继续处理；同一
+编号改为较小金额仍可在本批次内成功。`limits` 缺省、为 `null` 或为空数组
+时不限制扣款；未列出的组合沿用无限制行为。同时超限和余额不足时报告
+`limit_exceeded`；限额变化不属于付款字段变化，不影响幂等判断。
+每个限额项的 `account`、`asset` 必须非空，同一组合不得重复，`max_charged`
+必须明确提供非负 int64 整数（`0` 表示禁止该组合新增扣款）；任一限额项
+不合法或组合重复时整个批次返回 `invalid_parameter`、退出码 1，任何意图
+都不执行（空意图列表同样检查）。
 
 **幂等与冲突**：编号成功落账后，再次提交时若全部付款字段
 （账户、付款方、资产、金额、nonce）与费率都与原请求相同，返回原结算记录并标记

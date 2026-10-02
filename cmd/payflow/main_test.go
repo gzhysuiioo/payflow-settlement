@@ -791,3 +791,107 @@ func TestCLIReconcileRangeOnlyRefunds(t *testing.T) {
 		t.Fatalf("ledger row=%+v", row)
 	}
 }
+
+func TestCLISubmitChargeLimits(t *testing.T) {
+	ledgerPath := t.TempDir() + "/ledger.json"
+	r := runCLIWith(t, []string{"init", "-l", ledgerPath},
+		`{"balances":[{"account":"aa-1","asset":"usdc","balance":2000},{"account":"aa-1","asset":"eth","balance":100}]}`)
+	if r.code != 0 {
+		t.Fatalf("init code=%d err=%s", r.code, r.err)
+	}
+
+	// 限额内、恰好到顶、超限、未列出组合逐项对应，退出码 0。
+	batch := `{"fee_bps":0,
+	  "limits":[{"account":"aa-1","asset":"usdc","max_charged":1000}],
+	  "intents":[
+	    {"id":"p1","account":"aa-1","asset":"usdc","amount":600},
+	    {"id":"p2","account":"aa-1","asset":"usdc","amount":400},
+	    {"id":"p3","account":"aa-1","asset":"usdc","amount":1},
+	    {"id":"p4","account":"aa-1","asset":"eth","amount":50}
+	  ]}`
+	r = runCLIWith(t, []string{"submit", "-l", ledgerPath}, batch)
+	if r.code != 0 {
+		t.Fatalf("submit code=%d err=%s", r.code, r.err)
+	}
+	var res struct {
+		Results []struct {
+			ID     string `json:"id"`
+			Status string `json:"status"`
+			Reason string `json:"reason"`
+		} `json:"results"`
+	}
+	if err := json.Unmarshal([]byte(r.out), &res); err != nil {
+		t.Fatal(err)
+	}
+	got := make([]string, len(res.Results))
+	for i, x := range res.Results {
+		got[i] = x.Status
+	}
+	want := []string{"settled", "settled", "limit_exceeded", "settled"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("statuses=%v want %v", got, want)
+	}
+	for _, frag := range []string{"max_charged 1000", "used 1000", "charges 1"} {
+		if !strings.Contains(res.Results[2].Reason, frag) {
+			t.Fatalf("limit reason %q missing %q", res.Results[2].Reason, frag)
+		}
+	}
+
+	// 上限仅对本次提交有效：下一批次从零计算，可再扣 1000。
+	r = runCLIWith(t, []string{"submit", "-l", ledgerPath}, `{"fee_bps":0,
+	  "limits":[{"account":"aa-1","asset":"usdc","max_charged":1000}],
+	  "intents":[{"id":"p5","account":"aa-1","asset":"usdc","amount":900}]}`)
+	if r.code != 0 || !strings.Contains(r.out, `"settled"`) {
+		t.Fatalf("limit must reset per submission: code=%d out=%s err=%s", r.code, r.out, r.err)
+	}
+
+	// 非法限额：整个批次拒绝，退出码 1，invalid_parameter，任何意图都不执行。
+	badLimits := []string{
+		`{"fee_bps":0,"limits":[{"account":"","asset":"usdc","max_charged":1}],"intents":[]}`,
+		`{"fee_bps":0,"limits":[{"account":"aa-1","asset":"usdc"}],"intents":[]}`,
+		`{"fee_bps":0,"limits":[{"account":"aa-1","asset":"usdc","max_charged":null}],"intents":[]}`,
+		`{"fee_bps":0,"limits":[{"account":"aa-1","asset":"usdc","max_charged":-1}],"intents":[]}`,
+		`{"fee_bps":0,"limits":[{"account":"aa-1","asset":"usdc","max_charged":1.5}],"intents":[]}`,
+		`{"fee_bps":0,"limits":[{"account":"aa-1","asset":"usdc","max_charged":1},{"account":"aa-1","asset":"usdc","max_charged":2}],"intents":[]}`,
+		// 空意图列表也要检查限额。
+		`{"fee_bps":0,"limits":[{"account":"aa-1","asset":"","max_charged":1}],"intents":[]}`,
+	}
+	for _, bad := range badLimits {
+		r = runCLIWith(t, []string{"submit", "-l", ledgerPath}, bad)
+		if r.code != 1 || decodeOut(t, r.err)["error"].(map[string]any)["kind"] != "invalid_parameter" {
+			t.Fatalf("bad limits %s: code=%d err=%s", bad, r.code, r.err)
+		}
+	}
+	// 带意图的非法限额批次同样整批拒绝。
+	r = runCLIWith(t, []string{"submit", "-l", ledgerPath}, `{"fee_bps":0,
+	  "limits":[{"account":"aa-1","asset":"usdc","max_charged":-1}],
+	  "intents":[{"id":"p6","account":"aa-1","asset":"usdc","amount":1}]}`)
+	if r.code != 1 {
+		t.Fatalf("bad limits with intents: code=%d", r.code)
+	}
+
+	// 非法批次没有执行任何意图：余额与记录只来自前两次成功提交。
+	r = runCLIWith(t, []string{"query", "-l", ledgerPath}, "")
+	if r.code != 0 {
+		t.Fatalf("query code=%d", r.code)
+	}
+	var snap struct {
+		Balances []struct {
+			Account string `json:"account"`
+			Asset   string `json:"asset"`
+			Balance int64  `json:"balance"`
+		} `json:"balances"`
+		Settlements []struct {
+			ID string `json:"id"`
+		} `json:"settlements"`
+	}
+	if err := json.Unmarshal([]byte(r.out), &snap); err != nil {
+		t.Fatal(err)
+	}
+	if len(snap.Settlements) != 4 {
+		t.Fatalf("settlements=%+v want 4 (p1, p2, p4, p5)", snap.Settlements)
+	}
+	if snap.Balances[0].Balance != 50 || snap.Balances[1].Balance != 100 {
+		t.Fatalf("balances=%+v want usdc 50, eth 100", snap.Balances)
+	}
+}

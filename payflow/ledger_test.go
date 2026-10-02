@@ -1381,3 +1381,366 @@ func TestLegacyFileWithoutRefundsField(t *testing.T) {
 		t.Fatalf("reopen balance=%d want 900", bal)
 	}
 }
+
+// ---- 本次批次扣款上限（limits） ----
+
+func limit(account, asset string, max int64) ChargeLimit {
+	return ChargeLimit{Account: account, Asset: asset, MaxCharged: i64p(max)}
+}
+
+func TestChargeLimitBasics(t *testing.T) {
+	path := newTestLedger(t, []BalanceInit{
+		{Account: "aa", Asset: "usdc", Balance: 10000},
+		{Account: "aa", Asset: "eth", Balance: 100},
+	})
+	l := openOrFail(t, path)
+
+	res, err := l.Submit(FeeBatch{
+		FeeBps: 0,
+		Limits: []ChargeLimit{limit("aa", "usdc", 1000)},
+		Intents: []PaymentIntent{
+			intent("p1", "aa", "usdc", 600), // 成功，已用 600
+			intent("p2", "aa", "usdc", 400), // 恰好达到上限，成功
+			intent("p3", "aa", "usdc", 1),   // 超限
+			intent("p4", "aa", "eth", 5),    // 未列出的组合不受限
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{StatusSettled, StatusSettled, StatusLimitExceeded, StatusSettled}
+	if got := statuses(res); fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("statuses=%v want %v", got, want)
+	}
+	r := res.Results[2]
+	for _, frag := range []string{"aa/usdc", "max_charged 1000", "used 1000", "charges 1"} {
+		if !strings.Contains(r.Reason, frag) {
+			t.Fatalf("limit reason %q missing %q", r.Reason, frag)
+		}
+	}
+	if r.Record != nil {
+		t.Fatalf("limit_exceeded must not carry a record: %+v", r.Record)
+	}
+	// 超限项不扣余额、不留记录；未列出组合正常扣款。
+	if bal, _ := l.Balance("aa", "usdc"); bal != 9000 {
+		t.Fatalf("usdc balance=%d want 9000", bal)
+	}
+	if bal, _ := l.Balance("aa", "eth"); bal != 95 {
+		t.Fatalf("eth balance=%d want 95", bal)
+	}
+	snap, _ := l.Query()
+	if len(snap.Settlements) != 3 {
+		t.Fatalf("settlements=%+v want 3 records", snap.Settlements)
+	}
+}
+
+func TestChargeLimitRetrySmallerSucceeds(t *testing.T) {
+	path := newTestLedger(t, []BalanceInit{{Account: "aa", Asset: "usdc", Balance: 10000}})
+	l := openOrFail(t, path)
+
+	big := intent("p2", "aa", "usdc", 200)
+	small := intent("p2", "aa", "usdc", 100)
+	res, err := l.Submit(FeeBatch{
+		FeeBps:  0,
+		Limits:  []ChargeLimit{limit("aa", "usdc", 500)},
+		Intents: []PaymentIntent{intent("p1", "aa", "usdc", 400), big, small},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 前项超限失败后，同一编号改为较小金额仍可在本批次内成功。
+	want := []string{StatusSettled, StatusLimitExceeded, StatusSettled}
+	if got := statuses(res); fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("statuses=%v want %v", got, want)
+	}
+	if bal, _ := l.Balance("aa", "usdc"); bal != 9500 {
+		t.Fatalf("balance=%d want 9500", bal)
+	}
+}
+
+func TestChargeLimitIncludesFee(t *testing.T) {
+	path := newTestLedger(t, []BalanceInit{{Account: "aa", Asset: "usdc", Balance: 10000}})
+	l := openOrFail(t, path)
+
+	// 上限计入手续费：100 + 1(费) = 101 恰好达到上限。
+	res, err := l.Submit(FeeBatch{
+		FeeBps:  100,
+		Limits:  []ChargeLimit{limit("aa", "usdc", 101)},
+		Intents: []PaymentIntent{intent("p1", "aa", "usdc", 100), intent("p2", "aa", "usdc", 1)},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{StatusSettled, StatusLimitExceeded}
+	if got := statuses(res); fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("statuses=%v want %v", got, want)
+	}
+	if got := res.Results[0].Record.Charged; got != 101 {
+		t.Fatalf("charged=%d want 101", got)
+	}
+}
+
+func TestChargeLimitPerComboIndependent(t *testing.T) {
+	path := newTestLedger(t, []BalanceInit{
+		{Account: "aa", Asset: "usdc", Balance: 10000},
+		{Account: "aa", Asset: "eth", Balance: 10000},
+		{Account: "bb", Asset: "usdc", Balance: 10000},
+	})
+	l := openOrFail(t, path)
+
+	res, err := l.Submit(FeeBatch{
+		FeeBps: 0,
+		Limits: []ChargeLimit{limit("aa", "usdc", 100), limit("aa", "eth", 50)},
+		Intents: []PaymentIntent{
+			intent("u1", "aa", "usdc", 100), // 用尽 aa/usdc 额度
+			intent("u2", "aa", "usdc", 1),   // aa/usdc 超限
+			intent("e1", "aa", "eth", 50),   // 同账户不同资产：额度各自独立
+			intent("b1", "bb", "usdc", 100), // 同资产不同账户：未列出，不受限
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{StatusSettled, StatusLimitExceeded, StatusSettled, StatusSettled}
+	if got := statuses(res); fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("statuses=%v want %v", got, want)
+	}
+}
+
+func TestChargeLimitZeroBlocksCombo(t *testing.T) {
+	path := newTestLedger(t, []BalanceInit{{Account: "aa", Asset: "usdc", Balance: 1000}})
+	l := openOrFail(t, path)
+
+	res, err := l.Submit(FeeBatch{
+		FeeBps:  0,
+		Limits:  []ChargeLimit{limit("aa", "usdc", 0)},
+		Intents: []PaymentIntent{intent("p1", "aa", "usdc", 1)},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Results[0].Status != StatusLimitExceeded {
+		t.Fatalf("zero limit must block any charge: %+v", res.Results[0])
+	}
+	if bal, _ := l.Balance("aa", "usdc"); bal != 1000 {
+		t.Fatalf("balance=%d want 1000", bal)
+	}
+}
+
+func TestChargeLimitCheckedBeforeBalance(t *testing.T) {
+	path := newTestLedger(t, []BalanceInit{{Account: "aa", Asset: "usdc", Balance: 5}})
+	l := openOrFail(t, path)
+
+	res, err := l.Submit(FeeBatch{
+		FeeBps: 0,
+		Limits: []ChargeLimit{limit("aa", "usdc", 6)},
+		Intents: []PaymentIntent{
+			intent("p1", "aa", "usdc", 8), // 超限且余额不足：报告超限
+			intent("p2", "aa", "usdc", 6), // 限额内但余额不足：报告余额
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{StatusLimitExceeded, StatusFunds}
+	if got := statuses(res); fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("statuses=%v want %v", got, want)
+	}
+}
+
+func TestChargeLimitFailuresDoNotConsumeQuota(t *testing.T) {
+	path := newTestLedger(t, []BalanceInit{{Account: "aa", Asset: "usdc", Balance: 150}})
+	l := openOrFail(t, path)
+
+	res, err := l.Submit(FeeBatch{
+		FeeBps: 0,
+		Limits: []ChargeLimit{limit("aa", "usdc", 200)},
+		Intents: []PaymentIntent{
+			intent("p1", "aa", "usdc", 100), // 成功，已用 100，余额 50
+			intent("p2", "aa", "usdc", 100), // 限额内但余额不足，不占额度
+			intent("p3", "aa", "usdc", 100), // 若 p2 占了额度此处会报超限
+			intent("p4", "aa", "usdc", 50),  // 成功
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{StatusSettled, StatusFunds, StatusFunds, StatusSettled}
+	if got := statuses(res); fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("statuses=%v want %v", got, want)
+	}
+}
+
+func TestChargeLimitPerSubmissionAndIdempotency(t *testing.T) {
+	path := newTestLedger(t, []BalanceInit{{Account: "aa", Asset: "usdc", Balance: 10000}})
+	l := openOrFail(t, path)
+
+	// 第一次提交：上限 100，p1 用满。
+	res, err := l.Submit(FeeBatch{
+		FeeBps:  0,
+		Limits:  []ChargeLimit{limit("aa", "usdc", 100)},
+		Intents: []PaymentIntent{intent("p1", "aa", "usdc", 100)},
+	})
+	if err != nil || res.Results[0].Status != StatusSettled {
+		t.Fatalf("first submit: %v %+v", err, res.Results[0])
+	}
+
+	// 重复提交已成功付款：即使不带限额（或额度已用完）仍返回 duplicate 及原记录。
+	res, err = l.Submit(FeeBatch{FeeBps: 0, Intents: []PaymentIntent{intent("p1", "aa", "usdc", 100)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Results[0].Status != StatusDuplicate || res.Results[0].Record == nil || res.Results[0].Record.Charged != 100 {
+		t.Fatalf("duplicate after limit batch: %+v", res.Results[0])
+	}
+	// 限额变化不属于付款字段变化：带不同限额重复提交仍是 duplicate。
+	res, err = l.Submit(FeeBatch{
+		FeeBps:  0,
+		Limits:  []ChargeLimit{limit("aa", "usdc", 1)},
+		Intents: []PaymentIntent{intent("p1", "aa", "usdc", 100)},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Results[0].Status != StatusDuplicate {
+		t.Fatalf("limits must not affect idempotency: %+v", res.Results[0])
+	}
+
+	// 额度按提交从零计算：新批次同样的上限可再扣 100，历史扣款不占额度。
+	res, err = l.Submit(FeeBatch{
+		FeeBps:  0,
+		Limits:  []ChargeLimit{limit("aa", "usdc", 100)},
+		Intents: []PaymentIntent{intent("p2", "aa", "usdc", 100)},
+	})
+	if err != nil || res.Results[0].Status != StatusSettled {
+		t.Fatalf("limit must reset per submission: %v %+v", err, res.Results[0])
+	}
+
+	// 退款不回补本次额度：第三次提交内 p3 用满后，即使此前 p1 已退款，
+	// 本批次额度仍只有 100。
+	if _, err := l.Refund(RefundBatch{Refunds: []RefundRequest{refundReq("r1", "p1", "cancel")}}); err != nil {
+		t.Fatal(err)
+	}
+	res, err = l.Submit(FeeBatch{
+		FeeBps:  0,
+		Limits:  []ChargeLimit{limit("aa", "usdc", 100)},
+		Intents: []PaymentIntent{intent("p3", "aa", "usdc", 100), intent("p4", "aa", "usdc", 1)},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{StatusSettled, StatusLimitExceeded}
+	if got := statuses(res); fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("refund must not restore quota: %v want %v", got, want)
+	}
+}
+
+func TestChargeLimitOverflowSafety(t *testing.T) {
+	path := newTestLedger(t, []BalanceInit{{Account: "aa", Asset: "usdc", Balance: math.MaxInt64}})
+	l := openOrFail(t, path)
+
+	res, err := l.Submit(FeeBatch{
+		FeeBps: 0,
+		Limits: []ChargeLimit{limit("aa", "usdc", math.MaxInt64)},
+		Intents: []PaymentIntent{
+			intent("p1", "aa", "usdc", math.MaxInt64-10), // 成功，余 10
+			intent("p2", "aa", "usdc", 100),              // 累计会溢出 int64：必须拒绝
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{StatusSettled, StatusLimitExceeded}
+	if got := statuses(res); fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("statuses=%v want %v", got, want)
+	}
+	if bal, _ := l.Balance("aa", "usdc"); bal != 10 {
+		t.Fatalf("balance=%d want 10", bal)
+	}
+}
+
+func TestChargeLimitStorageFailureRestoresQuota(t *testing.T) {
+	path := newTestLedger(t, []BalanceInit{{Account: "aa", Asset: "usdc", Balance: 10000}})
+	l := openOrFail(t, path)
+	SetFailHook(l, &failNth{nth: 2})
+	t.Cleanup(func() { SetFailHook(l, nil) })
+
+	res, err := l.Submit(FeeBatch{
+		FeeBps: 0,
+		Limits: []ChargeLimit{limit("aa", "usdc", 200)},
+		Intents: []PaymentIntent{
+			intent("ok1", "aa", "usdc", 100), // 成功，已用 100
+			intent("boom", "aa", "usdc", 50), // 保存失败：回滚且不占额度
+			intent("ok2", "aa", "usdc", 100), // 恰好用满 200
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{StatusSettled, StatusStorage, StatusSettled}
+	if got := statuses(res); fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("statuses=%v want %v", got, want)
+	}
+	if bal, _ := l.Balance("aa", "usdc"); bal != 9800 {
+		t.Fatalf("balance=%d want 9800", bal)
+	}
+}
+
+func TestChargeLimitInvalidRejectsWholeBatch(t *testing.T) {
+	cases := []struct {
+		name   string
+		limits []ChargeLimit
+	}{
+		{"empty account", []ChargeLimit{limit("", "usdc", 1)}},
+		{"empty asset", []ChargeLimit{limit("aa", "", 1)}},
+		{"missing max_charged", []ChargeLimit{{Account: "aa", Asset: "usdc"}}},
+		{"negative max_charged", []ChargeLimit{limit("aa", "usdc", -1)}},
+		{"duplicate combo", []ChargeLimit{limit("aa", "usdc", 1), limit("aa", "usdc", 2)}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			path := newTestLedger(t, []BalanceInit{{Account: "aa", Asset: "usdc", Balance: 1000}})
+			l := openOrFail(t, path)
+
+			// 空意图列表也要检查限额。
+			if _, err := l.Submit(FeeBatch{FeeBps: 0, Limits: tc.limits}); KindOf(err) != ErrInvalid {
+				t.Fatalf("empty intents: want ErrInvalid, got %v", err)
+			}
+			// 任一限额项不合法：整个批次拒绝，任何意图都不执行。
+			_, err := l.Submit(FeeBatch{
+				FeeBps:  0,
+				Limits:  tc.limits,
+				Intents: []PaymentIntent{intent("p1", "aa", "usdc", 100)},
+			})
+			if KindOf(err) != ErrInvalid {
+				t.Fatalf("want ErrInvalid, got %v", err)
+			}
+			if bal, _ := l.Balance("aa", "usdc"); bal != 1000 {
+				t.Fatalf("invalid limits must not execute any intent, balance=%d", bal)
+			}
+			snap, _ := l.Query()
+			if len(snap.Settlements) != 0 {
+				t.Fatalf("invalid limits must not settle: %+v", snap.Settlements)
+			}
+		})
+	}
+}
+
+func TestChargeLimitAbsentOrEmptyMeansUnlimited(t *testing.T) {
+	for _, limits := range [][]ChargeLimit{nil, {}} {
+		path := newTestLedger(t, []BalanceInit{{Account: "aa", Asset: "usdc", Balance: 1000}})
+		l := openOrFail(t, path)
+		res, err := l.Submit(FeeBatch{
+			FeeBps:  0,
+			Limits:  limits,
+			Intents: []PaymentIntent{intent("p1", "aa", "usdc", 1000)},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res.Results[0].Status != StatusSettled {
+			t.Fatalf("limits=%v must not restrict: %+v", limits, res.Results[0])
+		}
+		l.Close()
+	}
+}
