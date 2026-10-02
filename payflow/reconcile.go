@@ -12,22 +12,28 @@ import (
 // 离线流水对账：把外部支付渠道提供的有序流水与本地账本逐笔核对。
 // 对账是只读操作，不改变余额、历史或账本文件。
 //
-// 逐条结果（保持输入顺序）有四种：
+// 逐条结果（保持输入顺序）有五种：
 //   - matched：编号命中一条成功记录，且全部核对字段一致；
 //   - field_mismatch：编号命中成功记录，但至少一个字段不同（逐个列出差异）；
 //   - missing_in_ledger：账本中没有该编号的成功记录；
 //   - duplicate：同一(kind,id)在输入中出现多次，整组全部标为重复并附全部
-//     输入位置，不再判断字段差异，也不再把对应账本记录列为缺失。
+//     输入位置，不再判断字段差异，也不再把对应账本记录列为缺失；
+//   - out_of_scope：命中同类型同编号的成功记录，但该记录的成功序号不在本次
+//     核对范围内（after < seq <= through）。不比较字段、不计入流水侧汇总；
+//     该编号在流水中出现多次时全部按此状态处理（优先于整组重复）。
 //
 // 付款编号与退款编号分别匹配，同名也不会混为一笔。只核对成功记录：
-// 已退款的付款仍按原扣款核对，退款单独核对。账本中没有任何对应流水的成功
-// 记录另列缺失（先按付款成功顺序，再按退款成功顺序）。
+// 已退款的付款仍按原扣款核对，退款单独核对。账本中没有任何对应流水的入选
+// 记录另列缺失（先按付款成功顺序，再按退款成功顺序）。范围只影响记录是否
+// 参加核对，不切断关联：入选退款仍可指向范围外付款，入选付款仍携带范围外
+// 退款的信息。
 
 const (
 	ReconMatched         = "matched"
 	ReconFieldMismatch   = "field_mismatch"
 	ReconMissingInLedger = "missing_in_ledger"
 	ReconDuplicate       = "duplicate"
+	ReconOutOfScope      = "out_of_scope"
 )
 
 // amountJSON 是必须提供、且为 int64 整数的金额。
@@ -154,6 +160,25 @@ type ReconReport struct {
 	NetDiff         []ReconNetDiff   `json:"net_diff"`
 	MaxPaymentSeq   int64            `json:"max_payment_seq"`
 	MaxRefundSeq    int64            `json:"max_refund_seq"`
+	PaymentAfter    int64            `json:"payment_after"`
+	PaymentThrough  int64            `json:"payment_through"`
+	RefundAfter     int64            `json:"refund_after"`
+	RefundThrough   int64            `json:"refund_through"`
+}
+
+// ReconcileBounds 限定付款与退款各自的核对范围：每类记录只核对成功序号
+// 满足 after < seq <= through 的记录（下界排除、上界包含）。两类记录各用
+// 自己的序号，分别选择范围，不根据退款引用的付款序号判断退款是否入选。
+//
+// 指针为 nil 表示该侧不限制：下界缺省取 0，上界缺省取本次所见该类记录的
+// 最大成功序号（即完整历史）。显式给出的上下界必须是非负 int64，且
+// after <= through、through 不超过对应类别的最大成功序号；after == through
+// 表示范围为空（该类记录全部不参加核对）。
+type ReconcileBounds struct {
+	PaymentAfter   *int64
+	PaymentThrough *int64
+	RefundAfter    *int64
+	RefundThrough  *int64
 }
 
 // ParseReconcileRequest 严格解析对账输入。
@@ -259,10 +284,49 @@ func (s *reconSide) addRefund(k balanceKey, v int64) {
 	x.Add(x, big.NewInt(v))
 }
 
-// ReconcileFlow 对一批外部流水与当前账本状态做只读对账。
-// 整份报告在同一把账本互斥锁内生成，因而对应同一个完整账本状态，
-// 与并发的 Submit/Refund 串行，不会读到半截历史。
+// ReconcileFlow 对一批外部流水与当前账本状态做只读对账，核对范围为完整
+// 历史（付款与退款都取各自全部成功记录）。等价于 ReconcileFlowRanged 传入
+// 空边界。
 func (l *Ledger) ReconcileFlow(entries []FlowEntry) (*ReconReport, error) {
+	return l.ReconcileFlowRanged(entries, ReconcileBounds{})
+}
+
+// resolveReconRange 确定一类记录的实际核对边界 (after, through]，并校验：
+// 边界必须非负、after 不大于 through、through 不超过该类最大成功序号。
+// 空历史的最大序号为零，因此缺省边界为 (0,0]，范围为空。
+func resolveReconRange(kind string, after, through *int64, maxSeq int64) (int64, int64, error) {
+	a := int64(0)
+	if after != nil {
+		a = *after
+	}
+	t := maxSeq
+	if through != nil {
+		t = *through
+	}
+	if a < 0 {
+		return 0, 0, ledgerError(ErrInvalid, "reconcile %s bounds: after must be a non-negative int64, got %d", kind, a)
+	}
+	if t < 0 {
+		return 0, 0, ledgerError(ErrInvalid, "reconcile %s bounds: through must be a non-negative int64, got %d", kind, t)
+	}
+	if a > t {
+		return 0, 0, ledgerError(ErrInvalid, "reconcile %s bounds: after %d must not exceed through %d", kind, a, t)
+	}
+	if t > maxSeq {
+		return 0, 0, ledgerError(ErrInvalid, "reconcile %s bounds: through %d exceeds max seq %d", kind, t, maxSeq)
+	}
+	return a, t, nil
+}
+
+// ReconcileFlowRanged 对一批外部流水与当前账本状态做只读对账，只核对成功
+// 序号落在边界内的记录（after < seq <= through）。边界不改变账本状态，
+// 整份报告仍在同一把账本互斥锁内生成，对应同一个完整账本状态。
+//
+// 范围只影响记录是否参加核对，不切断关联：入选退款仍可指向范围外付款，
+// 入选付款仍携带范围外退款的信息。命中同类型同编号但记录在范围外的流水
+// 返回 out_of_scope（携带账本记录、不比较字段、不计入流水侧汇总）；该编号
+// 在流水中出现多次时全部按 out_of_scope 处理。
+func (l *Ledger) ReconcileFlowRanged(entries []FlowEntry, bounds ReconcileBounds) (*ReconReport, error) {
 	if err := l.beginOp(); err != nil {
 		return nil, err
 	}
@@ -272,7 +336,21 @@ func (l *Ledger) ReconcileFlow(entries []FlowEntry) (*ReconReport, error) {
 
 	st := l.stateView()
 
+	maxPay := int64(len(st.Settlements))
+	maxRef := int64(len(st.Refunds))
+	payAfter, payThrough, err := resolveReconRange("payment", bounds.PaymentAfter, bounds.PaymentThrough, maxPay)
+	if err != nil {
+		return nil, err
+	}
+	refAfter, refThrough, err := resolveReconRange("refund", bounds.RefundAfter, bounds.RefundThrough, maxRef)
+	if err != nil {
+		return nil, err
+	}
+	inPayRange := func(seq int64) bool { return seq > payAfter && seq <= payThrough }
+	inRefRange := func(seq int64) bool { return seq > refAfter && seq <= refThrough }
+
 	// 结算编号 / 退款编号各自索引：同名编号也不会混为一笔。
+	// 关联索引始终基于完整历史：范围不切断付款与退款之间的关联。
 	payByID := make(map[string]*Record, len(st.Settlements))
 	for i := range st.Settlements {
 		payByID[st.Settlements[i].ID] = &st.Settlements[i]
@@ -309,13 +387,17 @@ func (l *Ledger) ReconcileFlow(entries []FlowEntry) (*ReconReport, error) {
 		MissingPayments: []ReconRecordRef{},
 		MissingRefunds:  []ReconRecordRef{},
 		NetDiff:         []ReconNetDiff{},
-		MaxPaymentSeq:   int64(len(st.Settlements)),
-		MaxRefundSeq:    int64(len(st.Refunds)),
+		MaxPaymentSeq:   maxPay,
+		MaxRefundSeq:    maxRef,
+		PaymentAfter:    payAfter,
+		PaymentThrough:  payThrough,
+		RefundAfter:     refAfter,
+		RefundThrough:   refThrough,
 	}
 
 	ledgerSide := newReconSide()
 	flowSide := newReconSide()
-	coveredPay := map[string]bool{} // 唯一且命中账本的付款编号（含字段不符）
+	coveredPay := map[string]bool{} // 唯一且命中账本入选记录的付款编号（含字段不符）
 	coveredRefund := map[string]bool{}
 
 	// 逐条结果（保持输入顺序）。
@@ -325,24 +407,48 @@ func (l *Ledger) ReconcileFlow(entries []FlowEntry) (*ReconReport, error) {
 		k := balanceKey{e.Account, e.Asset}
 
 		uses := paySeen[e.ID]
-		if e.Kind == "refund" {
+		var payRec *Record
+		var refRec *RefundRecord
+		inRange := false
+		if e.Kind == "payment" {
+			payRec = payByID[e.ID]
+			inRange = payRec != nil && inPayRange(payRec.Seq)
+		} else {
 			uses = refundSeen[e.ID]
+			refRec = refundByID[e.ID]
+			inRange = refRec != nil && inRefRange(refRec.Seq)
 		}
 
-		// 1. 重复组：不判字段、不占缺失；流水侧合计仍包含每一条。
+		// 1. 命中同类型同编号但记录在范围外：不比较字段、不计入流水侧汇总；
+		//    该编号在流水中出现多次时全部按 out_of_scope 处理（优先于整组重复）。
+		if (payRec != nil || refRec != nil) && !inRange {
+			res.Status = ReconOutOfScope
+			if e.Kind == "payment" {
+				ref := paymentRef(payRec, refundOfPay[e.ID])
+				res.Record = &ref
+			} else {
+				ref := refundRef(refRec)
+				res.Record = &ref
+			}
+			report.Results = append(report.Results, res)
+			continue
+		}
+
+		// 2. 记录在范围内或账本无此编号：保留整组重复判定，流水侧合计仍包含
+		//    每一条（范围内重复项与账本外流水逐条计入）。
 		if len(uses.positions) > 1 {
 			res.Status = ReconDuplicate
 			res.Positions = append([]int(nil), uses.positions...)
 			if e.Kind == "payment" {
 				flowSide.addCharged(k, e.Charged)
-				if rec := payByID[e.ID]; rec != nil {
-					ref := paymentRef(rec, refundOfPay[e.ID])
+				if payRec != nil {
+					ref := paymentRef(payRec, refundOfPay[e.ID])
 					res.Record = &ref
 				}
 			} else {
 				flowSide.addRefund(k, e.Charged)
-				if rec := refundByID[e.ID]; rec != nil {
-					ref := refundRef(rec)
+				if refRec != nil {
+					ref := refundRef(refRec)
 					res.Record = &ref
 				}
 			}
@@ -350,14 +456,14 @@ func (l *Ledger) ReconcileFlow(entries []FlowEntry) (*ReconReport, error) {
 			continue
 		}
 
-		// 2. 唯一条目：命中则逐字段核对，否则账本缺这笔。
+		// 3. 唯一条目：命中入选记录则逐字段核对，否则账本缺这笔。
 		if e.Kind == "payment" {
 			flowSide.addCharged(k, e.Charged)
-			if rec := payByID[e.ID]; rec != nil {
+			if payRec != nil {
 				coveredPay[e.ID] = true
-				ref := paymentRef(rec, refundOfPay[e.ID])
+				ref := paymentRef(payRec, refundOfPay[e.ID])
 				res.Record = &ref
-				if diffs := comparePayment(rec, e); len(diffs) > 0 {
+				if diffs := comparePayment(payRec, e); len(diffs) > 0 {
 					res.Status = ReconFieldMismatch
 					res.Diffs = diffs
 				} else {
@@ -368,11 +474,11 @@ func (l *Ledger) ReconcileFlow(entries []FlowEntry) (*ReconReport, error) {
 			}
 		} else {
 			flowSide.addRefund(k, e.Charged)
-			if rec := refundByID[e.ID]; rec != nil {
+			if refRec != nil {
 				coveredRefund[e.ID] = true
-				ref := refundRef(rec)
+				ref := refundRef(refRec)
 				res.Record = &ref
-				if diffs := compareRefund(rec, e); len(diffs) > 0 {
+				if diffs := compareRefund(refRec, e); len(diffs) > 0 {
 					res.Status = ReconFieldMismatch
 					res.Diffs = diffs
 				} else {
@@ -385,21 +491,29 @@ func (l *Ledger) ReconcileFlow(entries []FlowEntry) (*ReconReport, error) {
 		report.Results = append(report.Results, res)
 	}
 
-	// 账本侧合计恒为完整账本：所有成功结算与成功退款。
-	// 已退款的付款仍计入原扣款，退款单独计入退款侧。
+	// 账本侧合计只包含入选记录：已退款的付款仍按原扣款计入，退款单独计入
+	// 退款侧；只选退款时扣款合计为零，不会顺带计入原付款。
 	for i := range st.Settlements {
 		r := &st.Settlements[i]
-		ledgerSide.addCharged(balanceKey{r.Account, r.Asset}, r.Charged)
+		if inPayRange(r.Seq) {
+			ledgerSide.addCharged(balanceKey{r.Account, r.Asset}, r.Charged)
+		}
 	}
 	for i := range st.Refunds {
 		r := &st.Refunds[i]
-		ledgerSide.addRefund(balanceKey{r.Account, r.Asset}, r.Charged)
+		if inRefRange(r.Seq) {
+			ledgerSide.addRefund(balanceKey{r.Account, r.Asset}, r.Charged)
+		}
 	}
 
-	// 账本有、但流水未覆盖的成功记录另列缺失（先付款后退款，各按成功顺序）。
-	// 唯一出现即算覆盖（含字段不符）；重复组对应记录按规则不列为缺失。
+	// 入选但流水未覆盖的成功记录另列缺失（先付款后退款，各按成功顺序）。
+	// 唯一出现即算覆盖（含字段不符）；重复组对应记录按规则不列为缺失；
+	// 范围外记录不列入缺失。
 	for i := range st.Settlements {
 		r := &st.Settlements[i]
+		if !inPayRange(r.Seq) {
+			continue
+		}
 		if coveredPay[r.ID] {
 			continue
 		}
@@ -410,6 +524,9 @@ func (l *Ledger) ReconcileFlow(entries []FlowEntry) (*ReconReport, error) {
 	}
 	for i := range st.Refunds {
 		r := &st.Refunds[i]
+		if !inRefRange(r.Seq) {
+			continue
+		}
 		if coveredRefund[r.ID] {
 			continue
 		}

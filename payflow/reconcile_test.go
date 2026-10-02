@@ -600,3 +600,323 @@ func TestReconcileConcurrentWithWriters(t *testing.T) {
 	close(stop)
 	wg.Wait()
 }
+
+// ---- 按成功序号限定核对范围 ----
+
+// rangeLedger 构造含 3 笔付款、2 笔退款的账本：
+// p1(usdc,1003)、p2(usdc,2006)、p3(eth,10)；r1 退 p1、r2 退 p2。
+func rangeLedger(t *testing.T) *Ledger {
+	t.Helper()
+	path := newTestLedger(t, []BalanceInit{
+		{Account: "aa-1", Asset: "usdc", Balance: 1000000},
+		{Account: "aa-2", Asset: "eth", Balance: 100},
+	})
+	l := openOrFail(t, path)
+	res, err := l.Submit(FeeBatch{FeeBps: 30, Intents: []PaymentIntent{
+		{ID: "p1", Account: "aa-1", Paymaster: "pm", Asset: "usdc", Amount: i64p(1000), Nonce: 1, State: "pending"},
+		{ID: "p2", Account: "aa-1", Paymaster: "pm", Asset: "usdc", Amount: i64p(2000), Nonce: 2, State: "pending"},
+		{ID: "p3", Account: "aa-2", Asset: "eth", Amount: i64p(10), State: "pending"},
+	}})
+	if err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	for i, want := range []string{StatusSettled, StatusSettled, StatusSettled} {
+		if res.Results[i].Status != want {
+			t.Fatalf("setup payment %d status=%s", i, res.Results[i].Status)
+		}
+	}
+	rr, err := l.Refund(RefundBatch{Refunds: []RefundRequest{
+		{ID: "r1", SettlementID: "p1", Reason: "cancel"},
+		{ID: "r2", SettlementID: "p2", Reason: "cancel"},
+	}})
+	if err != nil {
+		t.Fatalf("refund: %v", err)
+	}
+	for i, want := range []string{StatusRefundSuccess, StatusRefundSuccess} {
+		if rr.Results[i].Status != want {
+			t.Fatalf("setup refund %d status=%s", i, rr.Results[i].Status)
+		}
+	}
+	return l
+}
+
+func flowEntry(idx int, kind, id, acct, asset string, amount, fee, charged int64, settle string) FlowEntry {
+	return FlowEntry{
+		Index: idx, Kind: kind, ID: id, Account: acct, Asset: asset,
+		Amount: amount, Fee: fee, Charged: charged, SettlementID: settle,
+	}
+}
+
+func findTotalRow(t *testing.T, rows []ReconTotalRow, acct, asset string) ReconTotalRow {
+	t.Helper()
+	for _, r := range rows {
+		if r.Account == acct && r.Asset == asset {
+			return r
+		}
+	}
+	t.Fatalf("row %s/%s not found in %+v", acct, asset, rows)
+	return ReconTotalRow{}
+}
+
+func TestReconcileFlowRangedDefaultsFull(t *testing.T) {
+	l := rangeLedger(t)
+	entries := []FlowEntry{
+		flowEntry(0, "payment", "p1", "aa-1", "usdc", 1000, 3, 1003, ""),
+		flowEntry(1, "refund", "r1", "aa-1", "usdc", 1000, 3, 1003, "p1"),
+	}
+	full, err := l.ReconcileFlow(entries)
+	if err != nil {
+		t.Fatalf("full: %v", err)
+	}
+	ranged, err := l.ReconcileFlowRanged(entries, ReconcileBounds{})
+	if err != nil {
+		t.Fatalf("ranged: %v", err)
+	}
+	fj, _ := json.Marshal(full)
+	rj, _ := json.Marshal(ranged)
+	if !bytes.Equal(fj, rj) {
+		t.Fatalf("full and ranged-empty differ:\n%s\n%s", fj, rj)
+	}
+	// 空边界 = 全量：报告边界取完整历史最大序号。
+	if ranged.PaymentAfter != 0 || ranged.PaymentThrough != 3 ||
+		ranged.RefundAfter != 0 || ranged.RefundThrough != 2 {
+		t.Fatalf("bounds=%d,%d,%d,%d", ranged.PaymentAfter, ranged.PaymentThrough,
+			ranged.RefundAfter, ranged.RefundThrough)
+	}
+}
+
+func TestReconcileFlowRangedPaymentSelection(t *testing.T) {
+	l := rangeLedger(t)
+	// 只选付款 seq (1,2]：p2 入选；p1、p3 不入选。退款全量入选。
+	a, th := int64(1), int64(2)
+	rep, err := l.ReconcileFlowRanged(nil, ReconcileBounds{
+		PaymentAfter: &a, PaymentThrough: &th,
+	})
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if len(rep.MissingPayments) != 1 || rep.MissingPayments[0].ID != "p2" {
+		t.Fatalf("missing payments=%+v", rep.MissingPayments)
+	}
+	if len(rep.MissingRefunds) != 2 {
+		t.Fatalf("missing refunds=%+v", rep.MissingRefunds)
+	}
+	// 账本侧：usdc 扣款只有 p2=2006；退款 r1+r2=3009；eth 无入选记录，不出行。
+	if len(rep.Totals.Ledger) != 1 {
+		t.Fatalf("ledger rows=%+v", rep.Totals.Ledger)
+	}
+	usdc := findTotalRow(t, rep.Totals.Ledger, "aa-1", "usdc")
+	if usdc.ChargedTotal != "2006" || usdc.RefundedTotal != "3009" {
+		t.Fatalf("usdc ledger=%+v", usdc)
+	}
+	if rep.PaymentAfter != 1 || rep.PaymentThrough != 2 {
+		t.Fatalf("payment bounds=%d,%d", rep.PaymentAfter, rep.PaymentThrough)
+	}
+}
+
+func TestReconcileFlowRangedOutOfScope(t *testing.T) {
+	l := rangeLedger(t)
+	// 付款 (1,2]，退款 (0,1]。
+	pa, pt, ra, rt := int64(1), int64(2), int64(0), int64(1)
+	entries := []FlowEntry{
+		flowEntry(0, "payment", "p1", "aa-1", "usdc", 1000, 3, 1003, ""),    // seq 1 范围外
+		flowEntry(1, "payment", "p2", "aa-1", "usdc", 2000, 6, 2006, ""),    // 入选
+		flowEntry(2, "refund", "r2", "aa-1", "usdc", 2000, 6, 2006, "p2"),   // seq 2 范围外
+	}
+	rep, err := l.ReconcileFlowRanged(entries, ReconcileBounds{
+		PaymentAfter: &pa, PaymentThrough: &pt, RefundAfter: &ra, RefundThrough: &rt,
+	})
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	want := []string{ReconOutOfScope, ReconMatched, ReconOutOfScope}
+	for i, r := range rep.Results {
+		if r.Status != want[i] {
+			t.Fatalf("result %d=%s want %s", i, r.Status, want[i])
+		}
+	}
+	// out_of_scope 携带账本记录与关联（不切断）。
+	if rep.Results[0].Record == nil || rep.Results[0].Record.RefundID != "r1" {
+		t.Fatalf("p1 out_of_scope record link: %+v", rep.Results[0].Record)
+	}
+	if rep.Results[2].Record == nil || rep.Results[2].Record.SettlementID != "p2" {
+		t.Fatalf("r2 out_of_scope record link: %+v", rep.Results[2].Record)
+	}
+	// 流水侧只计入 p2：usdc 扣款 2006，退款 0。
+	if len(rep.Totals.Flow) != 1 {
+		t.Fatalf("flow rows=%+v", rep.Totals.Flow)
+	}
+	usdc := findTotalRow(t, rep.Totals.Flow, "aa-1", "usdc")
+	if usdc.ChargedTotal != "2006" || usdc.RefundedTotal != "0" {
+		t.Fatalf("flow usdc=%+v", usdc)
+	}
+	// 缺失：退款 r1 入选且未覆盖；付款无缺失（p2 覆盖，p1/p3 范围外）。
+	if len(rep.MissingPayments) != 0 {
+		t.Fatalf("missing payments=%+v", rep.MissingPayments)
+	}
+	if len(rep.MissingRefunds) != 1 || rep.MissingRefunds[0].ID != "r1" {
+		t.Fatalf("missing refunds=%+v", rep.MissingRefunds)
+	}
+}
+
+func TestReconcileFlowRangedDuplicateOutOfScope(t *testing.T) {
+	l := rangeLedger(t)
+	pa, pt := int64(1), int64(2)
+	// p1 出现两次，记录在范围外 -> 全部 out_of_scope，不是 duplicate。
+	entries := []FlowEntry{
+		flowEntry(0, "payment", "p1", "aa-1", "usdc", 1000, 3, 1003, ""),
+		flowEntry(1, "payment", "p1", "aa-1", "usdc", 999, 0, 999, ""),
+	}
+	rep, err := l.ReconcileFlowRanged(entries, ReconcileBounds{
+		PaymentAfter: &pa, PaymentThrough: &pt,
+	})
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	for i, r := range rep.Results {
+		if r.Status != ReconOutOfScope {
+			t.Fatalf("result %d=%s want out_of_scope", i, r.Status)
+		}
+		if r.Record == nil || r.Record.ID != "p1" {
+			t.Fatalf("result %d record=%+v", i, r.Record)
+		}
+	}
+	// 流水侧不计入。
+	if len(rep.Totals.Flow) != 0 {
+		t.Fatalf("flow totals should be empty: %+v", rep.Totals.Flow)
+	}
+}
+
+func TestReconcileFlowRangedOnlyRefunds(t *testing.T) {
+	l := rangeLedger(t)
+	// 付款范围 (0,0] 全空；退款全量入选。
+	z := int64(0)
+	entries := []FlowEntry{
+		flowEntry(0, "payment", "p1", "aa-1", "usdc", 1000, 3, 1003, ""), // 范围外
+	}
+	rep, err := l.ReconcileFlowRanged(entries, ReconcileBounds{PaymentThrough: &z})
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if rep.Results[0].Status != ReconOutOfScope {
+		t.Fatalf("p1=%s want out_of_scope", rep.Results[0].Status)
+	}
+	// 账本侧：扣款合计为零，退款合计 3009，净扣款 -3009。
+	if len(rep.Totals.Ledger) != 1 {
+		t.Fatalf("ledger rows=%+v", rep.Totals.Ledger)
+	}
+	row := rep.Totals.Ledger[0]
+	if row.ChargedTotal != "0" || row.RefundedTotal != "3009" || row.NetCharged != "-3009" {
+		t.Fatalf("ledger row=%+v", row)
+	}
+	// 缺失付款为空；缺失退款 r1,r2。
+	if len(rep.MissingPayments) != 0 {
+		t.Fatalf("missing payments=%+v", rep.MissingPayments)
+	}
+	if len(rep.MissingRefunds) != 2 {
+		t.Fatalf("missing refunds=%+v", rep.MissingRefunds)
+	}
+}
+
+func TestReconcileFlowRangedAssociationsPreserved(t *testing.T) {
+	l := rangeLedger(t)
+	z := int64(0)
+	// 只选退款：入选退款 r1 仍指向范围外付款 p1。
+	rep, err := l.ReconcileFlowRanged(nil, ReconcileBounds{PaymentThrough: &z})
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if rep.MissingRefunds[0].SettlementID != "p1" {
+		t.Fatalf("selected refund r1 must link out-of-range payment p1: %+v", rep.MissingRefunds[0])
+	}
+	// 只选付款：入选付款 p1 仍携带范围外退款 r1。
+	rep2, err := l.ReconcileFlowRanged(nil, ReconcileBounds{RefundThrough: &z})
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if rep2.MissingPayments[0].RefundID != "r1" {
+		t.Fatalf("selected payment p1 must carry out-of-range refund r1: %+v", rep2.MissingPayments[0])
+	}
+}
+
+func TestReconcileFlowRangedInvalidBounds(t *testing.T) {
+	l := rangeLedger(t)
+	neg, zero, one, two, three, four := int64(-1), int64(0), int64(1), int64(2), int64(3), int64(4)
+	bad := []ReconcileBounds{
+		{PaymentAfter: &neg},                      // after 负
+		{PaymentAfter: &one, PaymentThrough: &zero}, // after > through
+		{PaymentThrough: &four},                   // through > maxPay(3)
+		{RefundAfter: &neg},                       // refund after 负
+		{RefundAfter: &two, RefundThrough: &one},  // refund after > through
+		{RefundThrough: &three},                   // through > maxRef(2)
+	}
+	for i, b := range bad {
+		if _, err := l.ReconcileFlowRanged(nil, b); err == nil || KindOf(err) != ErrInvalid {
+			t.Fatalf("case %d: want invalid_parameter, got %v", i, err)
+		}
+	}
+	// 非法边界即使流水有条目也整次拒绝。
+	if _, err := l.ReconcileFlowRanged([]FlowEntry{
+		flowEntry(0, "payment", "p1", "aa-1", "usdc", 1000, 3, 1003, ""),
+	}, ReconcileBounds{PaymentThrough: &four}); err == nil || KindOf(err) != ErrInvalid {
+		t.Fatalf("invalid bounds with entries: %v", err)
+	}
+}
+
+func TestReconcileFlowRangedEmptyRange(t *testing.T) {
+	l := rangeLedger(t)
+	// after == through 表示范围为空。
+	z := int64(0)
+	rep, err := l.ReconcileFlowRanged(nil, ReconcileBounds{
+		PaymentAfter: &z, PaymentThrough: &z, RefundAfter: &z, RefundThrough: &z,
+	})
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if len(rep.MissingPayments) != 0 || len(rep.MissingRefunds) != 0 {
+		t.Fatalf("empty range missing=%+v/%+v", rep.MissingPayments, rep.MissingRefunds)
+	}
+	if len(rep.Totals.Ledger) != 0 {
+		t.Fatalf("empty range ledger totals=%+v", rep.Totals.Ledger)
+	}
+}
+
+func TestReconcileFlowRangedEmptyHistory(t *testing.T) {
+	path := newTestLedger(t, []BalanceInit{{Account: "aa", Asset: "usdc", Balance: 1}})
+	l := openOrFail(t, path)
+	rep, err := l.ReconcileFlowRanged(nil, ReconcileBounds{})
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if rep.PaymentAfter != 0 || rep.PaymentThrough != 0 ||
+		rep.RefundAfter != 0 || rep.RefundThrough != 0 {
+		t.Fatalf("empty history bounds=%d,%d,%d,%d", rep.PaymentAfter, rep.PaymentThrough,
+			rep.RefundAfter, rep.RefundThrough)
+	}
+	if rep.MaxPaymentSeq != 0 || rep.MaxRefundSeq != 0 {
+		t.Fatalf("max seqs=%d/%d", rep.MaxPaymentSeq, rep.MaxRefundSeq)
+	}
+}
+
+func TestReconcileFlowRangedDuplicatesCounted(t *testing.T) {
+	l := rangeLedger(t)
+	pa, pt := int64(1), int64(2)
+	// p2 两次（都在范围内）-> duplicate，两条都计入流水侧。
+	entries := []FlowEntry{
+		flowEntry(0, "payment", "p2", "aa-1", "usdc", 2000, 6, 2006, ""),
+		flowEntry(1, "payment", "p2", "aa-1", "usdc", 2000, 6, 2006, ""),
+	}
+	rep, err := l.ReconcileFlowRanged(entries, ReconcileBounds{
+		PaymentAfter: &pa, PaymentThrough: &pt,
+	})
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if rep.Results[0].Status != ReconDuplicate || rep.Results[1].Status != ReconDuplicate {
+		t.Fatalf("statuses=%s,%s", rep.Results[0].Status, rep.Results[1].Status)
+	}
+	usdc := findTotalRow(t, rep.Totals.Flow, "aa-1", "usdc")
+	if usdc.ChargedTotal != "4012" {
+		t.Fatalf("flow usdc=%+v", usdc)
+	}
+}

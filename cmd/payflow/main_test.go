@@ -638,3 +638,156 @@ func TestCLIHelpListsReconcile(t *testing.T) {
 		t.Fatalf("help does not mention reconcile:\n%s", r.out)
 	}
 }
+
+func setupRangeLedger(t *testing.T) string {
+	t.Helper()
+	ledgerPath := t.TempDir() + "/ledger.json"
+	if r := runCLIWith(t, []string{"init", "-l", ledgerPath},
+		`{"balances":[{"account":"aa-1","asset":"usdc","balance":1000000},{"account":"aa-2","asset":"eth","balance":100}]}`); r.code != 0 {
+		t.Fatalf("init: %s", r.err)
+	}
+	// p1 usdc 1003, p2 usdc 2006, p3 eth 10（30bps）。
+	if r := runCLIWith(t, []string{"submit", "-l", ledgerPath}, `{"fee_bps":30,"intents":[
+	  {"id":"p1","account":"aa-1","paymaster":"pm","asset":"usdc","amount":1000,"nonce":1},
+	  {"id":"p2","account":"aa-1","paymaster":"pm","asset":"usdc","amount":2000,"nonce":2},
+	  {"id":"p3","account":"aa-2","asset":"eth","amount":10}
+	]}`); r.code != 0 {
+		t.Fatalf("submit: %s", r.err)
+	}
+	if r := runCLIWith(t, []string{"refund", "-l", ledgerPath}, `{"refunds":[
+	  {"id":"r1","settlement_id":"p1","reason":"cancel"},
+	  {"id":"r2","settlement_id":"p2","reason":"cancel"}
+	]}`); r.code != 0 {
+		t.Fatalf("refund: %s", r.err)
+	}
+	return ledgerPath
+}
+
+func TestCLIReconcileRangeFlags(t *testing.T) {
+	ledgerPath := setupRangeLedger(t)
+	// 付款 (1,2]：p1 范围外、p2 入选；退款 (0,1]：r2 范围外。
+	body := `{"entries":[
+	  {"kind":"payment","id":"p1","account":"aa-1","asset":"usdc","amount":1000,"fee":3,"charged":1003},
+	  {"kind":"payment","id":"p2","account":"aa-1","asset":"usdc","amount":2000,"fee":6,"charged":2006},
+	  {"kind":"refund","id":"r2","account":"aa-1","asset":"usdc","amount":2000,"fee":6,"charged":2006,"settlement_id":"p2"}
+	]}`
+	r := runCLIWith(t, []string{"reconcile", "-l", ledgerPath,
+		"--payment-after", "1", "--payment-through", "2",
+		"--refund-after", "0", "--refund-through", "1"}, body)
+	if r.code != 0 {
+		t.Fatalf("reconcile: %s", r.err)
+	}
+	var rep struct {
+		Results []struct {
+			Status string `json:"status"`
+		} `json:"results"`
+		PaymentAfter   int64 `json:"payment_after"`
+		PaymentThrough int64 `json:"payment_through"`
+		RefundAfter    int64 `json:"refund_after"`
+		RefundThrough  int64 `json:"refund_through"`
+		MaxPaymentSeq  int64 `json:"max_payment_seq"`
+		MaxRefundSeq   int64 `json:"max_refund_seq"`
+	}
+	if err := json.Unmarshal([]byte(r.out), &rep); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"out_of_scope", "matched", "out_of_scope"}
+	for i, x := range rep.Results {
+		if x.Status != want[i] {
+			t.Fatalf("result %d=%s want %s", i, x.Status, want[i])
+		}
+	}
+	if rep.PaymentAfter != 1 || rep.PaymentThrough != 2 ||
+		rep.RefundAfter != 0 || rep.RefundThrough != 1 {
+		t.Fatalf("bounds=%d,%d,%d,%d", rep.PaymentAfter, rep.PaymentThrough,
+			rep.RefundAfter, rep.RefundThrough)
+	}
+	if rep.MaxPaymentSeq != 3 || rep.MaxRefundSeq != 2 {
+		t.Fatalf("max seqs=%d/%d", rep.MaxPaymentSeq, rep.MaxRefundSeq)
+	}
+}
+
+func TestCLIReconcileRangeDefaults(t *testing.T) {
+	ledgerPath := setupRangeLedger(t)
+	// 只给部分边界：未给的上界取最大序号，未给的下界取 0。
+	r := runCLIWith(t, []string{"reconcile", "-l", ledgerPath, "--payment-after", "1"},
+		`{"entries":[]}`)
+	if r.code != 0 {
+		t.Fatalf("reconcile: %s", r.err)
+	}
+	var rep struct {
+		PaymentAfter   int64 `json:"payment_after"`
+		PaymentThrough int64 `json:"payment_through"`
+		RefundAfter    int64 `json:"refund_after"`
+		RefundThrough  int64 `json:"refund_through"`
+	}
+	if err := json.Unmarshal([]byte(r.out), &rep); err != nil {
+		t.Fatal(err)
+	}
+	if rep.PaymentAfter != 1 || rep.PaymentThrough != 3 ||
+		rep.RefundAfter != 0 || rep.RefundThrough != 2 {
+		t.Fatalf("bounds=%d,%d,%d,%d", rep.PaymentAfter, rep.PaymentThrough,
+			rep.RefundAfter, rep.RefundThrough)
+	}
+}
+
+func TestCLIReconcileRangeInvalidBounds(t *testing.T) {
+	ledgerPath := setupRangeLedger(t)
+	bad := [][]string{
+		{"--payment-after", "-1"},
+		{"--payment-after", "2", "--payment-through", "1"},
+		{"--payment-through", "4"},
+		{"--refund-after", "3"},
+		{"--refund-through", "3"},
+		{"--payment-after", "abc"},
+	}
+	for i, flags := range bad {
+		args := append([]string{"reconcile", "-l", ledgerPath}, flags...)
+		r := runCLIWith(t, args, `{"entries":[]}`)
+		if r.code != 1 {
+			t.Fatalf("case %d: code=%d want 1", i, r.code)
+		}
+		if r.out != "" {
+			t.Fatalf("case %d: invalid bounds must print no partial report: %q", i, r.out)
+		}
+		if env := decodeOut(t, r.err); env["error"].(map[string]any)["kind"] != "invalid_parameter" {
+			t.Fatalf("case %d envelope=%s", i, r.err)
+		}
+	}
+}
+
+func TestCLIReconcileRangeOnlyRefunds(t *testing.T) {
+	ledgerPath := setupRangeLedger(t)
+	// 只选退款（付款上界 0）：账本侧扣款合计为零，退款按所选合计。
+	r := runCLIWith(t, []string{"reconcile", "-l", ledgerPath, "--payment-through", "0"},
+		`{"entries":[]}`)
+	if r.code != 0 {
+		t.Fatalf("reconcile: %s", r.err)
+	}
+	var rep struct {
+		MissingPayments []map[string]any `json:"missing_payments"`
+		MissingRefunds  []map[string]any `json:"missing_refunds"`
+		Totals          struct {
+			Ledger []struct {
+				ChargedTotal  string `json:"charged_total"`
+				RefundedTotal string `json:"refunded_total"`
+			} `json:"ledger"`
+		} `json:"totals"`
+	}
+	if err := json.Unmarshal([]byte(r.out), &rep); err != nil {
+		t.Fatal(err)
+	}
+	if len(rep.MissingPayments) != 0 {
+		t.Fatalf("missing payments=%+v", rep.MissingPayments)
+	}
+	if len(rep.MissingRefunds) != 2 {
+		t.Fatalf("missing refunds=%+v", rep.MissingRefunds)
+	}
+	if len(rep.Totals.Ledger) != 1 {
+		t.Fatalf("ledger rows=%+v", rep.Totals.Ledger)
+	}
+	row := rep.Totals.Ledger[0]
+	if row.ChargedTotal != "0" || row.RefundedTotal != "3009" {
+		t.Fatalf("ledger row=%+v", row)
+	}
+}

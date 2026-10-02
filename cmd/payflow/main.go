@@ -64,6 +64,12 @@ func usage(w io.Writer) {
 	fmt.Fprintln(w, "ledger flags (init/submit/refund/query/reconcile):")
 	fmt.Fprintln(w, "  -l, --ledger <path>   ledger file path (required)")
 	fmt.Fprintln(w, "  -f, --file <path>     JSON input file (init/submit/refund/reconcile; default: stdin)")
+	fmt.Fprintln(w, "")
+	fmt.Fprintln(w, "reconcile range flags (seq bounds, after < seq <= through; default: full history):")
+	fmt.Fprintln(w, "  --payment-after <n>    payment seq lower bound (exclusive)")
+	fmt.Fprintln(w, "  --payment-through <n>  payment seq upper bound (inclusive)")
+	fmt.Fprintln(w, "  --refund-after <n>     refund seq lower bound (exclusive)")
+	fmt.Fprintln(w, "  --refund-through <n>   refund seq upper bound (inclusive)")
 }
 
 // initRequest 是 init 的输入：{"balances":[...]}。
@@ -245,6 +251,14 @@ func cmdQuery(args []string, stdout, stderr io.Writer) int {
 
 func cmdReconcile(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	fs, ledgerPath, inputFile := ledgerFlagSet("reconcile")
+	// 序号边界：after 排除下界、through 包含上界（after < seq <= through）。
+	// 用指针区分“未提供”与显式给出的 0：未提供时由库取缺省值（下界 0、
+	// 上界为该类记录的最大成功序号）。
+	var paymentAfter, paymentThrough, refundAfter, refundThrough int64
+	fs.Int64Var(&paymentAfter, "payment-after", 0, "payment seq lower bound (exclusive)")
+	fs.Int64Var(&paymentThrough, "payment-through", 0, "payment seq upper bound (inclusive)")
+	fs.Int64Var(&refundAfter, "refund-after", 0, "refund seq lower bound (exclusive)")
+	fs.Int64Var(&refundThrough, "refund-through", 0, "refund seq upper bound (inclusive)")
 	if err := fs.Parse(args); err != nil {
 		return failEnvelope(stderr, payflow.ErrInvalid, err.Error())
 	}
@@ -261,14 +275,33 @@ func cmdReconcile(args []string, stdin io.Reader, stdout, stderr io.Writer) int 
 		return failWithError(stderr, err)
 	}
 
+	bounds := payflow.ReconcileBounds{}
+	fs.Visit(func(f *flag.Flag) {
+		switch f.Name {
+		case "payment-after":
+			v := paymentAfter
+			bounds.PaymentAfter = &v
+		case "payment-through":
+			v := paymentThrough
+			bounds.PaymentThrough = &v
+		case "refund-after":
+			v := refundAfter
+			bounds.RefundAfter = &v
+		case "refund-through":
+			v := refundThrough
+			bounds.RefundThrough = &v
+		}
+	})
+
 	l, err := payflow.Open(*ledgerPath)
 	if err != nil {
 		return failWithError(stderr, err)
 	}
 	defer l.Close()
 
-	// 对账只读：不改余额、历史或账本文件。输入有差异仍是正常结果，退出码 0。
-	report, err := l.ReconcileFlow(entries)
+	// 对账只读：不改余额、历史或账本文件。边界非法同样整次拒绝、不输出部分
+	// 报告；输入有差异仍是正常结果，退出码 0。
+	report, err := l.ReconcileFlowRanged(entries, bounds)
 	if err != nil {
 		return failWithError(stderr, err)
 	}
