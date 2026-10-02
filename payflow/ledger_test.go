@@ -1744,3 +1744,445 @@ func TestChargeLimitAbsentOrEmptyMeansUnlimited(t *testing.T) {
 		l.Close()
 	}
 }
+
+// ---- 预览（submit --dry-run） ----
+
+// snapshotFingerprint 返回余额与全部记录的确定性指纹，用于断言预览不写账本。
+func snapshotFingerprint(t *testing.T, l *Ledger) string {
+	t.Helper()
+	snap, err := l.Query()
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := json.Marshal(snap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(raw)
+}
+
+func TestPreviewDoesNotWriteLedger(t *testing.T) {
+	path := newTestLedger(t, []BalanceInit{{Account: "aa", Asset: "usdc", Balance: 100}})
+	l := openOrFail(t, path)
+
+	before := snapshotFingerprint(t, l)
+	fileBefore, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := l.Preview(FeeBatch{FeeBps: 0, Intents: []PaymentIntent{
+		intent("p1", "aa", "usdc", 70),
+		intent("p2", "aa", "usdc", 40),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.DryRun {
+		t.Fatalf("preview must carry dry_run=true: %+v", res)
+	}
+	want := []string{StatusSettled, StatusFunds}
+	if got := statuses(res); fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("statuses=%v want %v", got, want)
+	}
+
+	// 预览后余额、付款与退款历史必须与预览前完全一致。
+	if after := snapshotFingerprint(t, l); after != before {
+		t.Fatalf("preview changed ledger state:\nbefore=%s\nafter=%s", before, after)
+	}
+	fileAfter, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(fileBefore, fileAfter) {
+		t.Fatalf("preview changed ledger file content:\nbefore=%s\nafter=%s", fileBefore, fileAfter)
+	}
+
+	// 随后实际提交这些新付款仍按首次提交处理：p1 真实落账并扣款。
+	real, err := l.Submit(FeeBatch{FeeBps: 0, Intents: []PaymentIntent{intent("p1", "aa", "usdc", 70)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if real.Results[0].Status != StatusSettled {
+		t.Fatalf("actual submit after preview must settle as first-time: %+v", real.Results[0])
+	}
+	if bal, _ := l.Balance("aa", "usdc"); bal != 30 {
+		t.Fatalf("balance=%d want 30", bal)
+	}
+}
+
+func TestPreviewSeesPredictedBalanceSequentially(t *testing.T) {
+	path := newTestLedger(t, []BalanceInit{{Account: "aa", Asset: "usdc", Balance: 100}})
+	l := openOrFail(t, path)
+
+	// 余额 100、费率为零：先付 70 成功，后付 40 余额不足（不是两项都成功）。
+	res, err := l.Preview(FeeBatch{FeeBps: 0, Intents: []PaymentIntent{
+		intent("p1", "aa", "usdc", 70),
+		intent("p2", "aa", "usdc", 40),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{StatusSettled, StatusFunds}
+	if got := statuses(res); fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("statuses=%v want %v", got, want)
+	}
+	if res.Results[0].Record == nil || res.Results[0].Record.Charged != 70 {
+		t.Fatalf("first item record=%+v", res.Results[0].Record)
+	}
+}
+
+func TestPreviewSeqContinuesAfterHistory(t *testing.T) {
+	path := newTestLedger(t, []BalanceInit{{Account: "aa", Asset: "usdc", Balance: 100}})
+	l := openOrFail(t, path)
+	// 已有一笔成功付款，序号为 1。
+	if _, err := l.Submit(FeeBatch{FeeBps: 0, Intents: []PaymentIntent{intent("p0", "aa", "usdc", 10)}}); err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := l.Preview(FeeBatch{FeeBps: 0, Intents: []PaymentIntent{
+		intent("p1", "aa", "usdc", 30),   // 预计成功，序号 2
+		intent("p2", "aa", "usdc", 30),   // 预计成功，序号 3
+		intent("p3", "aa", "usdc", 1000), // 余额不足，不占序号
+		intent("p4", "aa", "usdc", 30),   // 预计成功，序号 4
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{StatusSettled, StatusSettled, StatusFunds, StatusSettled}
+	if got := statuses(res); fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("statuses=%v want %v", got, want)
+	}
+	wantSeq := []int64{2, 3, 0, 4}
+	for i, w := range wantSeq {
+		if w == 0 {
+			if res.Results[i].Record != nil {
+				t.Fatalf("item %d must not carry a record: %+v", i, res.Results[i])
+			}
+			continue
+		}
+		if res.Results[i].Record == nil || res.Results[i].Record.Seq != w {
+			t.Fatalf("item %d seq=%v want %d", i, res.Results[i].Record, w)
+		}
+	}
+
+	// 预览不预留序号：账本里仍只有 p0 一笔。
+	snap, _ := l.Query()
+	if len(snap.Settlements) != 1 || snap.Settlements[0].ID != "p0" {
+		t.Fatalf("preview reserved seq: %+v", snap.Settlements)
+	}
+}
+
+func TestPreviewFailedIDRetrySucceedsWithoutConsumingSeq(t *testing.T) {
+	path := newTestLedger(t, []BalanceInit{{Account: "aa", Asset: "usdc", Balance: 100}})
+	l := openOrFail(t, path)
+
+	res, err := l.Preview(FeeBatch{FeeBps: 0, Intents: []PaymentIntent{
+		intent("p1", "aa", "usdc", 200), // 余额不足，不占编号
+		intent("p1", "aa", "usdc", 60),  // 同一编号改为可支付请求，预计成功
+		intent("p2", "aa", "usdc", 40),  // 预计成功
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{StatusFunds, StatusSettled, StatusSettled}
+	if got := statuses(res); fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("statuses=%v want %v", got, want)
+	}
+	// 失败项不占序号：后两项序号连续为 1、2。
+	if res.Results[1].Record == nil || res.Results[1].Record.Seq != 1 {
+		t.Fatalf("retry record=%+v", res.Results[1].Record)
+	}
+	if res.Results[2].Record == nil || res.Results[2].Record.Seq != 2 {
+		t.Fatalf("following record=%+v", res.Results[2].Record)
+	}
+}
+
+func TestPreviewIdempotencyAndConflict(t *testing.T) {
+	path := newTestLedger(t, []BalanceInit{{Account: "aa", Asset: "usdc", Balance: 1_000_000}})
+	l := openOrFail(t, path)
+	base := intent("p1", "aa", "usdc", 100)
+	base.Paymaster = "pm-1"
+	base.Nonce = 7
+	if _, err := l.Submit(FeeBatch{FeeBps: 30, Intents: []PaymentIntent{base}}); err != nil {
+		t.Fatal(err)
+	}
+	afterSubmit := snapshotFingerprint(t, l)
+
+	// 已有成功编号：相同请求（含费率）显示重复并携带原记录，不扣余额、不占额度。
+	same := base
+	res, err := l.Preview(FeeBatch{FeeBps: 30, Intents: []PaymentIntent{same}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Results[0].Status != StatusDuplicate || res.Results[0].Record == nil ||
+		res.Results[0].Record.Seq != 1 || res.Results[0].Record.Charged != 100 {
+		t.Fatalf("duplicate: %+v", res.Results[0])
+	}
+
+	// 字段不同：冲突。
+	diff := base
+	diff.Amount = i64p(101)
+	res, err = l.Preview(FeeBatch{FeeBps: 30, Intents: []PaymentIntent{diff}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Results[0].Status != StatusConflict {
+		t.Fatalf("conflict: %+v", res.Results[0])
+	}
+
+	// 预览中首次预计成功的编号对本批次后续项同样生效：
+	// 相同请求显示重复，字段不同显示冲突。
+	// 注意：账本已有 p1（序号 1），预计成功的 n1 序号从 2 开始。
+	res, err = l.Preview(FeeBatch{FeeBps: 0, Intents: []PaymentIntent{
+		intent("n1", "aa", "usdc", 100),
+		intent("n1", "aa", "usdc", 100),
+		func() PaymentIntent { d := intent("n1", "aa", "usdc", 100); d.Amount = i64p(101); return d }(),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{StatusSettled, StatusDuplicate, StatusConflict}
+	if got := statuses(res); fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("in-batch repeat: statuses=%v want %v", got, want)
+	}
+	if res.Results[1].Record == nil || res.Results[1].Record.Seq != 2 {
+		t.Fatalf("in-batch duplicate must carry predicted record: %+v", res.Results[1])
+	}
+
+	// 预览全程不写账本。
+	if after := snapshotFingerprint(t, l); after != afterSubmit {
+		t.Fatalf("preview wrote ledger: before=%s after=%s", afterSubmit, after)
+	}
+}
+
+func TestPreviewRefundedPaymentStillDuplicate(t *testing.T) {
+	path := newTestLedger(t, []BalanceInit{{Account: "aa", Asset: "usdc", Balance: 1_000_000}})
+	l := openOrFail(t, path)
+	base := intent("p1", "aa", "usdc", 100)
+	if _, err := l.Submit(FeeBatch{FeeBps: 0, Intents: []PaymentIntent{base}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := l.Refund(RefundBatch{Refunds: []RefundRequest{refundReq("r1", "p1", "cancel")}}); err != nil {
+		t.Fatal(err)
+	}
+
+	// 原付款已退款：预览中相同请求仍返回 duplicate 及原记录，不占余额与额度。
+	res, err := l.Preview(FeeBatch{FeeBps: 0, Intents: []PaymentIntent{base}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Results[0].Status != StatusDuplicate || res.Results[0].Record == nil ||
+		res.Results[0].Record.ID != "p1" {
+		t.Fatalf("refunded payment duplicate: %+v", res.Results[0])
+	}
+}
+
+func TestPreviewLimitsAccumulatePredictedCharges(t *testing.T) {
+	path := newTestLedger(t, []BalanceInit{{Account: "aa", Asset: "usdc", Balance: 100}})
+	l := openOrFail(t, path)
+
+	// 上限 100、费率为零：p1 预计成功（已用 60），p2 超限（先于余额不足），
+	// p3 预计成功（恰好用满 100）。
+	res, err := l.Preview(FeeBatch{
+		FeeBps: 0,
+		Limits: []ChargeLimit{limit("aa", "usdc", 100)},
+		Intents: []PaymentIntent{
+			intent("p1", "aa", "usdc", 60),
+			intent("p2", "aa", "usdc", 50),
+			intent("p3", "aa", "usdc", 40),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{StatusSettled, StatusLimitExceeded, StatusSettled}
+	if got := statuses(res); fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("statuses=%v want %v", got, want)
+	}
+	if res.Results[2].Record == nil || res.Results[2].Record.Charged != 40 {
+		t.Fatalf("p3 record=%+v", res.Results[2].Record)
+	}
+	// 预览不写账本：余额与记录不变。
+	if bal, _ := l.Balance("aa", "usdc"); bal != 100 {
+		t.Fatalf("preview changed balance: %d", bal)
+	}
+
+	// 额度计入手续费：100 + 1(费) = 101 恰好达到上限。
+	// 用独立账本（余额充足）以排除余额因素，只检验限额判定。
+	path2 := newTestLedger(t, []BalanceInit{{Account: "aa", Asset: "usdc", Balance: 10000}})
+	l2 := openOrFail(t, path2)
+	res, err = l2.Preview(FeeBatch{
+		FeeBps:  100,
+		Limits:  []ChargeLimit{limit("aa", "usdc", 101)},
+		Intents: []PaymentIntent{intent("f1", "aa", "usdc", 100), intent("f2", "aa", "usdc", 1)},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want = []string{StatusSettled, StatusLimitExceeded}
+	if got := statuses(res); fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("fee-inclusive limit: statuses=%v want %v", got, want)
+	}
+	if res.Results[0].Record == nil || res.Results[0].Record.Charged != 101 {
+		t.Fatalf("f1 charged=%+v", res.Results[0].Record)
+	}
+}
+
+func TestPreviewLimitCheckedBeforeBalance(t *testing.T) {
+	path := newTestLedger(t, []BalanceInit{{Account: "aa", Asset: "usdc", Balance: 5}})
+	l := openOrFail(t, path)
+
+	// 同时超限与余额不足：报告超限。
+	res, err := l.Preview(FeeBatch{
+		FeeBps: 0,
+		Limits: []ChargeLimit{limit("aa", "usdc", 6)},
+		Intents: []PaymentIntent{
+			intent("p1", "aa", "usdc", 8), // 超限且余额不足 → 超限
+			intent("p2", "aa", "usdc", 6), // 限额内但余额不足 → 余额
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{StatusLimitExceeded, StatusFunds}
+	if got := statuses(res); fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("statuses=%v want %v", got, want)
+	}
+}
+
+func TestPreviewDeterministic(t *testing.T) {
+	path := newTestLedger(t, []BalanceInit{{Account: "aa", Asset: "usdc", Balance: 100}})
+	l := openOrFail(t, path)
+	batch := FeeBatch{FeeBps: 30, Intents: []PaymentIntent{
+		intent("p1", "aa", "usdc", 70),
+		intent("p2", "aa", "usdc", 40),
+		intent("p3", "aa", "usdc", 1),
+	}}
+
+	first, err := l.Preview(batch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := l.Preview(batch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw1, _ := json.Marshal(first)
+	raw2, _ := json.Marshal(second)
+	if !bytes.Equal(raw1, raw2) {
+		t.Fatalf("preview not deterministic:\n%s\n%s", raw1, raw2)
+	}
+}
+
+func TestPreviewEmptyBatch(t *testing.T) {
+	path := newTestLedger(t, []BalanceInit{{Account: "aa", Asset: "usdc", Balance: 100}})
+	l := openOrFail(t, path)
+
+	res, err := l.Preview(FeeBatch{FeeBps: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.DryRun {
+		t.Fatalf("empty preview must carry dry_run=true")
+	}
+	if res.Results == nil || len(res.Results) != 0 {
+		t.Fatalf("empty preview results=%v want empty", res.Results)
+	}
+}
+
+func TestPreviewBatchLevelErrors(t *testing.T) {
+	path := newTestLedger(t, []BalanceInit{{Account: "aa", Asset: "usdc", Balance: 100}})
+	l := openOrFail(t, path)
+
+	// 非法费率：批次级错误，退出码 1，不输出部分结果（空批次同样检查）。
+	if _, err := l.Preview(FeeBatch{FeeBps: -1}); KindOf(err) != ErrInvalid {
+		t.Fatalf("bad fee: want ErrInvalid, got %v", err)
+	}
+	if _, err := l.Preview(FeeBatch{FeeBps: 10001}); KindOf(err) != ErrInvalid {
+		t.Fatalf("fee too high: want ErrInvalid, got %v", err)
+	}
+	// 非法限额：同样整次拒绝。
+	if _, err := l.Preview(FeeBatch{
+		FeeBps: 0,
+		Limits: []ChargeLimit{limit("aa", "usdc", -1)},
+	}); KindOf(err) != ErrInvalid {
+		t.Fatalf("bad limits: want ErrInvalid, got %v", err)
+	}
+	if _, err := l.Preview(FeeBatch{
+		FeeBps: 0,
+		Limits: []ChargeLimit{limit("aa", "usdc", 1), limit("aa", "usdc", 2)},
+	}); KindOf(err) != ErrInvalid {
+		t.Fatalf("duplicate limits: want ErrInvalid, got %v", err)
+	}
+
+	// 批次级错误不执行任何意图：余额与记录不变。
+	if bal, _ := l.Balance("aa", "usdc"); bal != 100 {
+		t.Fatalf("batch-level error changed balance: %d", bal)
+	}
+	snap, _ := l.Query()
+	if len(snap.Settlements) != 0 {
+		t.Fatalf("batch-level error settled: %+v", snap.Settlements)
+	}
+}
+
+func TestPreviewOverflowAndStateDoNotConsumeSeq(t *testing.T) {
+	path := newTestLedger(t, []BalanceInit{{Account: "aa", Asset: "usdc", Balance: math.MaxInt64}})
+	l := openOrFail(t, path)
+
+	res, err := l.Preview(FeeBatch{FeeBps: 1, Intents: []PaymentIntent{
+		intent("p1", "aa", "usdc", math.MaxInt64), // 金额+手续费溢出 → invalid_parameter
+		intent("p2", "aa", "usdc", 100),           // 预计成功，序号 1
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{StatusInvalid, StatusSettled}
+	if got := statuses(res); fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("overflow: statuses=%v want %v", got, want)
+	}
+	if res.Results[1].Record == nil || res.Results[1].Record.Seq != 1 {
+		t.Fatalf("overflow must not consume seq: %+v", res.Results[1].Record)
+	}
+
+	// 状态错误同样不占序号。
+	res, err = l.Preview(FeeBatch{FeeBps: 0, Intents: []PaymentIntent{
+		intent("s1", "aa", "usdc", 100),
+		func() PaymentIntent { d := intent("s2", "aa", "usdc", 100); d.State = "failed"; return d }(),
+		intent("s3", "aa", "usdc", 100),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want = []string{StatusSettled, StatusState, StatusSettled}
+	if got := statuses(res); fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("state: statuses=%v want %v", got, want)
+	}
+	if res.Results[0].Record == nil || res.Results[0].Record.Seq != 1 {
+		t.Fatalf("s1 seq=%+v", res.Results[0].Record)
+	}
+	if res.Results[2].Record == nil || res.Results[2].Record.Seq != 2 {
+		t.Fatalf("state error must not consume seq: %+v", res.Results[2].Record)
+	}
+}
+
+func TestPreviewMissingOrCorruptLedger(t *testing.T) {
+	// 账本不存在：沿用 ledger_not_initialized，不创建账本。
+	missing := filepath.Join(t.TempDir(), "nope.json")
+	if _, err := Open(missing); KindOf(err) != ErrNotInit {
+		t.Fatalf("want ErrNotInit, got %v", err)
+	}
+	if _, err := os.Stat(missing); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("preview must not create ledger: stat err=%v", err)
+	}
+
+	// 账本损坏：沿用 corrupt_ledger，不修复。
+	dir := t.TempDir()
+	corrupt := filepath.Join(dir, "corrupt.json")
+	if err := os.WriteFile(corrupt, []byte(`garbage{`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(corrupt); KindOf(err) != ErrCorrupt {
+		t.Fatalf("want ErrCorrupt, got %v", err)
+	}
+}

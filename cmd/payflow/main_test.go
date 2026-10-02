@@ -895,3 +895,187 @@ func TestCLISubmitChargeLimits(t *testing.T) {
 		t.Fatalf("balances=%+v want usdc 50, eth 100", snap.Balances)
 	}
 }
+
+// ---- submit --dry-run 预览 ----
+
+func TestCLISubmitDryRun(t *testing.T) {
+	ledgerPath := t.TempDir() + "/ledger.json"
+	r := runCLIWith(t, []string{"init", "-l", ledgerPath},
+		`{"balances":[{"account":"aa-1","asset":"usdc","balance":100}]}`)
+	if r.code != 0 {
+		t.Fatalf("init code=%d err=%s", r.code, r.err)
+	}
+
+	// 预览：dry_run:true，结果按输入顺序；后项看到前项预计成功后的余额。
+	batch := `{"fee_bps":0,"intents":[
+	  {"id":"p1","account":"aa-1","asset":"usdc","amount":70},
+	  {"id":"p2","account":"aa-1","asset":"usdc","amount":40}
+	]}`
+	r = runCLIWith(t, []string{"submit", "--dry-run", "-l", ledgerPath}, batch)
+	if r.code != 0 {
+		t.Fatalf("dry-run code=%d err=%s", r.code, r.err)
+	}
+	var res struct {
+		DryRun  bool `json:"dry_run"`
+		Results []struct {
+			ID     string `json:"id"`
+			Status string `json:"status"`
+			Record *struct {
+				Seq int64 `json:"seq"`
+			} `json:"record"`
+		} `json:"results"`
+	}
+	if err := json.Unmarshal([]byte(r.out), &res); err != nil {
+		t.Fatal(err)
+	}
+	if !res.DryRun {
+		t.Fatalf("dry_run must be true: %s", r.out)
+	}
+	want := []string{"settled", "insufficient_balance"}
+	got := make([]string, len(res.Results))
+	for i, x := range res.Results {
+		got[i] = x.Status
+	}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("statuses=%v want %v", got, want)
+	}
+	if res.Results[0].Record == nil || res.Results[0].Record.Seq != 1 {
+		t.Fatalf("predicted record seq=%+v", res.Results[0].Record)
+	}
+
+	// 预览不写账本：余额与记录不变。
+	r = runCLIWith(t, []string{"query", "-l", ledgerPath}, "")
+	if r.code != 0 {
+		t.Fatalf("query code=%d", r.code)
+	}
+	var snap struct {
+		Balances []struct {
+			Balance int64 `json:"balance"`
+		} `json:"balances"`
+		Settlements []struct {
+			ID string `json:"id"`
+		} `json:"settlements"`
+	}
+	if err := json.Unmarshal([]byte(r.out), &snap); err != nil {
+		t.Fatal(err)
+	}
+	if len(snap.Balances) != 1 || snap.Balances[0].Balance != 100 {
+		t.Fatalf("balance=%+v want 100", snap.Balances)
+	}
+	if len(snap.Settlements) != 0 {
+		t.Fatalf("settlements=%+v want empty", snap.Settlements)
+	}
+
+	// 随后实际提交仍按首次提交处理。
+	r = runCLIWith(t, []string{"submit", "-l", ledgerPath},
+		`{"fee_bps":0,"intents":[{"id":"p1","account":"aa-1","asset":"usdc","amount":70}]}`)
+	if r.code != 0 || !strings.Contains(r.out, `"settled"`) {
+		t.Fatalf("actual submit after dry-run: code=%d out=%s err=%s", r.code, r.out, r.err)
+	}
+	r = runCLIWith(t, []string{"query", "-l", ledgerPath}, "")
+	if err := json.Unmarshal([]byte(r.out), &snap); err != nil {
+		t.Fatal(err)
+	}
+	if snap.Balances[0].Balance != 30 || len(snap.Settlements) != 1 {
+		t.Fatalf("after actual submit: balances=%+v settlements=%+v", snap.Balances, snap.Settlements)
+	}
+}
+
+func TestCLISubmitDryRunEmptyBatch(t *testing.T) {
+	ledgerPath := t.TempDir() + "/ledger.json"
+	r := runCLIWith(t, []string{"init", "-l", ledgerPath},
+		`{"balances":[{"account":"aa-1","asset":"usdc","balance":100}]}`)
+	if r.code != 0 {
+		t.Fatalf("init code=%d err=%s", r.code, r.err)
+	}
+
+	// 合法空批次：返回带预览标记的空结果列表。
+	r = runCLIWith(t, []string{"submit", "--dry-run", "-l", ledgerPath}, `{"fee_bps":0,"intents":[]}`)
+	if r.code != 0 {
+		t.Fatalf("dry-run empty code=%d err=%s", r.code, r.err)
+	}
+	if strings.TrimSpace(r.out) != `{
+  "dry_run": true,
+  "results": []
+}` {
+		t.Fatalf("empty dry-run out=%q", r.out)
+	}
+
+	// 空批次也检查费率：非法费率退出码 1，不输出部分结果。
+	r = runCLIWith(t, []string{"submit", "--dry-run", "-l", ledgerPath}, `{"fee_bps":-1,"intents":[]}`)
+	if r.code != 1 || decodeOut(t, r.err)["error"].(map[string]any)["kind"] != "invalid_parameter" {
+		t.Fatalf("bad fee dry-run: code=%d err=%s", r.code, r.err)
+	}
+	// 空批次也检查限额。
+	r = runCLIWith(t, []string{"submit", "--dry-run", "-l", ledgerPath},
+		`{"fee_bps":0,"limits":[{"account":"aa-1","asset":"usdc","max_charged":-1}],"intents":[]}`)
+	if r.code != 1 || decodeOut(t, r.err)["error"].(map[string]any)["kind"] != "invalid_parameter" {
+		t.Fatalf("bad limits dry-run: code=%d err=%s", r.code, r.err)
+	}
+}
+
+func TestCLISubmitDryRunInvalidJSON(t *testing.T) {
+	ledgerPath := t.TempDir() + "/ledger.json"
+	r := runCLIWith(t, []string{"init", "-l", ledgerPath},
+		`{"balances":[{"account":"aa-1","asset":"usdc","balance":100}]}`)
+	if r.code != 0 {
+		t.Fatalf("init code=%d err=%s", r.code, r.err)
+	}
+
+	// 非法 JSON：批次级错误，退出码 1，不输出部分结果。
+	r = runCLIWith(t, []string{"submit", "--dry-run", "-l", ledgerPath}, `{not json`)
+	if r.code != 1 || decodeOut(t, r.err)["error"].(map[string]any)["kind"] != "invalid_parameter" {
+		t.Fatalf("invalid JSON dry-run: code=%d err=%s", r.code, r.err)
+	}
+	if r.out != "" {
+		t.Fatalf("invalid JSON must not produce partial output: %q", r.out)
+	}
+}
+
+func TestCLISubmitDryRunMissingLedger(t *testing.T) {
+	missing := t.TempDir() + "/nope.json"
+	r := runCLIWith(t, []string{"submit", "--dry-run", "-l", missing}, `{"fee_bps":0,"intents":[]}`)
+	if r.code != 1 || decodeOut(t, r.err)["error"].(map[string]any)["kind"] != "ledger_not_initialized" {
+		t.Fatalf("missing ledger dry-run: code=%d err=%s", r.code, r.err)
+	}
+	// 预览不创建账本。
+	if _, err := os.Stat(missing); !os.IsNotExist(err) {
+		t.Fatalf("dry-run must not create ledger: stat err=%v", err)
+	}
+}
+
+func TestCLISubmitWithoutDryRunUnchanged(t *testing.T) {
+	ledgerPath := t.TempDir() + "/ledger.json"
+	r := runCLIWith(t, []string{"init", "-l", ledgerPath},
+		`{"balances":[{"account":"aa-1","asset":"usdc","balance":100}]}`)
+	if r.code != 0 {
+		t.Fatalf("init code=%d err=%s", r.code, r.err)
+	}
+
+	// 未启用预览：输出不含 dry_run 标记，格式与原来一致。
+	r = runCLIWith(t, []string{"submit", "-l", ledgerPath},
+		`{"fee_bps":0,"intents":[{"id":"p1","account":"aa-1","asset":"usdc","amount":70}]}`)
+	if r.code != 0 {
+		t.Fatalf("submit code=%d err=%s", r.code, r.err)
+	}
+	var raw map[string]any
+	if err := json.Unmarshal([]byte(r.out), &raw); err != nil {
+		t.Fatal(err)
+	}
+	if _, present := raw["dry_run"]; present {
+		t.Fatalf("normal submit must not carry dry_run: %s", r.out)
+	}
+	if _, present := raw["results"]; !present {
+		t.Fatalf("normal submit must carry results: %s", r.out)
+	}
+}
+
+func TestCLIHelpListsDryRun(t *testing.T) {
+	r := runCLIWith(t, []string{"help"}, "")
+	if r.code != 0 {
+		t.Fatalf("help code=%d err=%s", r.code, r.err)
+	}
+	if !strings.Contains(r.out, "--dry-run") {
+		t.Fatalf("help must list --dry-run: %s", r.out)
+	}
+}

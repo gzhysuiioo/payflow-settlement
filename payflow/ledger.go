@@ -127,8 +127,11 @@ type ItemResult struct {
 	Record *Record `json:"record,omitempty"`
 }
 
-// BatchResult 是一次提交的结果。空批次对应空 Results。
+// BatchResult 是一次提交（或一次预览）的结果。空批次对应空 Results。
+// DryRun 为 true 时表示这是 --dry-run 预览：结果只预测业务结果，不写入账本，
+// 因此不承诺实际提交时能否落盘。
 type BatchResult struct {
+	DryRun  bool         `json:"dry_run,omitempty"`
 	Results []ItemResult `json:"results"`
 }
 
@@ -609,20 +612,66 @@ func (l *Ledger) Submit(batch FeeBatch) (*BatchResult, error) {
 		return nil, err
 	}
 	defer l.endOp()
-	if batch.FeeBps < 0 || batch.FeeBps > 10000 {
-		return nil, ledgerError(ErrInvalid, "fee_bps must be within [0,10000], got %d", batch.FeeBps)
-	}
-	// 限额非法是批次级错误：任何意图都不执行（空意图列表同样检查）。
-	limits, err := validateLimits(batch.Limits)
+	limits, err := validateBatch(batch)
 	if err != nil {
 		return nil, err
 	}
-	out := &BatchResult{Results: make([]ItemResult, 0, len(batch.Intents))}
 
 	l.reg.mu.Lock()
 	defer l.reg.mu.Unlock()
 
-	// 本次提交内各组合已消耗的额度，从零开始，仅成功落账的扣款计入。
+	return l.processBatch(batch, l.reg.state, limits, false), nil
+}
+
+// Preview 在不写入账本的前提下预测整个批次的业务结果（submit --dry-run）。
+// 处理规则与 Submit 完全一致：后项看到前项预计成功后的可用余额与本批次
+// 已用额度，预计成功的付款获得从当前最大付款序号之后连续递增的序号；
+// 失败、重复与冲突不消耗序号。预览只预测业务结果，不承诺实际提交时能否
+// 落盘，也不预留任何编号、序号或额度：预览后余额、付款与退款历史及账本
+// 文件内容均保持不变；相同批次在账本未变化时多次预览结果一致，随后实际
+// 提交这些新付款仍按首次提交处理。
+func (l *Ledger) Preview(batch FeeBatch) (*BatchResult, error) {
+	if err := l.beginOp(); err != nil {
+		return nil, err
+	}
+	defer l.endOp()
+	limits, err := validateBatch(batch)
+	if err != nil {
+		return nil, err
+	}
+
+	l.reg.mu.Lock()
+	defer l.reg.mu.Unlock()
+
+	sim := cloneLedgerState(l.reg.state)
+	res := l.processBatch(batch, sim, limits, true)
+	res.DryRun = true
+	return res, nil
+}
+
+// validateBatch 校验费率与本次扣款上限：两者都是批次级约束，任一不合法时
+// 整个批次在任何意图执行之前拒绝（ErrInvalid），空意图列表同样检查。
+// 合法时返回按组合索引的上限表；无上限时返回 nil。
+func validateBatch(batch FeeBatch) (map[balanceKey]int64, error) {
+	if batch.FeeBps < 0 || batch.FeeBps > 10000 {
+		return nil, ledgerError(ErrInvalid, "fee_bps must be within [0,10000], got %d", batch.FeeBps)
+	}
+	return validateLimits(batch.Limits)
+}
+
+// processBatch 按输入顺序在状态 st 上处理一个批次，返回与输入逐项对应的
+// 结果。dryRun 为 true 时只预测业务结果：预计成功的付款只在 st 内生效，
+// 不持久化（因此不会出现存储失败），也不触碰 l.reg.state 与账本文件；
+// dryRun 为 false 时 st 必须就是账本的当前状态，每项成功后原子落盘，
+// 保存失败按 Submit 的既有规则回滚该项。
+//
+// 两种模式共用同一条判定路径，保证预览与实际提交对同一批次给出一致的
+// 业务结论：参数校验、幂等/冲突、状态、手续费与溢出、本次限额、余额。
+func (l *Ledger) processBatch(batch FeeBatch, st *ledgerState, limits map[balanceKey]int64, dryRun bool) *BatchResult {
+	out := &BatchResult{Results: make([]ItemResult, 0, len(batch.Intents))}
+
+	// 本次批次内各组合已消耗的额度，从零开始，仅预计/实际成功落账的扣款
+	// （含手续费）计入；失败、重复与冲突都不消耗额度。
 	used := make(map[balanceKey]int64, len(limits))
 
 	for i := range batch.Intents {
@@ -640,8 +689,8 @@ func (l *Ledger) Submit(batch FeeBatch) (*BatchResult, error) {
 
 		// 2. 已成功编号：字段与费率完全一致则幂等返回原记录；
 		//    任一不同则编号冲突。两者都不再扣款、不改原记录。
-		//    本批次内先成功的同编号项也在此被看到。
-		if rec, exists := l.findRecord(it.ID); exists {
+		//    预览时本批次内预计成功的同编号项也在此被看到。
+		if rec, exists := findRecordIn(st, it.ID); exists {
 			if sameRequest(rec, it, amount, batch.FeeBps) {
 				cp := rec
 				res.Status = StatusDuplicate
@@ -688,7 +737,7 @@ func (l *Ledger) Submit(batch FeeBatch) (*BatchResult, error) {
 		}
 
 		// 6. 余额校验。不存在的账户/资产组合余额视为 0（不足）。
-		bal := l.reg.state.Balances[key]
+		bal := st.Balances[key]
 		if total > bal {
 			res.Status = StatusFunds
 			res.Reason = reasonFunds
@@ -696,7 +745,9 @@ func (l *Ledger) Submit(batch FeeBatch) (*BatchResult, error) {
 			continue
 		}
 
-		// 7. 先在内存生效，再原子持久化；保存失败回滚该项，不留成功记录。
+		// 7. 生效：预览只在模拟状态上记账并分配预计序号（当前最大付款序号
+		//    之后连续递增）；实际提交先在内存生效，再原子持久化，保存失败
+		//    回滚该项，不留成功记录。
 		rec := Record{
 			ID:        it.ID,
 			Account:   it.Account,
@@ -707,9 +758,21 @@ func (l *Ledger) Submit(batch FeeBatch) (*BatchResult, error) {
 			FeeBps:    batch.FeeBps,
 			Fee:       fee,
 			Charged:   total,
-			Seq:       int64(len(l.reg.state.Settlements)) + 1,
+			Seq:       int64(len(st.Settlements)) + 1,
 		}
-		rollback := l.stage(key, bal-total, rec)
+
+		if dryRun {
+			st.Balances[key] = bal - total
+			st.Settlements = append(st.Settlements, rec)
+			used[key] += total
+			cp := rec
+			res.Status = StatusSettled
+			res.Record = &cp
+			out.Results = append(out.Results, res)
+			continue
+		}
+
+		rollback := stageState(st, key, bal-total, rec)
 		if err := l.persistLocked(); err != nil {
 			rollback()
 			res.Status = StatusStorage
@@ -723,22 +786,42 @@ func (l *Ledger) Submit(batch FeeBatch) (*BatchResult, error) {
 		}
 		out.Results = append(out.Results, res)
 	}
-	return out, nil
+	return out
 }
 
-// stage 应用一笔扣款与记录，返回回滚函数（恢复该项执行前的余额与记录长度）。
-func (l *Ledger) stage(key balanceKey, newBal int64, rec Record) func() {
-	oldBal, hadKey := l.reg.state.Balances[key]
-	oldLen := len(l.reg.state.Settlements)
-	l.reg.state.Balances[key] = newBal
-	l.reg.state.Settlements = append(l.reg.state.Settlements, rec)
+// cloneLedgerState 返回账本状态的一份深拷贝。预览在副本上进行，
+// 因此任何预计成功的扣款与序号都不会触及账本状态或账本文件。
+func cloneLedgerState(st *ledgerState) *ledgerState {
+	cp := &ledgerState{
+		Version:     st.Version,
+		Initial:     make(map[balanceKey]int64, len(st.Initial)),
+		Balances:    make(map[balanceKey]int64, len(st.Balances)),
+		Settlements: append([]Record(nil), st.Settlements...),
+		Refunds:     append([]RefundRecord(nil), st.Refunds...),
+	}
+	for k, v := range st.Initial {
+		cp.Initial[k] = v
+	}
+	for k, v := range st.Balances {
+		cp.Balances[k] = v
+	}
+	return cp
+}
+
+// stageState 在状态 st 上应用一笔扣款与记录，返回回滚函数
+// （恢复该项执行前的余额与记录长度）。
+func stageState(st *ledgerState, key balanceKey, newBal int64, rec Record) func() {
+	oldBal, hadKey := st.Balances[key]
+	oldLen := len(st.Settlements)
+	st.Balances[key] = newBal
+	st.Settlements = append(st.Settlements, rec)
 	return func() {
 		if hadKey {
-			l.reg.state.Balances[key] = oldBal
+			st.Balances[key] = oldBal
 		} else {
-			delete(l.reg.state.Balances, key)
+			delete(st.Balances, key)
 		}
-		l.reg.state.Settlements = l.reg.state.Settlements[:oldLen]
+		st.Settlements = st.Settlements[:oldLen]
 	}
 }
 
@@ -901,8 +984,14 @@ func (l *Ledger) findRefundOfSettlement(settlementID string) (RefundRecord, bool
 func (l *Ledger) stateView() *ledgerState { return l.reg.state }
 
 func (l *Ledger) findRecord(id string) (Record, bool) {
+	return findRecordIn(l.reg.state, id)
+}
+
+// findRecordIn 在指定状态的成功结算记录中按编号查找。
+// 预览在账本状态的副本上进行，因此幂等判断统一走本函数。
+func findRecordIn(st *ledgerState, id string) (Record, bool) {
 	// 记录按成功顺序追加且 ID 唯一；条目规模在单机账本量级，直接扫描。
-	for _, r := range l.stateView().Settlements {
+	for _, r := range st.Settlements {
 		if r.ID == id {
 			return r, true
 		}
