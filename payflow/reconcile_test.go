@@ -920,3 +920,334 @@ func TestReconcileFlowRangedDuplicatesCounted(t *testing.T) {
 		t.Fatalf("flow usdc=%+v", usdc)
 	}
 }
+
+// ---- Go 入口直接接收流水时的输入检查 ----
+
+// validFlowEntry 是一条各字段都合法的付款流水，各用例在其副本上改坏一个字段。
+func validFlowEntry(idx int) FlowEntry {
+	return FlowEntry{
+		Index: idx, Kind: "payment", ID: "p1", Account: "aa-1", Asset: "usdc",
+		Amount: 1000, Fee: 3, Charged: 1003,
+	}
+}
+
+func TestReconcileFlowGoEntryValidation(t *testing.T) {
+	l := rangeLedger(t)
+
+	cases := []struct {
+		name  string
+		entry FlowEntry
+		field string // 错误信息中应出现的字段
+	}{
+		{"unknown kind", func() FlowEntry { e := validFlowEntry(0); e.Kind = "wire"; return e }(), "kind"},
+		{"empty kind", func() FlowEntry { e := validFlowEntry(0); e.Kind = ""; return e }(), "kind"},
+		{"empty id", func() FlowEntry { e := validFlowEntry(0); e.ID = ""; return e }(), "id"},
+		{"empty account", func() FlowEntry { e := validFlowEntry(0); e.Account = ""; return e }(), "account"},
+		{"empty asset", func() FlowEntry { e := validFlowEntry(0); e.Asset = ""; return e }(), "asset"},
+		{"zero amount", func() FlowEntry { e := validFlowEntry(0); e.Amount = 0; return e }(), "amount"},
+		{"negative amount", func() FlowEntry { e := validFlowEntry(0); e.Amount = -1; return e }(), "amount"},
+		{"negative fee", func() FlowEntry { e := validFlowEntry(0); e.Fee = -1; return e }(), "fee"},
+		{"zero charged", func() FlowEntry { e := validFlowEntry(0); e.Charged = 0; return e }(), "charged"},
+		{"negative charged", func() FlowEntry { e := validFlowEntry(0); e.Charged = -5; return e }(), "charged"},
+		{"refund without settlement_id", func() FlowEntry {
+			e := validFlowEntry(0)
+			e.Kind = "refund"
+			e.ID = "r1"
+			return e
+		}(), "settlement_id"},
+	}
+
+	for _, c := range cases {
+		// 单条非法：两个入口都必须返回 invalid_parameter、空报告、不崩溃。
+		rep1, err1 := l.ReconcileFlow([]FlowEntry{c.entry})
+		if err1 == nil || KindOf(err1) != ErrInvalid || rep1 != nil {
+			t.Fatalf("%s ReconcileFlow: rep=%+v err=%v", c.name, rep1, err1)
+		}
+		rep2, err2 := l.ReconcileFlowRanged([]FlowEntry{c.entry}, ReconcileBounds{})
+		if err2 == nil || KindOf(err2) != ErrInvalid || rep2 != nil {
+			t.Fatalf("%s ReconcileFlowRanged: rep=%+v err=%v", c.name, rep2, err2)
+		}
+		// 错误信息必须指出出错字段。
+		if !strings.Contains(err1.Error(), c.field) {
+			t.Fatalf("%s: error must name field %q, got %v", c.name, c.field, err1)
+		}
+	}
+}
+
+// TestReconcileFlowValidationFirstInvalidPosition 验证按传入列表顺序报告第一条
+// 非法流水的位置；前面已有合法条目也不返回部分结果。
+func TestReconcileFlowValidationFirstInvalidPosition(t *testing.T) {
+	l := rangeLedger(t)
+	entries := []FlowEntry{
+		flowEntry(0, "payment", "p1", "aa-1", "usdc", 1000, 3, 1003, ""), // 合法
+		flowEntry(1, "payment", "p2", "aa-1", "usdc", 2000, 6, 2006, ""), // 合法
+		func() FlowEntry { e := validFlowEntry(2); e.Amount = -7; return e }(), // 第一条非法：位置 2
+		func() FlowEntry { e := validFlowEntry(3); e.Kind = "bogus"; return e }(),
+	}
+	rep, err := l.ReconcileFlow(entries)
+	if err == nil || KindOf(err) != ErrInvalid {
+		t.Fatalf("want invalid_parameter, got rep=%+v err=%v", rep, err)
+	}
+	if rep != nil {
+		t.Fatalf("no partial report allowed, got %+v", rep)
+	}
+	if !strings.Contains(err.Error(), "entry 2") {
+		t.Fatalf("error must point at list position 2, got %v", err)
+	}
+	if strings.Contains(err.Error(), "entry 3") {
+		t.Fatalf("must stop at first invalid entry, got %v", err)
+	}
+}
+
+// TestReconcileFlowValidationUsesListPositionNotIndex 位置用列表下标，
+// 与调用者自填的 Index 无关。
+func TestReconcileFlowValidationUsesListPositionNotIndex(t *testing.T) {
+	l := rangeLedger(t)
+	entries := []FlowEntry{
+		{Index: 99, Kind: "payment", ID: "p1", Account: "aa-1", Asset: "usdc", Amount: 0, Fee: 3, Charged: 1003},
+	}
+	_, err := l.ReconcileFlow(entries)
+	if err == nil || KindOf(err) != ErrInvalid {
+		t.Fatalf("want invalid_parameter, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "entry 0") {
+		t.Fatalf("position must be list index 0, not caller Index 99: %v", err)
+	}
+}
+
+// TestReconcileFlowValidationOutOfScopeAndDuplicateNotMasked 非法条目即使命中
+// 范围外记录、或与其他条目组成重复编号组，也必须按参数错误拒绝整次请求。
+func TestReconcileFlowValidationOutOfScopeAndDuplicateNotMasked(t *testing.T) {
+	l := rangeLedger(t)
+	pa, pt := int64(1), int64(2)
+
+	// p1 在范围 (1,2] 之外，但条目本身 amount 非法：仍拒绝，不能用 out_of_scope 掩盖。
+	badOutOfScope := []FlowEntry{
+		flowEntry(0, "payment", "p1", "aa-1", "usdc", -1, 3, 1003, ""),
+	}
+	if rep, err := l.ReconcileFlowRanged(badOutOfScope, ReconcileBounds{
+		PaymentAfter: &pa, PaymentThrough: &pt,
+	}); err == nil || KindOf(err) != ErrInvalid || rep != nil {
+		t.Fatalf("invalid entry hitting out-of-range record: rep=%+v err=%v", rep, err)
+	}
+
+	// 非法条目与一条合法条目同编号（本应成重复组）：参数错误优先于 duplicate。
+	badDup := []FlowEntry{
+		flowEntry(0, "payment", "p2", "aa-1", "usdc", 2000, 6, 2006, ""),
+		func() FlowEntry {
+			e := flowEntry(1, "payment", "p2", "aa-1", "usdc", 2000, 6, 2006, "")
+			e.Charged = -2006
+			return e
+		}(),
+	}
+	if rep, err := l.ReconcileFlowRanged(badDup, ReconcileBounds{
+		PaymentAfter: &pa, PaymentThrough: &pt,
+	}); err == nil || KindOf(err) != ErrInvalid || rep != nil {
+		t.Fatalf("invalid entry in duplicate group: rep=%+v err=%v", rep, err)
+	}
+}
+
+// TestReconcileFlowValidationDoesNotMutateEntries 校验不得改写传入条目。
+func TestReconcileFlowValidationDoesNotMutateEntries(t *testing.T) {
+	l := rangeLedger(t)
+	entries := []FlowEntry{
+		func() FlowEntry {
+			e := validFlowEntry(0)
+			e.Kind = "refund"
+			e.ID = "r1"
+			e.SettlementID = "" // 非法
+			return e
+		}(),
+	}
+	before := entries[0]
+	if _, err := l.ReconcileFlow(entries); err == nil {
+		t.Fatal("want invalid_parameter")
+	}
+	if entries[0] != before {
+		t.Fatalf("entry mutated: before=%+v after=%+v", before, entries[0])
+	}
+}
+
+// TestReconcileFlowValidationReadOnlyAndRecoverable 参数错误不改账本，
+// 且同一句柄随后仍能正常对账。
+func TestReconcileFlowValidationReadOnlyAndRecoverable(t *testing.T) {
+	l, path := reconLedger(t)
+	before, err := l.Query()
+	if err != nil {
+		t.Fatalf("query before: %v", err)
+	}
+
+	bad := []FlowEntry{func() FlowEntry { e := validFlowEntry(0); e.Kind = "nope"; return e }()}
+	if rep, err := l.ReconcileFlow(bad); err == nil || rep != nil {
+		t.Fatalf("invalid call: rep=%+v err=%v", rep, err)
+	}
+	if rep, err := l.ReconcileFlowRanged(bad, ReconcileBounds{}); err == nil || rep != nil {
+		t.Fatalf("invalid ranged call: rep=%+v err=%v", rep, err)
+	}
+
+	// 账本余额、历史与文件不变。
+	after, err := l.Query()
+	if err != nil {
+		t.Fatalf("query after: %v", err)
+	}
+	bj, _ := json.Marshal(before)
+	aj, _ := json.Marshal(after)
+	if string(bj) != string(aj) {
+		t.Fatalf("ledger changed:\nbefore=%s\nafter =%s", bj, aj)
+	}
+	onDisk, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(onDisk, []byte("nope")) {
+		t.Fatalf("invalid reconcile touched the ledger file")
+	}
+
+	// 同一句柄继续接受合法对账。
+	good := []FlowEntry{
+		{Index: 0, Kind: "payment", ID: "p1", Account: "aa-1", Asset: "usdc", Amount: 1000, Fee: 3, Charged: 1003},
+	}
+	rep, err := l.ReconcileFlow(good)
+	if err != nil {
+		t.Fatalf("subsequent valid reconcile: %v", err)
+	}
+	if rep.Results[0].Status != ReconMatched {
+		t.Fatalf("status=%s want matched", rep.Results[0].Status)
+	}
+}
+
+// TestReconcileFlowGoValidationConsistency Go 入口与 JSON 入口对相同内容判断一致：
+// 同一条非法流水经 ParseReconcileRequest 与直接传 Go 结构体都得到 invalid_parameter。
+func TestReconcileFlowGoValidationConsistency(t *testing.T) {
+	l := rangeLedger(t)
+	raw := []byte(`{"entries":[
+	  {"kind":"payment","id":"p1","account":"aa-1","asset":"usdc","amount":1000,"fee":3,"charged":1003},
+	  {"kind":"refund","id":"r9","account":"aa-1","asset":"usdc","amount":10,"fee":0,"charged":10}
+	]}`)
+	// JSON 入口拒绝（退款缺 settlement_id）。
+	if _, err := ParseReconcileRequest(raw); err == nil || KindOf(err) != ErrInvalid {
+		t.Fatalf("JSON path must reject: %v", err)
+	}
+	// Go 入口对同样内容同样拒绝。
+	direct := []FlowEntry{
+		{Index: 0, Kind: "payment", ID: "p1", Account: "aa-1", Asset: "usdc", Amount: 1000, Fee: 3, Charged: 1003},
+		{Index: 1, Kind: "refund", ID: "r9", Account: "aa-1", Asset: "usdc", Amount: 10, Fee: 0, Charged: 10},
+	}
+	if rep, err := l.ReconcileFlow(direct); err == nil || KindOf(err) != ErrInvalid || rep != nil {
+		t.Fatalf("Go path must reject identically: rep=%+v err=%v", rep, err)
+	}
+}
+
+// TestReconcileFlowSemanticMismatchesAreNotParameterErrors 输入合法但与账本不一致
+// （amount+fee != charged、退款原付款编号不同）仍是核对结论，不是参数错误。
+func TestReconcileFlowSemanticMismatchesAreNotParameterErrors(t *testing.T) {
+	l, _ := reconLedger(t)
+
+	// amount+fee != charged（1000+3 != 1004）：合法输入，按字段差异核对。
+	badSum := []FlowEntry{
+		{Index: 0, Kind: "payment", ID: "p1", Account: "aa-1", Asset: "usdc", Amount: 1000, Fee: 3, Charged: 1004},
+	}
+	rep, err := l.ReconcileFlow(badSum)
+	if err != nil {
+		t.Fatalf("amount+fee!=charged is not a parameter error: %v", err)
+	}
+	if rep.Results[0].Status != ReconFieldMismatch {
+		t.Fatalf("status=%s want field_mismatch", rep.Results[0].Status)
+	}
+
+	// 退款引用的原付款编号与账本不同（r1 实际指向 p1）：field_mismatch。
+	wrongSettle := []FlowEntry{
+		{Index: 0, Kind: "refund", ID: "r1", Account: "aa-1", Asset: "usdc",
+			Amount: 1000, Fee: 3, Charged: 1003, SettlementID: "p2"},
+	}
+	rep, err = l.ReconcileFlow(wrongSettle)
+	if err != nil {
+		t.Fatalf("settlement mismatch is not a parameter error: %v", err)
+	}
+	if rep.Results[0].Status != ReconFieldMismatch || len(rep.Results[0].Diffs) != 1 ||
+		rep.Results[0].Diffs[0].Field != "settlement_id" {
+		t.Fatalf("want settlement_id mismatch, got %+v", rep.Results[0])
+	}
+
+	// 退款引用账本中根本不存在的原付款编号，但退款编号本身也不在账本：missing_in_ledger。
+	ghost := []FlowEntry{
+		{Index: 0, Kind: "refund", ID: "rX", Account: "aa-1", Asset: "usdc",
+			Amount: 10, Fee: 0, Charged: 10, SettlementID: "does-not-exist"},
+	}
+	rep, err = l.ReconcileFlow(ghost)
+	if err != nil {
+		t.Fatalf("unknown settlement id is not a parameter error: %v", err)
+	}
+	if rep.Results[0].Status != ReconMissingInLedger {
+		t.Fatalf("status=%s want missing_in_ledger", rep.Results[0].Status)
+	}
+}
+
+// TestReconcileFlowGoEntryMaxInt64AndOverflow 正数金额到 int64 上界仍合法；
+// 多条累计超过 int64 时汇总仍是精确十进制字符串。
+func TestReconcileFlowGoEntryMaxInt64AndOverflow(t *testing.T) {
+	l := rangeLedger(t)
+	entries := []FlowEntry{
+		{Index: 0, Kind: "payment", ID: "a", Account: "aa-1", Asset: "zzz",
+			Amount: math.MaxInt64, Fee: 0, Charged: math.MaxInt64},
+		{Index: 1, Kind: "payment", ID: "b", Account: "aa-1", Asset: "zzz",
+			Amount: math.MaxInt64, Fee: 0, Charged: math.MaxInt64},
+	}
+	rep, err := l.ReconcileFlow(entries)
+	if err != nil {
+		t.Fatalf("max int64 entries must be valid: %v", err)
+	}
+	want := new(big.Int).Mul(big.NewInt(math.MaxInt64), big.NewInt(2))
+	row := findTotalRow(t, rep.Totals.Flow, "aa-1", "zzz")
+	if row.ChargedTotal != want.String() {
+		t.Fatalf("overflow total=%s want %s", row.ChargedTotal, want.String())
+	}
+}
+
+// TestReconcileFlowSameIDPaymentAndRefundGo 付款与退款同编号分别匹配（Go 入口）。
+func TestReconcileFlowSameIDPaymentAndRefundGo(t *testing.T) {
+	l, _ := reconLedger(t)
+	entries := []FlowEntry{
+		{Index: 0, Kind: "payment", ID: "r1", Account: "aa-1", Asset: "usdc", Amount: 1, Fee: 0, Charged: 1},
+		{Index: 1, Kind: "refund", ID: "r1", Account: "aa-1", Asset: "usdc",
+			Amount: 1000, Fee: 3, Charged: 1003, SettlementID: "p1"},
+	}
+	rep, err := l.ReconcileFlow(entries)
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if rep.Results[0].Status != ReconMissingInLedger {
+		t.Fatalf("payment r1: %s", rep.Results[0].Status)
+	}
+	if rep.Results[1].Status != ReconMatched {
+		t.Fatalf("refund r1: %s", rep.Results[1].Status)
+	}
+}
+
+// TestReconcileFlowNilAndEmptyStillListMissing Go 的 nil/空列表语义保持不变。
+func TestReconcileFlowNilAndEmptyStillListMissing(t *testing.T) {
+	l, _ := reconLedger(t)
+	for _, entries := range [][]FlowEntry{nil, {}} {
+		rep, err := l.ReconcileFlow(entries)
+		if err != nil {
+			t.Fatalf("nil/empty: %v", err)
+		}
+		if len(rep.Results) != 0 {
+			t.Fatalf("nil/empty must have no results, got %+v", rep.Results)
+		}
+		if ids := refs(rep.MissingPayments); ids != "p1,p2" {
+			t.Fatalf("missing payments=%s want p1,p2", ids)
+		}
+		if ids := refs(rep.MissingRefunds); ids != "r1" {
+			t.Fatalf("missing refunds=%s want r1", ids)
+		}
+	}
+}
+
+func refs(rs []ReconRecordRef) string {
+	var ids []string
+	for _, r := range rs {
+		ids = append(ids, r.ID)
+	}
+	return strings.Join(ids, ",")
+}
