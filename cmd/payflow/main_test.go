@@ -638,3 +638,107 @@ func TestCLIHelpListsReconcile(t *testing.T) {
 		t.Fatalf("help does not mention reconcile:\n%s", r.out)
 	}
 }
+
+func TestCLIReconcileScopeFlags(t *testing.T) {
+	ledgerPath := setupReconLedger(t) // p1(usdc 1003, seq 1)、p2(eth 10, seq 2)，无退款
+
+	// 只核对 p1：流水里的 p2 命中范围外记录 -> out_of_scope，不计入流水侧汇总；
+	// p2 在账本上也不列为缺失。缺省上界解析为最大序号并写入报告。
+	body := `{"entries":[
+	  {"kind":"payment","id":"p1","account":"aa-1","asset":"usdc","amount":1000,"fee":3,"charged":1003},
+	  {"kind":"payment","id":"p2","account":"aa-2","asset":"eth","amount":10,"fee":0,"charged":10}
+	]}`
+	r := runCLIWith(t, []string{"reconcile", "-l", ledgerPath, "--payment-through", "1"}, body)
+	if r.code != 0 {
+		t.Fatalf("reconcile: %s", r.err)
+	}
+	var rep struct {
+		Results []struct {
+			ID     string `json:"id"`
+			Status string `json:"status"`
+		} `json:"results"`
+		MissingPayments []any `json:"missing_payments"`
+		MissingRefunds  []any `json:"missing_refunds"`
+		MaxPaymentSeq   int64 `json:"max_payment_seq"`
+		MaxRefundSeq    int64 `json:"max_refund_seq"`
+		PaymentAfter    int64 `json:"payment_after"`
+		PaymentThrough  int64 `json:"payment_through"`
+		RefundAfter     int64 `json:"refund_after"`
+		RefundThrough   int64 `json:"refund_through"`
+		Totals          struct {
+			Ledger []struct {
+				Asset        string `json:"asset"`
+				ChargedTotal string `json:"charged_total"`
+			} `json:"ledger"`
+			Flow []struct {
+				NetCharged string `json:"net_charged"`
+			} `json:"flow"`
+		} `json:"totals"`
+	}
+	if err := json.Unmarshal([]byte(r.out), &rep); err != nil {
+		t.Fatalf("decode: %v\n%s", err, r.out)
+	}
+	if rep.Results[0].Status != "matched" || rep.Results[1].Status != "out_of_scope" {
+		t.Fatalf("statuses=%s,%s", rep.Results[0].Status, rep.Results[1].Status)
+	}
+	if len(rep.MissingPayments) != 0 || len(rep.MissingRefunds) != 0 {
+		t.Fatalf("missing=%+v/%+v", rep.MissingPayments, rep.MissingRefunds)
+	}
+	if rep.PaymentAfter != 0 || rep.PaymentThrough != 1 || rep.RefundAfter != 0 || rep.RefundThrough != 0 {
+		t.Fatalf("bounds=%d/%d %d/%d", rep.PaymentAfter, rep.PaymentThrough, rep.RefundAfter, rep.RefundThrough)
+	}
+	if rep.MaxPaymentSeq != 2 || rep.MaxRefundSeq != 0 {
+		t.Fatalf("max seqs=%d/%d", rep.MaxPaymentSeq, rep.MaxRefundSeq)
+	}
+	// 账本侧只含 p1；流水侧只计入 p1（p2 是 out_of_scope，不计入）。
+	if len(rep.Totals.Ledger) != 1 || rep.Totals.Ledger[0].ChargedTotal != "1003" {
+		t.Fatalf("ledger totals=%+v", rep.Totals.Ledger)
+	}
+	if len(rep.Totals.Flow) != 1 || rep.Totals.Flow[0].NetCharged != "1003" {
+		t.Fatalf("flow totals=%+v", rep.Totals.Flow)
+	}
+
+	// 下界排除：--payment-after 1 只留 p2；空流水时 p2 单独列为缺失。
+	r = runCLIWith(t, []string{"reconcile", "-l", ledgerPath, "--payment-after", "1"}, `{"entries":[]}`)
+	if r.code != 0 {
+		t.Fatalf("reconcile after: %s", r.err)
+	}
+	var rep2 struct {
+		MissingPayments []struct {
+			ID string `json:"id"`
+		} `json:"missing_payments"`
+		PaymentThrough int64 `json:"payment_through"`
+	}
+	if err := json.Unmarshal([]byte(r.out), &rep2); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(rep2.MissingPayments) != 1 || rep2.MissingPayments[0].ID != "p2" || rep2.PaymentThrough != 2 {
+		t.Fatalf("missing=%+v through=%d", rep2.MissingPayments, rep2.PaymentThrough)
+	}
+}
+
+func TestCLIReconcileScopeInvalidBounds(t *testing.T) {
+	ledgerPath := setupReconLedger(t)
+	bad := [][]string{
+		{"--payment-after", "-1"},
+		{"--payment-through", "-1"},
+		{"--payment-after", "2", "--payment-through", "1"}, // 下界大于上界
+		{"--payment-through", "3"},                         // 超过最大付款序号 2
+		{"--refund-through", "1"},                          // 超过最大退款序号 0
+		{"--refund-after", "abc"},                          // 非整数
+		{"--payment-through", "99999999999999999999999"},   // 越界
+	}
+	for i, flags := range bad {
+		args := append([]string{"reconcile", "-l", ledgerPath}, flags...)
+		r := runCLIWith(t, args, `{"entries":[]}`)
+		if r.code != 1 {
+			t.Fatalf("case %d: exit=%d want 1 (out=%s)", i, r.code, r.out)
+		}
+		if r.out != "" {
+			t.Fatalf("case %d: invalid bounds must print no partial report: %q", i, r.out)
+		}
+		if env := decodeOut(t, r.err); env["error"].(map[string]any)["kind"] != "invalid_parameter" {
+			t.Fatalf("case %d envelope=%s", i, r.err)
+		}
+	}
+}

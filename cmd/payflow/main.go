@@ -64,6 +64,12 @@ func usage(w io.Writer) {
 	fmt.Fprintln(w, "ledger flags (init/submit/refund/query/reconcile):")
 	fmt.Fprintln(w, "  -l, --ledger <path>   ledger file path (required)")
 	fmt.Fprintln(w, "  -f, --file <path>     JSON input file (init/submit/refund/reconcile; default: stdin)")
+	fmt.Fprintln(w, "")
+	fmt.Fprintln(w, "reconcile scope flags (after < seq <= through, per record kind):")
+	fmt.Fprintln(w, "  --payment-after N     payments with success seq > N (default 0)")
+	fmt.Fprintln(w, "  --payment-through N   payments with success seq <= N (default: max payment seq)")
+	fmt.Fprintln(w, "  --refund-after N      refunds with success seq > N (default 0)")
+	fmt.Fprintln(w, "  --refund-through N    refunds with success seq <= N (default: max refund seq)")
 }
 
 // initRequest 是 init 的输入：{"balances":[...]}。
@@ -245,11 +251,29 @@ func cmdQuery(args []string, stdout, stderr io.Writer) int {
 
 func cmdReconcile(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	fs, ledgerPath, inputFile := ledgerFlagSet("reconcile")
+	// 序号范围边界：after < seq <= through。after 缺省 0；through 缺省
+	// 取对应类别的最大成功序号（用是否显式给出区分，而非特殊值）。
+	var payAfter, payThrough, refAfter, refThrough int64
+	fs.Int64Var(&payAfter, "payment-after", 0, "reconcile payments with success seq greater than this")
+	fs.Int64Var(&payThrough, "payment-through", 0, "reconcile payments with success seq up to this (default: max payment seq)")
+	fs.Int64Var(&refAfter, "refund-after", 0, "reconcile refunds with success seq greater than this")
+	fs.Int64Var(&refThrough, "refund-through", 0, "reconcile refunds with success seq up to this (default: max refund seq)")
 	if err := fs.Parse(args); err != nil {
 		return failEnvelope(stderr, payflow.ErrInvalid, err.Error())
 	}
 	if *ledgerPath == "" {
 		return failEnvelope(stderr, payflow.ErrInvalid, "reconcile requires --ledger <path>")
+	}
+	provided := map[string]bool{}
+	fs.Visit(func(f *flag.Flag) { provided[f.Name] = true })
+	scope := payflow.ReconScope{}
+	scope.Payment.After = payAfter
+	scope.Refund.After = refAfter
+	if provided["payment-through"] {
+		scope.Payment.Through = &payThrough
+	}
+	if provided["refund-through"] {
+		scope.Refund.Through = &refThrough
 	}
 	raw, err := readInput(*inputFile, stdin)
 	if err != nil {
@@ -268,7 +292,8 @@ func cmdReconcile(args []string, stdin io.Reader, stdout, stderr io.Writer) int 
 	defer l.Close()
 
 	// 对账只读：不改余额、历史或账本文件。输入有差异仍是正常结果，退出码 0。
-	report, err := l.ReconcileFlow(entries)
+	// 边界非法（负数、下界大于上界、上界超过最大序号）整次 invalid_parameter。
+	report, err := l.ReconcileFlowScoped(entries, scope)
 	if err != nil {
 		return failWithError(stderr, err)
 	}

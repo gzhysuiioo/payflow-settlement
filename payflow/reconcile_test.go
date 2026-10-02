@@ -600,3 +600,268 @@ func TestReconcileConcurrentWithWriters(t *testing.T) {
 	close(stop)
 	wg.Wait()
 }
+
+// ---- 按成功序号限定核对范围 ----
+
+// reconScopedLedger 构造三笔付款、两笔退款的账本：
+// p1(aa-1/usdc charged 1003)、p2(aa-2/eth charged 10)、p3(aa-1/usdc charged 50)；
+// r1→p1(1003)、r2→p3(50)。
+func reconScopedLedger(t *testing.T) *Ledger {
+	t.Helper()
+	path := newTestLedger(t, []BalanceInit{
+		{Account: "aa-1", Asset: "usdc", Balance: math.MaxInt64},
+		{Account: "aa-2", Asset: "eth", Balance: 100},
+	})
+	l := openOrFail(t, path)
+	res, err := l.Submit(FeeBatch{FeeBps: 30, Intents: []PaymentIntent{
+		{ID: "p1", Account: "aa-1", Asset: "usdc", Amount: i64p(1000), State: "pending"},
+		{ID: "p2", Account: "aa-2", Asset: "eth", Amount: i64p(10), State: "pending"},
+		{ID: "p3", Account: "aa-1", Asset: "usdc", Amount: i64p(50), State: "pending"},
+	}})
+	if err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	for i, s := range statuses(res) {
+		if s != StatusSettled {
+			t.Fatalf("setup intent %d status=%s", i, s)
+		}
+	}
+	rr, err := l.Refund(RefundBatch{Refunds: []RefundRequest{
+		{ID: "r1", SettlementID: "p1", Reason: "cancel"},
+		{ID: "r2", SettlementID: "p3", Reason: "cancel"},
+	}})
+	if err != nil {
+		t.Fatalf("refund: %v", err)
+	}
+	for i, x := range rr.Results {
+		if x.Status != StatusRefundSuccess {
+			t.Fatalf("setup refund %d status=%s", i, x.Status)
+		}
+	}
+	return l
+}
+
+func scopePtr(v int64) *int64 { return &v }
+
+func TestReconcileScopeLimitsMissingAndTotals(t *testing.T) {
+	l := reconScopedLedger(t)
+	// 付款只选 (1,2] 即 p2；退款只选 (0,1] 即 r1。空流水：入选记录全部缺失。
+	rep, err := l.ReconcileFlowScoped(nil, ReconScope{
+		Payment: ReconRange{After: 1, Through: scopePtr(2)},
+		Refund:  ReconRange{Through: scopePtr(1)},
+	})
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if len(rep.MissingPayments) != 1 || rep.MissingPayments[0].ID != "p2" {
+		t.Fatalf("missing payments=%+v", rep.MissingPayments)
+	}
+	if len(rep.MissingRefunds) != 1 || rep.MissingRefunds[0].ID != "r1" {
+		t.Fatalf("missing refunds=%+v", rep.MissingRefunds)
+	}
+	// 报告列明实际采用的四个边界；最大序号仍表示完整历史。
+	if rep.PaymentAfter != 1 || rep.PaymentThrough != 2 || rep.RefundAfter != 0 || rep.RefundThrough != 1 {
+		t.Fatalf("bounds=%d/%d %d/%d", rep.PaymentAfter, rep.PaymentThrough, rep.RefundAfter, rep.RefundThrough)
+	}
+	if rep.MaxPaymentSeq != 3 || rep.MaxRefundSeq != 2 {
+		t.Fatalf("max seqs=%d/%d", rep.MaxPaymentSeq, rep.MaxRefundSeq)
+	}
+	// 账本侧只含入选记录：eth 扣款 10；usdc 只有退款 1003（p1/p3 未入选，
+	// 不能顺带计入原付款）。
+	if len(rep.Totals.Ledger) != 2 {
+		t.Fatalf("ledger rows=%+v", rep.Totals.Ledger)
+	}
+	for _, row := range rep.Totals.Ledger {
+		switch row.Asset {
+		case "eth":
+			if row.ChargedTotal != "10" || row.RefundedTotal != "0" || row.NetCharged != "10" {
+				t.Fatalf("eth row=%+v", row)
+			}
+		case "usdc":
+			if row.ChargedTotal != "0" || row.RefundedTotal != "1003" || row.NetCharged != "-1003" {
+				t.Fatalf("usdc row=%+v", row)
+			}
+		}
+	}
+}
+
+func TestReconcileScopeOutOfScopeEntries(t *testing.T) {
+	l := reconScopedLedger(t)
+	// 只核对 p1（through=1）。流水里 p2 出现两次且字段故意不符：
+	// 全部按 out_of_scope 处理，不比较字段、不计入流水侧汇总。
+	entries, err := ParseReconcileRequest([]byte(`{"entries":[
+	  {"kind":"payment","id":"p1","account":"aa-1","asset":"usdc","amount":1000,"fee":3,"charged":1003},
+	  {"kind":"payment","id":"p2","account":"WRONG","asset":"eth","amount":999,"fee":9,"charged":999},
+	  {"kind":"payment","id":"p2","account":"WRONG","asset":"eth","amount":999,"fee":9,"charged":999},
+	  {"kind":"refund","id":"r2","account":"aa-1","asset":"usdc","amount":50,"fee":0,"charged":50,"settlement_id":"p3"}
+	]}`))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	rep, err := l.ReconcileFlowScoped(entries, ReconScope{
+		Payment: ReconRange{Through: scopePtr(1)},
+		Refund:  ReconRange{Through: scopePtr(1)},
+	})
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	want := []string{ReconMatched, ReconOutOfScope, ReconOutOfScope, ReconOutOfScope}
+	for i, r := range rep.Results {
+		if r.Status != want[i] {
+			t.Fatalf("result %d=%s want %s", i, r.Status, want[i])
+		}
+	}
+	// out_of_scope 携带账本记录但不比较字段、不标重复位置。
+	for _, i := range []int{1, 2} {
+		r := rep.Results[i]
+		if r.Record == nil || r.Record.ID != "p2" || r.Record.Seq != 2 {
+			t.Fatalf("result %d record=%+v", i, r.Record)
+		}
+		if len(r.Diffs) != 0 || len(r.Positions) != 0 {
+			t.Fatalf("result %d must not compare fields: %+v", i, r)
+		}
+	}
+	if rep.Results[3].Record == nil || rep.Results[3].Record.SettlementID != "p3" {
+		t.Fatalf("out-of-scope refund must link settlement: %+v", rep.Results[3].Record)
+	}
+	// 流水侧只计入 p1 的 1003；范围外命中与重复都不计入。
+	if len(rep.Totals.Flow) != 1 || rep.Totals.Flow[0].ChargedTotal != "1003" ||
+		rep.Totals.Flow[0].RefundedTotal != "0" || rep.Totals.Flow[0].NetCharged != "1003" {
+		t.Fatalf("flow totals=%+v", rep.Totals.Flow)
+	}
+	// 缺失只列入选记录：付款 p1 已覆盖，退款 r1 未覆盖。
+	if len(rep.MissingPayments) != 0 {
+		t.Fatalf("missing payments=%+v", rep.MissingPayments)
+	}
+	if len(rep.MissingRefunds) != 1 || rep.MissingRefunds[0].ID != "r1" {
+		t.Fatalf("missing refunds=%+v", rep.MissingRefunds)
+	}
+}
+
+func TestReconcileScopeEmptyRange(t *testing.T) {
+	l := reconScopedLedger(t)
+	// 付款范围为空（after == through），退款全量：只选退款时账本侧扣款
+	// 合计为零，退款按所选记录合计，不顺带计入原付款。
+	rep, err := l.ReconcileFlowScoped(nil, ReconScope{
+		Payment: ReconRange{After: 2, Through: scopePtr(2)},
+	})
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if len(rep.MissingPayments) != 0 {
+		t.Fatalf("empty payment range must list no missing: %+v", rep.MissingPayments)
+	}
+	if len(rep.MissingRefunds) != 2 || rep.MissingRefunds[0].ID != "r1" || rep.MissingRefunds[1].ID != "r2" {
+		t.Fatalf("missing refunds=%+v", rep.MissingRefunds)
+	}
+	for _, row := range rep.Totals.Ledger {
+		if row.ChargedTotal != "0" {
+			t.Fatalf("ledger charged must be zero when payments unselected: %+v", row)
+		}
+		if row.Asset == "usdc" && row.RefundedTotal != "1053" {
+			t.Fatalf("usdc refunded=%s want 1053", row.RefundedTotal)
+		}
+		if row.Asset == "eth" {
+			t.Fatalf("eth must not appear (no in-scope records): %+v", row)
+		}
+	}
+	if rep.PaymentAfter != 2 || rep.PaymentThrough != 2 || rep.RefundAfter != 0 || rep.RefundThrough != 2 {
+		t.Fatalf("bounds=%d/%d %d/%d", rep.PaymentAfter, rep.PaymentThrough, rep.RefundAfter, rep.RefundThrough)
+	}
+}
+
+func TestReconcileScopeKeepsCrossRangeLinks(t *testing.T) {
+	l := reconScopedLedger(t)
+	// 退款范围为空：入选付款 p1 仍携带范围外退款 r1 的关联。
+	entries, _ := ParseReconcileRequest([]byte(`{"entries":[
+	  {"kind":"payment","id":"p1","account":"aa-1","asset":"usdc","amount":1000,"fee":3,"charged":1003}
+	]}`))
+	rep, err := l.ReconcileFlowScoped(entries, ReconScope{
+		Payment: ReconRange{Through: scopePtr(1)},
+		Refund:  ReconRange{After: 2, Through: scopePtr(2)},
+	})
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if rep.Results[0].Status != ReconMatched {
+		t.Fatalf("p1 status=%s", rep.Results[0].Status)
+	}
+	if rep.Results[0].Record == nil || rep.Results[0].Record.RefundID != "r1" || rep.Results[0].Record.RefundSeq != 1 {
+		t.Fatalf("in-scope payment must keep out-of-scope refund link: %+v", rep.Results[0].Record)
+	}
+
+	// 付款范围为空：入选退款 r1 命中并核对，即使它指向范围外付款 p1。
+	entries, _ = ParseReconcileRequest([]byte(`{"entries":[
+	  {"kind":"refund","id":"r1","account":"aa-1","asset":"usdc","amount":1000,"fee":3,"charged":1003,"settlement_id":"p1"}
+	]}`))
+	rep, err = l.ReconcileFlowScoped(entries, ReconScope{
+		Payment: ReconRange{After: 0, Through: scopePtr(0)},
+		Refund:  ReconRange{Through: scopePtr(1)},
+	})
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if rep.Results[0].Status != ReconMatched || rep.Results[0].Record.SettlementID != "p1" {
+		t.Fatalf("in-scope refund must match across ranges: %+v", rep.Results[0])
+	}
+	if len(rep.MissingPayments) != 0 || len(rep.MissingRefunds) != 0 {
+		t.Fatalf("missing=%+v/%+v", rep.MissingPayments, rep.MissingRefunds)
+	}
+}
+
+func TestReconcileScopeInvalidBounds(t *testing.T) {
+	l := reconScopedLedger(t) // max payment=3, max refund=2
+	cases := []ReconScope{
+		{Payment: ReconRange{After: -1}},                      // 下界为负
+		{Payment: ReconRange{Through: scopePtr(-1)}},          // 上界为负
+		{Payment: ReconRange{After: 2, Through: scopePtr(1)}}, // 下界大于上界
+		{Payment: ReconRange{Through: scopePtr(4)}},           // 上界超过付款最大序号
+		{Refund: ReconRange{Through: scopePtr(3)}},            // 上界超过退款最大序号
+		{Refund: ReconRange{After: -2}},                       // 退款下界为负
+		{Payment: ReconRange{After: 3, Through: scopePtr(3)}}, // 合法：空范围（对照见下）
+	}
+	for i, sc := range cases[:6] {
+		if _, err := l.ReconcileFlowScoped(nil, sc); err == nil || KindOf(err) != ErrInvalid {
+			t.Fatalf("case %d must be invalid_parameter, got %v", i, err)
+		}
+	}
+	// 边界值合法：after == through == max（空范围）。
+	if _, err := l.ReconcileFlowScoped(nil, cases[6]); err != nil {
+		t.Fatalf("empty range at max must be valid: %v", err)
+	}
+	// 空历史账本：最大序号为零，只有 0 是合法上界。
+	empty := openOrFail(t, newTestLedger(t, []BalanceInit{{Account: "aa", Asset: "usdc", Balance: 1}}))
+	if _, err := empty.ReconcileFlowScoped(nil, ReconScope{Payment: ReconRange{Through: scopePtr(1)}}); err == nil || KindOf(err) != ErrInvalid {
+		t.Fatalf("empty history through=1 must be invalid, got %v", err)
+	}
+	rep, err := empty.ReconcileFlowScoped(nil, ReconScope{})
+	if err != nil {
+		t.Fatalf("empty history default scope: %v", err)
+	}
+	if rep.PaymentThrough != 0 || rep.RefundThrough != 0 {
+		t.Fatalf("empty history bounds=%d/%d", rep.PaymentThrough, rep.RefundThrough)
+	}
+}
+
+func TestReconcileScopeDefaultsMatchFullReconcile(t *testing.T) {
+	l := reconScopedLedger(t)
+	entries, _ := ParseReconcileRequest([]byte(`{"entries":[
+	  {"kind":"payment","id":"p1","account":"aa-1","asset":"usdc","amount":1000,"fee":3,"charged":1003}
+	]}`))
+	full, err := l.ReconcileFlow(entries)
+	if err != nil {
+		t.Fatalf("full: %v", err)
+	}
+	scoped, err := l.ReconcileFlowScoped(entries, ReconScope{})
+	if err != nil {
+		t.Fatalf("scoped: %v", err)
+	}
+	fj, _ := json.Marshal(full)
+	sj, _ := json.Marshal(scoped)
+	if string(fj) != string(sj) {
+		t.Fatalf("zero scope must equal full reconcile:\nfull  =%s\nscoped=%s", fj, sj)
+	}
+	if scoped.PaymentAfter != 0 || scoped.PaymentThrough != 3 || scoped.RefundAfter != 0 || scoped.RefundThrough != 2 {
+		t.Fatalf("default bounds=%d/%d %d/%d", scoped.PaymentAfter, scoped.PaymentThrough, scoped.RefundAfter, scoped.RefundThrough)
+	}
+}
