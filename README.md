@@ -9,8 +9,13 @@
 ```bash
 go run ./cmd/payflow demo
 go run ./cmd/payflow version
+go run ./cmd/payflow evaluate <配置文件> <开关键> <上下文文件>
 go test ./...
 ```
+
+`evaluate` 离线求值特性开关：读取 UTF-8 JSON 配置与上下文，成功时标准输出为
+`{"key":...,"value":...,"reason":"disabled|rule|default","ruleId":...}`，失败时非零退出且
+标准输出为空、标准错误给出具体原因。完整文件格式见 `payflow help`。
 
 ## 技术方向
 
