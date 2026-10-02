@@ -60,7 +60,8 @@ JSON
 - `state` 缺省视为 `"pending"`；非 pending 返回 `state_error`。
 - 不存在的账户/资产组合按余额 0 处理，返回 `insufficient_balance`。
 - 每项状态可分别识别：`settled` / `duplicate` / `conflict` /
-  `state_error` / `insufficient_balance` / `invalid_parameter` / `storage_error`。
+  `state_error` / `insufficient_balance` / `limit_exceeded` /
+  `invalid_parameter` / `storage_error`。
 
 **幂等与冲突**：编号成功落账后，再次提交时若全部付款字段
 （账户、付款方、资产、金额、nonce）与费率都与原请求相同，返回原结算记录并标记
@@ -71,6 +72,40 @@ JSON
 存储失败时该项返回 `storage_error` 并回滚到执行前状态（余额不变、不留成功记录），
 已完成的前项不回滚；同一进程多次打开同一路径并发提交按同一本账本串行处理，
 相同编号最终只有一笔成功记录，争用仅够一笔的余额时只有一笔成功。
+
+**本次批次扣款上限（limits）**：可在原有 JSON 中额外提供 `limits` 数组，每项为
+某个 `(account, asset)` 组合设置本次提交的累计扣款上限：
+
+```json
+{
+  "fee_bps": 30,
+  "limits": [
+    {"account": "aa-1", "asset": "usdc", "max_charged": 1000}
+  ],
+  "intents": [
+    {"id": "p1", "account": "aa-1", "asset": "usdc", "amount": 600},
+    {"id": "p2", "account": "aa-1", "asset": "usdc", "amount": 400}
+  ]
+}
+```
+
+- 上限计入付款金额与手续费（即 `charged`），各组合分别计算、互不借用；
+  未列出的组合沿用现有行为（不限制扣款）。累计扣款**恰好等于**上限时允许成功。
+- 某项会使累计扣款超出上限时返回 `limit_exceeded`，原因中说明该组合的上限、
+  已用额度与本项需扣金额；该项不扣余额、不留成功记录、不占用付款编号，
+  后项继续处理。前项因超限失败后，同一编号改为较小金额仍可在本批次内成功。
+- 上限仅对本次提交有效：下次提交从零计算，历史扣款与退款不占本次额度。
+  `limits` 缺省、为 `null` 或空数组时不限制扣款。
+- 对于尚未成功且参数、状态合法的意图，先判断是否超限，再检查余额；
+  同时超限和余额不足时报告 `limit_exceeded`。余额不足、参数或状态错误、
+  编号冲突都不消耗额度。重复提交已成功付款仍返回 `duplicate` 及原记录，
+  即使本批次额度已经用完也不改成超限（同批次重复、历史重复、原付款已退款后
+  重试都如此）。限额变化不属于付款字段变化，不影响原有幂等判断。
+- 每个限额项的 `account` 与 `asset` 必须非空，同一组合不得重复；
+  `max_charged` 必须明确提供非负 int64 整数（零表示禁止该组合新增扣款）。
+  任一限额项不合法或组合重复时，整个批次返回 `invalid_parameter`、退出码 1，
+  任何意图都不执行；空意图列表也要检查限额。合法批次仍逐项输出结果，
+  逐项失败退出码为 0。金额接近 int64 上界时不会因累计溢出而放行。
 
 ### refund — 提交已结算付款的全额退款
 

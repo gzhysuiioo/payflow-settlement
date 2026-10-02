@@ -791,3 +791,168 @@ func TestCLIReconcileRangeOnlyRefunds(t *testing.T) {
 		t.Fatalf("ledger row=%+v", row)
 	}
 }
+
+// ===========================================================================
+// submit 限额（limits）测试
+// ===========================================================================
+
+func TestCLISubmitWithLimits(t *testing.T) {
+	ledgerPath := t.TempDir() + "/ledger.json"
+	if r := runCLIWith(t, []string{"init", "-l", ledgerPath},
+		`{"balances":[{"account":"aa-1","asset":"usdc","balance":10000}]}`); r.code != 0 {
+		t.Fatalf("init: %s", r.err)
+	}
+
+	// 限额 1000：600 成功、400 恰好凑满成功、1 超限；逐项返回，退出码 0。
+	body := `{"fee_bps":0,"limits":[
+	  {"account":"aa-1","asset":"usdc","max_charged":1000}
+	],"intents":[
+	  {"id":"p1","account":"aa-1","asset":"usdc","amount":600},
+	  {"id":"p2","account":"aa-1","asset":"usdc","amount":400},
+	  {"id":"p3","account":"aa-1","asset":"usdc","amount":1}
+	]}`
+	r := runCLIWith(t, []string{"submit", "-l", ledgerPath}, body)
+	if r.code != 0 {
+		t.Fatalf("submit with limits exits 0 even with per-item failures: %s", r.err)
+	}
+	var res struct {
+		Results []struct {
+			ID     string `json:"id"`
+			Status string `json:"status"`
+			Reason string `json:"reason"`
+		} `json:"results"`
+	}
+	if err := json.Unmarshal([]byte(r.out), &res); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"settled", "settled", "limit_exceeded"}
+	if len(res.Results) != len(want) {
+		t.Fatalf("got %d results, want %d: %s", len(res.Results), len(want), r.out)
+	}
+	for i, x := range res.Results {
+		if x.Status != want[i] {
+			t.Fatalf("item %d status=%s want %s", i, x.Status, want[i])
+		}
+	}
+	// 超限原因说明上限、已用额度与本项需扣金额。
+	if !strings.Contains(res.Results[2].Reason, "max_charged 1000") ||
+		!strings.Contains(res.Results[2].Reason, "already charged in batch 1000") ||
+		!strings.Contains(res.Results[2].Reason, "this intent needs 1") {
+		t.Fatalf("limit reason missing details: %q", res.Results[2].Reason)
+	}
+
+	// 超限项不扣款：余额 9000，仅两条成功记录。
+	r = runCLIWith(t, []string{"query", "-l", ledgerPath}, "")
+	var snap struct {
+		Balances []struct {
+			Balance int64 `json:"balance"`
+		} `json:"balances"`
+		Settlements []struct {
+			ID string `json:"id"`
+		} `json:"settlements"`
+	}
+	if err := json.Unmarshal([]byte(r.out), &snap); err != nil {
+		t.Fatal(err)
+	}
+	if len(snap.Balances) != 1 || snap.Balances[0].Balance != 9000 {
+		t.Fatalf("balance=%+v", snap.Balances)
+	}
+	if len(snap.Settlements) != 2 || snap.Settlements[0].ID != "p1" || snap.Settlements[1].ID != "p2" {
+		t.Fatalf("settlements=%+v", snap.Settlements)
+	}
+}
+
+func TestCLISubmitInvalidLimits(t *testing.T) {
+	ledgerPath := t.TempDir() + "/ledger.json"
+	if r := runCLIWith(t, []string{"init", "-l", ledgerPath},
+		`{"balances":[{"account":"aa-1","asset":"usdc","balance":10000}]}`); r.code != 0 {
+		t.Fatalf("init: %s", r.err)
+	}
+
+	bad := []string{
+		// 缺 max_charged
+		`{"fee_bps":0,"limits":[{"account":"aa-1","asset":"usdc"}],"intents":[{"id":"p","account":"aa-1","asset":"usdc","amount":1}]}`,
+		// 负 max_charged
+		`{"fee_bps":0,"limits":[{"account":"aa-1","asset":"usdc","max_charged":-1}],"intents":[{"id":"p","account":"aa-1","asset":"usdc","amount":1}]}`,
+		// 空账户
+		`{"fee_bps":0,"limits":[{"account":"","asset":"usdc","max_charged":100}],"intents":[{"id":"p","account":"aa-1","asset":"usdc","amount":1}]}`,
+		// 重复组合
+		`{"fee_bps":0,"limits":[{"account":"aa-1","asset":"usdc","max_charged":100},{"account":"aa-1","asset":"usdc","max_charged":200}],"intents":[]}`,
+		// 空意图列表也要检查限额
+		`{"fee_bps":0,"limits":[{"account":"aa-1","asset":"usdc","max_charged":-5}],"intents":[]}`,
+	}
+	for i, body := range bad {
+		r := runCLIWith(t, []string{"submit", "-l", ledgerPath}, body)
+		if r.code != 1 {
+			t.Fatalf("case %d: code=%d want 1", i, r.code)
+		}
+		if env := decodeOut(t, r.err); env["error"].(map[string]any)["kind"] != "invalid_parameter" {
+			t.Fatalf("case %d envelope=%s", i, r.err)
+		}
+	}
+
+	// 非法限额不执行任何意图：余额不变、无成功记录。
+	r := runCLIWith(t, []string{"query", "-l", ledgerPath}, "")
+	var snap struct {
+		Balances []struct {
+			Balance int64 `json:"balance"`
+		} `json:"balances"`
+	}
+	if err := json.Unmarshal([]byte(r.out), &snap); err != nil {
+		t.Fatal(err)
+	}
+	if len(snap.Balances) != 1 || snap.Balances[0].Balance != 10000 {
+		t.Fatalf("balance=%+v (invalid limits must not execute intents)", snap.Balances)
+	}
+}
+
+func TestCLISubmitEmptyIntentsWithLimits(t *testing.T) {
+	ledgerPath := t.TempDir() + "/ledger.json"
+	if r := runCLIWith(t, []string{"init", "-l", ledgerPath},
+		`{"balances":[{"account":"aa-1","asset":"usdc","balance":10000}]}`); r.code != 0 {
+		t.Fatalf("init: %s", r.err)
+	}
+
+	// 空意图 + 合法限额：正常返回空结果，退出码 0。
+	body := `{"fee_bps":0,"limits":[{"account":"aa-1","asset":"usdc","max_charged":100}],"intents":[]}`
+	r := runCLIWith(t, []string{"submit", "-l", ledgerPath}, body)
+	if r.code != 0 || strings.TrimSpace(r.out) != "{\n  \"results\": []\n}" {
+		t.Fatalf("empty intents with limits: code=%d out=%q err=%s", r.code, r.out, r.err)
+	}
+}
+
+func TestCLISubmitLimitsResetPerBatch(t *testing.T) {
+	ledgerPath := t.TempDir() + "/ledger.json"
+	if r := runCLIWith(t, []string{"init", "-l", ledgerPath},
+		`{"balances":[{"account":"aa-1","asset":"usdc","balance":2000}]}`); r.code != 0 {
+		t.Fatalf("init: %s", r.err)
+	}
+
+	// 首批用尽 500。
+	body := `{"fee_bps":0,"limits":[{"account":"aa-1","asset":"usdc","max_charged":500}],"intents":[
+	  {"id":"p1","account":"aa-1","asset":"usdc","amount":500}
+	]}`
+	if r := runCLIWith(t, []string{"submit", "-l", ledgerPath}, body); r.code != 0 {
+		t.Fatalf("first submit: %s", r.err)
+	}
+
+	// 次批从零计算，仍可扣 500。
+	body2 := `{"fee_bps":0,"limits":[{"account":"aa-1","asset":"usdc","max_charged":500}],"intents":[
+	  {"id":"p2","account":"aa-1","asset":"usdc","amount":500}
+	]}`
+	r := runCLIWith(t, []string{"submit", "-l", ledgerPath}, body2)
+	if r.code != 0 {
+		t.Fatalf("second submit: %s", r.err)
+	}
+	var res struct {
+		Results []struct {
+			Status string `json:"status"`
+		} `json:"results"`
+	}
+	if err := json.Unmarshal([]byte(r.out), &res); err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Results) != 1 || res.Results[0].Status != "settled" {
+		t.Fatalf("limit should reset per batch: %+v", res.Results)
+	}
+}

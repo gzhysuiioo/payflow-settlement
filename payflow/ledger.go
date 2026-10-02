@@ -40,6 +40,7 @@ const (
 	StatusConflict        = "conflict"             // 编号冲突：编号已成功但字段或费率/目标或原因不同
 	StatusState           = "state_error"          // 非 pending
 	StatusFunds           = "insufficient_balance" // 余额不足（含不存在的账户/资产组合）
+	StatusLimit           = "limit_exceeded"       // 本次批次扣款超过该 (账户, 资产) 组合的上限
 	StatusInvalid         = "invalid_parameter"
 	StatusStorage         = "storage_error"
 	StatusRefundSuccess   = "refunded"         // 成功全额退回
@@ -56,6 +57,7 @@ const (
 	reasonOverflow        = "amount plus fee overflows int64"
 	reasonNotPending      = "intent is not pending"
 	reasonFunds           = "insufficient balance for amount plus fee"
+	reasonLimitExceeded   = "charge limit exceeded for account %q asset %q: max_charged %d, already charged in batch %d, this intent needs %d"
 	reasonDuplicate       = "duplicate settlement attempt"
 	reasonConflict        = "settlement id conflicts with a different request"
 	reasonEmptyRefundID   = "refund id must not be empty"
@@ -85,10 +87,21 @@ type PaymentIntent struct {
 	State     string `json:"state"`
 }
 
-// FeeBatch 是一次提交：固定费率（基点）+ 有序意图列表。
+// ChargeLimit 是批次内对某个 (账户, 资产) 组合的本次扣款上限。
+// max_charged 必须明确提供（用指针区分缺省/null）且为非负 int64；
+// 零表示禁止该组合新增扣款。上限计入付款金额与手续费，各组合分别计算、
+// 互不借用，且仅对本次提交有效（下次提交从零计算，历史扣款与退款不占额度）。
+type ChargeLimit struct {
+	Account    string `json:"account"`
+	Asset      string `json:"asset"`
+	MaxCharged *int64 `json:"max_charged"`
+}
+
+// FeeBatch 是一次提交：固定费率（基点）+ 有序意图列表 + 可选的本次扣款上限。
 type FeeBatch struct {
 	FeeBps  int             `json:"fee_bps"`
 	Intents []PaymentIntent `json:"intents"`
+	Limits  []ChargeLimit   `json:"limits"`
 }
 
 // Record 是一笔成功结算留下的永久记录，按成功先后顺序保存。
@@ -417,6 +430,34 @@ func validateInitial(init []BalanceInit) error {
 	return nil
 }
 
+// validateChargeLimits 校验批次限额并建立 (账户, 资产) -> 上限 的索引。
+// 账户与资产必须非空、同一组合不得重复、max_charged 必须明确提供且为非负
+// int64（零表示禁止该组合新增扣款）。任一不合法即整次拒绝，不执行任何意图；
+// 空意图列表也会执行本校验。
+func validateChargeLimits(ls []ChargeLimit) (map[balanceKey]int64, error) {
+	out := make(map[balanceKey]int64, len(ls))
+	for i, l := range ls {
+		if l.Account == "" {
+			return nil, ledgerError(ErrInvalid, "charge limit %d: account must not be empty", i)
+		}
+		if l.Asset == "" {
+			return nil, ledgerError(ErrInvalid, "charge limit %d: asset must not be empty", i)
+		}
+		if l.MaxCharged == nil {
+			return nil, ledgerError(ErrInvalid, "charge limit %d (%s/%s): max_charged is required and must be a non-negative int64", i, l.Account, l.Asset)
+		}
+		if *l.MaxCharged < 0 {
+			return nil, ledgerError(ErrInvalid, "charge limit %d (%s/%s): max_charged must be a non-negative int64, got %d", i, l.Account, l.Asset, *l.MaxCharged)
+		}
+		k := balanceKey{l.Account, l.Asset}
+		if _, dup := out[k]; dup {
+			return nil, ledgerError(ErrInvalid, "charge limit %d: duplicate entry for %s/%s", i, l.Account, l.Asset)
+		}
+		out[k] = *l.MaxCharged
+	}
+	return out, nil
+}
+
 // Ledger 是一个可持久化的本地账本。同一进程内同一路径的多次 Open
 // 返回共享同一状态与互斥锁的实例，因此并发提交按同一本账本串行化。
 type Ledger struct {
@@ -563,6 +604,14 @@ func (l *Ledger) Submit(batch FeeBatch) (*BatchResult, error) {
 	if batch.FeeBps < 0 || batch.FeeBps > 10000 {
 		return nil, ledgerError(ErrInvalid, "fee_bps must be within [0,10000], got %d", batch.FeeBps)
 	}
+	// 限额在任何意图执行前整次校验：任一不合法即拒绝整个批次，空意图列表也不例外。
+	limits, err := validateChargeLimits(batch.Limits)
+	if err != nil {
+		return nil, err
+	}
+	// used 记录本批次内各 (账户, 资产) 组合已成功落账的累计扣款（含手续费）。
+	// 仅对本次提交有效：Submit 每次新建，下次提交从零计算；历史扣款与退款不占额度。
+	used := make(map[balanceKey]int64)
 	out := &BatchResult{Results: make([]ItemResult, 0, len(batch.Intents))}
 
 	l.reg.mu.Lock()
@@ -616,8 +665,20 @@ func (l *Ledger) Submit(batch FeeBatch) (*BatchResult, error) {
 		}
 		total := amount + fee
 
-		// 5. 余额校验。不存在的账户/资产组合余额视为 0（不足）。
+		// 5. 本次批次扣款上限校验（先于余额）：仅统计本批次已成功落账的扣款，
+		//    累计恰好等于上限时允许成功；不同组合互不借用。用 max-used 比较，
+		//    即使金额接近 int64 上界也不会因累计溢出而放行。
 		key := balanceKey{it.Account, it.Asset}
+		if max, limited := limits[key]; limited {
+			if total > max-used[key] {
+				res.Status = StatusLimit
+				res.Reason = fmt.Sprintf(reasonLimitExceeded, it.Account, it.Asset, max, used[key], total)
+				out.Results = append(out.Results, res)
+				continue
+			}
+		}
+
+		// 6. 余额校验。不存在的账户/资产组合余额视为 0（不足）。
 		bal := l.reg.state.Balances[key]
 		if total > bal {
 			res.Status = StatusFunds
@@ -626,7 +687,7 @@ func (l *Ledger) Submit(batch FeeBatch) (*BatchResult, error) {
 			continue
 		}
 
-		// 6. 先在内存生效，再原子持久化；保存失败回滚该项，不留成功记录。
+		// 7. 先在内存生效，再原子持久化；保存失败回滚该项，不留成功记录与已用额度。
 		rec := Record{
 			ID:        it.ID,
 			Account:   it.Account,
@@ -639,12 +700,17 @@ func (l *Ledger) Submit(batch FeeBatch) (*BatchResult, error) {
 			Charged:   total,
 			Seq:       int64(len(l.reg.state.Settlements)) + 1,
 		}
+		oldUsed := used[key]
 		rollback := l.stage(key, bal-total, rec)
 		if err := l.persistLocked(); err != nil {
 			rollback()
+			used[key] = oldUsed
 			res.Status = StatusStorage
 			res.Reason = err.Error()
 		} else {
+			if _, limited := limits[key]; limited {
+				used[key] = oldUsed + total
+			}
 			cp := rec
 			res.Status = StatusSettled
 			res.Record = &cp
