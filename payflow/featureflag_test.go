@@ -325,6 +325,47 @@ func TestContextValidation(t *testing.T) {
 	}
 }
 
+func TestContextNonStringErrorFollowsSourceOrder(t *testing.T) {
+	// 多个非字符串属性值时，错误必须稳定指向原文中最先出现的一个，
+	// 不受 map 遍历顺序或前面合法属性的影响。
+	assertFirst := func(raw, want string) {
+		t.Helper()
+		for i := 0; i < 20; i++ {
+			_, err := ParseContext([]byte(raw))
+			if err == nil || !strings.Contains(err.Error(), want) ||
+				!strings.Contains(err.Error(), "value must be a string") {
+				t.Fatalf("ParseContext(%s) run %d: err=%v want %q", raw, i, err, want)
+			}
+		}
+	}
+	assertFirst(`{"zeta":false,"plan":"pro","alpha":7}`, "context.zeta")
+	assertFirst(`{"alpha":7,"zeta":false,"plan":"pro"}`, "context.alpha")
+	// 合法字符串属性不改变选择。
+	assertFirst(`{"a":"1","b":"2","mid":null,"zeta":false}`, "context.mid")
+	// 对象与数组整体计为一个非字符串值，错误指向顶层属性而非内部成员。
+	assertFirst(`{"ok":"1","nested":{"inner":1},"zeta":false}`, "context.nested")
+	assertFirst(`{"list":[1,2],"zeta":false}`, "context.list")
+	// 数字、布尔、null 各类型。
+	for _, tc := range []struct{ raw, want string }{
+		{`{"a":1}`, "context.a"},
+		{`{"a":true}`, "context.a"},
+		{`{"a":null}`, "context.a"},
+	} {
+		assertFirst(tc.raw, tc.want)
+	}
+	// 解码后的 Unicode 转义字段名与直接字符同样定位；大小写空白原样保留。
+	assertFirst(`{"zeta":1}`, "context.zeta")
+	assertFirst(`{"\u007aeta":1}`, "context.zeta")
+	assertFirst(`{" Plan ":1}`, "context. Plan ")
+	// 修正第一处后，下一次求值报告剩余属性中最先出现的类型错误。
+	if _, err := ParseContext([]byte(`{"zeta":"ok","plan":"pro","alpha":7}`)); err == nil ||
+		!strings.Contains(err.Error(), "context.alpha") {
+		t.Fatalf("next error after fixing first: err=%v", err)
+	}
+	// 全部合法后才成功；空字符串与形似数字/布尔的字符串是合法值。
+	mustParseContext(t, `{"zeta":"ok","plan":"pro","alpha":"7","empty":"","boolish":"false"}`)
+}
+
 func TestInvalidUTF8(t *testing.T) {
 	bad := []byte("{\"flags\":[]}\xff")
 	if _, err := ParseConfig(bad); err == nil {

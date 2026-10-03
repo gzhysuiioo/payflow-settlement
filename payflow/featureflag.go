@@ -141,6 +141,10 @@ func ParseConfig(raw []byte) (*Config, error) {
 }
 
 // ParseContext parses an attribute-name -> string context object; it may be empty.
+// 文件通过 UTF-8、Unicode 转义、重复字段与 JSON 语法检查且顶层为对象后，再按
+// 属性在原文中的先后次序校验值类型：报告第一个值不是字符串的顶层属性，
+// 嵌套对象或数组整体计为一个非字符串值，错误指向所属顶层属性而非内部成员。
+// 字段名按解码后的文字定位，合法 Unicode 转义与直接字符同义，大小写与空白原样保留。
 func ParseContext(raw []byte) (*Context, error) {
 	if !utf8.Valid(raw) {
 		return nil, fmt.Errorf("context: file is not valid UTF-8")
@@ -159,15 +163,51 @@ func ParseContext(raw []byte) (*Context, error) {
 	if !ok {
 		return nil, fmt.Errorf("context: top level must be a JSON object")
 	}
+	if err := rejectNonStringContextValues(raw); err != nil {
+		return nil, err
+	}
 	ctx := &Context{values: make(map[string]string, len(root))}
 	for k, v := range root {
-		s, ok := v.(string)
-		if !ok {
-			return nil, fmt.Errorf("context.%s: value must be a string", k)
-		}
-		ctx.values[k] = s
+		// rejectNonStringContextValues 已保证顶层值全部为字符串。
+		ctx.values[k] = v.(string)
 	}
 	return ctx, nil
+}
+
+// rejectNonStringContextValues 按原文顺序遍历一份已通过全部格式校验、顶层为
+// 对象的上下文文档，返回第一个值不是字符串的顶层属性的类型错误。不深入嵌套
+// 容器：对象或数组整体算作一个非字符串值，错误指向所属顶层属性；数字、布尔
+// 与 null 同理。空字符串以及形如 "7"、"true" 的字符串是合法值。
+func rejectNonStringContextValues(raw []byte) error {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	// 根容器已由前置 Unmarshal 与顶层对象检查确认为 '{'。
+	if _, err := dec.Token(); err != nil {
+		return nil
+	}
+	tracker := newJSONPathTracker("context")
+	tracker.beginContainer(true)
+	for {
+		tok, err := dec.Token()
+		if err != nil {
+			// 文档合法，正常只会以 io.EOF 结束。
+			return nil
+		}
+		if d, isDelim := tok.(json.Delim); isDelim {
+			if d == '}' {
+				return nil
+			}
+			// '{' 或 '[' 作为顶层属性值：整个容器是非字符串值。
+			return fmt.Errorf("context.%s: value must be a string", tracker.top().lastKey)
+		}
+		if tracker.atKey() {
+			tracker.setKey(tok.(string))
+			continue
+		}
+		if _, ok := tok.(string); !ok {
+			return fmt.Errorf("context.%s: value must be a string", tracker.top().lastKey)
+		}
+		tracker.endValue()
+	}
 }
 
 // Get looks up an attribute; an empty string is a legal value.
