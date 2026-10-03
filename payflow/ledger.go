@@ -54,6 +54,7 @@ const (
 	reasonEmptyAccount    = "account must not be empty"
 	reasonEmptyAsset      = "asset must not be empty"
 	reasonBadAmount       = "amount must be a positive int64"
+	reasonBadFeeBps       = "fee_bps must be within [0,10000]"
 	reasonOverflow        = "amount plus fee overflows int64"
 	reasonNotPending      = "intent is not pending"
 	reasonFunds           = "insufficient balance for amount plus fee"

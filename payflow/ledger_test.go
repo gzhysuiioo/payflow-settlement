@@ -739,6 +739,91 @@ func TestLegacyExecuteAndReconcile(t *testing.T) {
 	}
 }
 
+// 大额付款：乘积中途溢出 int64 时手续费与扣款总额仍必须准确；
+// 只有最终总额可由 int64 表示，就按准确总额判断余额。
+func TestLegacyExecuteLargeAmountNoMidOverflow(t *testing.T) {
+	const (
+		amount = int64(4000000000000000000) // 4e18
+		fee    = int64(12000000000000000)   // amount*30/10000 = 1.2e16
+		total  = amount + fee               // 4012000000000000000
+	)
+	// 朴素乘积 amount*30 = 1.2e20 超出 int64（回绕为负），正是旧实现出错的场景；
+	// Execute 必须只看最终总额是否可表示，而不是拒绝中途乘积过大的付款。
+	naive := amount
+	naive = naive * 30 / 10000
+	if naive >= 0 || naive == fee {
+		t.Fatalf("sanity: naive product should wrap negative, got %d", naive)
+	}
+	// 余额恰好等于总额：成功，携带准确扣款额、费率与结算引用并标记编号。
+	spent := map[string]bool{}
+	s := Execute(Intent{ID: "big", State: "pending", Amount: amount}, 30, spent, total)
+	if s.Status != "settled" || s.Charged != total || s.FeeBps != 30 ||
+		s.Ref != "settle:big" || s.Intent != "big" || !spent["big"] {
+		t.Fatalf("exact-balance settle: %+v spent=%v", s, spent)
+	}
+	// 少一单位：余额不足，零扣款、空引用、不占编号。
+	spent = map[string]bool{}
+	s = Execute(Intent{ID: "big", State: "pending", Amount: amount}, 30, spent, total-1)
+	if s.Status != "failed" || s.Reason != reasonFunds || s.Charged != 0 || s.Ref != "" || spent["big"] {
+		t.Fatalf("short by one: %+v spent=%v", s, spent)
+	}
+}
+
+// 参数与溢出拒绝：金额、费率、总额溢出三类原因明确区分；
+// 被拒绝的编号不占用，修正后仍可作为首次付款提交。
+func TestLegacyExecuteValidationAndOverflow(t *testing.T) {
+	// 金额为零或负数。
+	for _, amount := range []int64{0, -1, math.MinInt64} {
+		s := Execute(Intent{ID: "a", State: "pending", Amount: amount}, 0, map[string]bool{}, math.MaxInt64)
+		if s.Status != "rejected" || s.Reason != reasonBadAmount || s.Charged != 0 || s.Ref != "" {
+			t.Fatalf("amount=%d: %+v", amount, s)
+		}
+	}
+	// 费率超出 [0,10000]。
+	for _, bps := range []int{-1, 10001, math.MinInt} {
+		s := Execute(Intent{ID: "a", State: "pending", Amount: 1}, bps, map[string]bool{}, math.MaxInt64)
+		if s.Status != "rejected" || s.Reason != reasonBadFeeBps || s.Charged != 0 || s.Ref != "" {
+			t.Fatalf("bps=%d: %+v", bps, s)
+		}
+	}
+	// 费率边界合法：0 与 10000。
+	for _, bps := range []int{0, 10000} {
+		s := Execute(Intent{ID: "a", State: "pending", Amount: 1}, bps, map[string]bool{}, math.MaxInt64)
+		if s.Status != "settled" {
+			t.Fatalf("bps=%d must be valid: %+v", bps, s)
+		}
+	}
+	// MaxInt64 @ 1bp：总额溢出。即使余额为 int64 最大值也必须按溢出拒绝，
+	// 而不是负数扣款或普通余额不足。
+	spent := map[string]bool{}
+	s := Execute(Intent{ID: "a", State: "pending", Amount: math.MaxInt64}, 1, spent, math.MaxInt64)
+	if s.Status != "rejected" || s.Reason != reasonOverflow || s.Charged != 0 || s.Ref != "" {
+		t.Fatalf("total overflow: %+v", s)
+	}
+	if spent["a"] {
+		t.Fatal("overflow rejection must not mark the id spent")
+	}
+	// 被拒绝编号修正金额后仍可作为首次付款提交。
+	s = Execute(Intent{ID: "a", State: "pending", Amount: 100}, 0, spent, 100)
+	if s.Status != "settled" || s.Charged != 100 || !spent["a"] {
+		t.Fatalf("resubmit after rejection: %+v spent=%v", s, spent)
+	}
+}
+
+// 判断顺序：非 pending 与已结算编号的旧拒绝原因优先于本次金额/费率检查。
+func TestLegacyExecuteRejectPrecedence(t *testing.T) {
+	// 非 pending：即便金额为负、费率非法，仍返回原有状态拒绝原因。
+	s := Execute(Intent{ID: "a", State: "failed", Amount: -1}, 10001, map[string]bool{}, 0)
+	if s.Status != "rejected" || s.Reason != "intent is not pending" {
+		t.Fatalf("not-pending precedence: %+v", s)
+	}
+	// 状态合法但编号已结算：即便参数非法，仍返回原有重复拒绝原因。
+	s = Execute(Intent{ID: "a", State: "pending", Amount: 0}, -1, map[string]bool{"a": true}, 0)
+	if s.Status != "rejected" || s.Reason != "duplicate settlement attempt" {
+		t.Fatalf("duplicate precedence: %+v", s)
+	}
+}
+
 // ===========================================================================
 // 退款（refund）测试
 // ===========================================================================
