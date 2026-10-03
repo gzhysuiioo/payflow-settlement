@@ -317,11 +317,151 @@ func TestContextValidation(t *testing.T) {
 		{`{"a":1}`, "context.a"},
 		{`{"a":true}`, "context.a"},
 		{`{"a":null}`, "context.a"},
+		{`{"a":{}}`, "context.a"},
+		{`{"a":[]}`, "context.a"},
 		{`{bad`, "invalid JSON"},
 	} {
 		if _, err := ParseContext([]byte(tc.raw)); err == nil || !strings.Contains(err.Error(), tc.want) {
 			t.Errorf("ParseContext(%s): err=%v want substring %q", tc.raw, err, tc.want)
 		}
+	}
+}
+
+func TestContextValueTypeErrorIsFirstInSourceOrder(t *testing.T) {
+	// 多个非字符串属性：报告原文中最先出现的一个，且每次运行一致，
+	// 不随 Go map 遍历顺序漂移。
+	raw := `{"zeta":false,"plan":"pro","alpha":7}`
+	var first string
+	for i := 0; i < 20; i++ {
+		_, err := ParseContext([]byte(raw))
+		if err == nil {
+			t.Fatalf("iter %d: expected error", i)
+		}
+		if i == 0 {
+			first = err.Error()
+			if !strings.Contains(first, "context.zeta") ||
+				!strings.Contains(first, "value must be a string") {
+				t.Fatalf("first error = %q, want context.zeta string-type error", first)
+			}
+			continue
+		}
+		if err.Error() != first {
+			t.Fatalf("iter %d: %q != %q", i, err.Error(), first)
+		}
+	}
+
+	// 把 alpha 放到 zeta 前面：应改为报告 context.alpha，前面的合法属性不影响选择。
+	_, err := ParseContext([]byte(`{"alpha":7,"plan":"pro","zeta":false}`))
+	if err == nil || !strings.Contains(err.Error(), "context.alpha") {
+		t.Fatalf("reordered: err=%v want context.alpha", err)
+	}
+
+	// 用户修正第一处错误后再次求值，应看到剩余属性中最先出现的类型错误。
+	_, err = ParseContext([]byte(`{"zeta":"z","plan":"pro","alpha":7}`))
+	if err == nil || !strings.Contains(err.Error(), "context.alpha") {
+		t.Fatalf("after fixing zeta: err=%v want context.alpha", err)
+	}
+
+	// 全部属性值合法后才返回求值结果；看起来像数字的字符串仍是合法字符串值。
+	ctx, err := ParseContext([]byte(`{"zeta":"false","plan":"pro","alpha":"7"}`))
+	if err != nil {
+		t.Fatalf("all string values must parse: %v", err)
+	}
+	if v, ok := ctx.Get("alpha"); !ok || v != "7" {
+		t.Fatalf("numeric-looking string should stay a string: %q %v", v, ok)
+	}
+}
+
+func TestContextNonStringValueShapes(t *testing.T) {
+	// 数字、布尔、null、数组、对象都不能作为顶层属性值；对象/数组值的错误
+	// 指向所属的顶层属性，不指向内部成员。
+	for _, tc := range []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{"number", `{"a":"ok","b":1}`, "context.b"},
+		{"bool", `{"a":"ok","b":false}`, "context.b"},
+		{"null", `{"a":"ok","b":null}`, "context.b"},
+		{"array", `{"a":"ok","b":["x"]}`, "context.b"},
+		{"object", `{"a":"ok","b":{"inner":1}}`, "context.b"},
+		{"object inner is string too", `{"obj":{"inner":"x"},"later":1}`, "context.obj"},
+		{"array with strings only", `{"arr":["x","y"]}`, "context.arr"},
+		{"first of mixed kinds", `{"z":{"x":1},"a":[2],"m":true}`, "context.z"},
+		{"nested bad member still points to top key", `{"a":"x","obj":{"inner":1},"b":2}`, "context.obj"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := ParseContext([]byte(tc.raw))
+			if err == nil || !strings.Contains(err.Error(), tc.want) ||
+				!strings.Contains(err.Error(), "value must be a string") {
+				t.Errorf("ParseContext(%s): err=%v want location %q", tc.raw, err, tc.want)
+			}
+		})
+	}
+}
+
+func TestContextTypeErrorKeyDecoding(t *testing.T) {
+	// 属性名采用解码后的文字定位：合法 Unicode 转义与直接字符同义。
+	escA := `"\u` + `0061lpha"` // 解码后为 "alpha"
+	_, err := ParseContext([]byte(`{` + escA + `:7}`))
+	if err == nil || !strings.Contains(err.Error(), "context.alpha") {
+		t.Fatalf("escaped key: err=%v want context.alpha", err)
+	}
+	// 转义形式与直接字符匹配同一属性（Get 使用解码后的名字）。
+	escP := `"\u` + `0070lan"` // 解码后为 "plan"
+	ctx := mustParseContext(t, `{`+escP+`:"pro"}`)
+	if v, ok := ctx.Get("plan"); !ok || v != "pro" {
+		t.Fatalf("escaped key lookup: %q %v", v, ok)
+	}
+	// 大小写与空白按原样保留，不改变属性匹配与定位。
+	_, err = ParseContext([]byte(`{"Alpha ":7}`))
+	if err == nil || !strings.Contains(err.Error(), "context.Alpha ") {
+		t.Fatalf("case/space key: err=%v", err)
+	}
+	// 配对的代理项转义解码后定位到同一属性名。
+	emojiKey := `"\u` + `D83D\u` + `DE00"` // 解码后为 "😀"
+	_, err = ParseContext([]byte(`{"a":"x",` + emojiKey + `:2}`))
+	if err == nil || !strings.Contains(err.Error(), "context.😀") {
+		t.Fatalf("surrogate pair key: err=%v", err)
+	}
+}
+
+func TestContextValidationPrecedence(t *testing.T) {
+	// 非法 UTF-8 先于属性类型错误报告。
+	if _, err := ParseContext(append([]byte(`{"a":1}`), 0xff)); err == nil ||
+		!strings.Contains(err.Error(), "not valid UTF-8") {
+		t.Fatalf("utf8 precedence: %v", err)
+	}
+	// 不能组成完整字符的 Unicode 转义不能被较早出现的属性类型错误遮住。
+	// 属性类型错误在 zeta，转义错误在其后的 plan 值中：仍报转义错误。
+	if _, err := ParseContext([]byte(`{"zeta":false,"plan":"\uD800"}`)); err == nil ||
+		!strings.Contains(err.Error(), "does not form a complete character") ||
+		!strings.Contains(err.Error(), "context.plan") {
+		t.Fatalf("unicode escape precedence: %v", err)
+	}
+	// 重复字段先于属性类型错误。
+	if _, err := ParseContext([]byte(`{"b":1,"b":2}`)); err == nil ||
+		!strings.Contains(err.Error(), "duplicate field") {
+		t.Fatalf("duplicate field precedence: %v", err)
+	}
+	// JSON 语法错误先于属性类型错误。
+	if _, err := ParseContext([]byte(`{"a":1,`)); err == nil ||
+		!strings.Contains(err.Error(), "invalid JSON") {
+		t.Fatalf("syntax precedence: %v", err)
+	}
+}
+
+func TestUnusedContextAttributesValidatedEvenWhenFlagDisabled(t *testing.T) {
+	// 开关关闭且规则不引用任何属性：未被规则使用的属性仍必须全部校验。
+	cfg := `{"flags":[{"key":"f","enabled":false,"default":true,"rules":[]}]}`
+	flag := mustParseConfig(t, cfg).Find("f")
+	if _, err := ParseContext([]byte(`{"anything":42}`)); err == nil ||
+		!strings.Contains(err.Error(), "context.anything") {
+		t.Fatalf("unused attr must still be validated even for a disabled flag: %v", err)
+	}
+	ctx := mustParseContext(t, `{"anything":"42"}`)
+	if got := flag.Evaluate(ctx); got.Reason != EvalDisabled {
+		t.Fatalf("valid unused attrs with disabled flag: %+v", got)
 	}
 }
 

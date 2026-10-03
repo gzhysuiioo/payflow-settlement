@@ -159,15 +159,44 @@ func ParseContext(raw []byte) (*Context, error) {
 	if !ok {
 		return nil, fmt.Errorf("context: top level must be a JSON object")
 	}
+	// 值类型必须按原文顺序逐个判定：Go map 的遍历顺序不稳定，不能直接
+	// range root，否则同一文件在不同运行中可能报告不同属性。对象或数组
+	// 值整体算所属顶层属性的一个值，错误不指向其内部成员。
+	if err := checkContextValueTypes(raw); err != nil {
+		return nil, err
+	}
 	ctx := &Context{values: make(map[string]string, len(root))}
 	for k, v := range root {
-		s, ok := v.(string)
-		if !ok {
-			return nil, fmt.Errorf("context.%s: value must be a string", k)
-		}
-		ctx.values[k] = s
+		ctx.values[k] = v.(string)
 	}
 	return ctx, nil
+}
+
+// checkContextValueTypes 按文件原文顺序扫描已通过语法与重复字段检查的
+// context 对象，报告第一个值不是字符串的顶层属性。键名使用解码后的文字
+// （合法的 \uXXXX 转义与直接字符同义；大小写与空白按原样保留）。嵌套
+// 对象或数组整体跳过，其内部成员不单独检查。
+func checkContextValueTypes(raw []byte) error {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	// 第一个令牌必须是顶层对象的 '{'；非对象的情形在 ParseContext 中报告。
+	if tok, err := dec.Token(); err != nil || tok != json.Delim('{') {
+		return nil
+	}
+	for dec.More() {
+		keyTok, err := dec.Token()
+		if err != nil {
+			return nil // 语法错误留给 Unmarshal 的报错
+		}
+		key, _ := keyTok.(string)
+		var value any
+		if err := dec.Decode(&value); err != nil {
+			return nil
+		}
+		if _, ok := value.(string); !ok {
+			return fmt.Errorf("context.%s: value must be a string", key)
+		}
+	}
+	return nil
 }
 
 // Get looks up an attribute; an empty string is a legal value.
