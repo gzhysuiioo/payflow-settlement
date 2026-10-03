@@ -253,41 +253,142 @@ func MarshalResult(r EvalResult) ([]byte, error) {
 
 // --- strict parsing helpers -------------------------------------------------
 
+// jsonFrame 是 JSON 原文遍历中一个对象或数组的层级状态。重复字段检查与非法
+// Unicode 转义检查共用这一份层级与位置定义，调整错误定位时只需改这一处。
+type jsonFrame struct {
+	path   string // 容器自身的完整位置，如 config.flags[0].rules[1]
+	object bool
+	// keys 记录本对象已声明的字段名（按解码后的字符串），仅重复字段检查使用；
+	// Unicode 遍历不登记字段，保持 nil。
+	keys map[string]struct{}
+	// lastKey 是对象最近一个字段名，用于拼出字段值的位置。
+	lastKey string
+	// expectKey 标记对象内下一个字符串是否为字段名。
+	expectKey bool
+	// nextIndex 是数组下一个元素的下标。
+	nextIndex int
+}
+
+// jsonPathTracker 是两类 JSON 检查共用的对象层级、数组位置与字段路径状态机。
+// label 是根容器的位置前缀（"config" 或 "context"）。
+type jsonPathTracker struct {
+	label string
+	stack []*jsonFrame
+}
+
+func newJSONPathTracker(label string) *jsonPathTracker {
+	return &jsonPathTracker{label: label}
+}
+
+func (t *jsonPathTracker) top() *jsonFrame {
+	return t.stack[len(t.stack)-1]
+}
+
+// childPath 拼出栈顶容器内下一个子值的位置：对象的字段值用 .字段名，
+// 数组元素用 [下标]。
+func (t *jsonPathTracker) childPath() string {
+	top := t.top()
+	if top.object {
+		return top.path + "." + top.lastKey
+	}
+	return top.path + "[" + strconv.Itoa(top.nextIndex) + "]"
+}
+
+// beginContainer 在遇到 '{' 或 '[' 时压入新容器，返回新容器的完整位置。
+func (t *jsonPathTracker) beginContainer(object bool) string {
+	path := t.label
+	if len(t.stack) > 0 {
+		path = t.childPath()
+	}
+	t.stack = append(t.stack, &jsonFrame{path: path, object: object, expectKey: object})
+	return path
+}
+
+// endContainer 在遇到 '}' 或 ']' 时弹出容器，并把整个容器计为父容器中
+// 一个已完成的值。
+func (t *jsonPathTracker) endContainer() {
+	if len(t.stack) > 0 {
+		t.stack = t.stack[:len(t.stack)-1]
+	}
+	t.endValue()
+}
+
+// atKey 报告下一个字符串是否应按对象字段名处理。
+func (t *jsonPathTracker) atKey() bool {
+	return len(t.stack) > 0 && t.top().object && t.top().expectKey
+}
+
+// currentPath 返回当前容器自身的位置（字段名报错时指向所属对象）；
+// 栈为空时返回根标签。
+func (t *jsonPathTracker) currentPath() string {
+	if len(t.stack) == 0 {
+		return t.label
+	}
+	return t.top().path
+}
+
+// valuePath 拼出下一个字符串值（字段值或数组元素）的位置，但不改变状态。
+func (t *jsonPathTracker) valuePath() string {
+	if len(t.stack) == 0 {
+		return t.label
+	}
+	return t.childPath()
+}
+
+// endValue 在一个字段值或数组元素完成后调用：对象回到等待字段名的状态，
+// 数组推进元素下标。
+func (t *jsonPathTracker) endValue() {
+	if len(t.stack) == 0 {
+		return
+	}
+	top := t.top()
+	if top.object {
+		top.expectKey = true
+	} else {
+		top.nextIndex++
+	}
+}
+
+// noteKey 登记一个已解码的对象字段名：更新字段路径状态，并在同一对象内第二次
+// 声明同名字段时返回重复字段错误。
+func (t *jsonPathTracker) noteKey(name string) error {
+	top := t.top()
+	if top.keys == nil {
+		top.keys = make(map[string]struct{})
+	}
+	if _, dup := top.keys[name]; dup {
+		return fmt.Errorf("%s.%s: duplicate field %q", top.path, name, name)
+	}
+	top.keys[name] = struct{}{}
+	top.lastKey = name
+	top.expectKey = false
+	return nil
+}
+
+// setKey 在不做重复检查的遍历（Unicode 扫描）中记录一个成功解码的字段名，
+// 仅维护字段值路径所需的状态。
+func (t *jsonPathTracker) setKey(name string) {
+	top := t.top()
+	top.lastKey = name
+	top.expectKey = false
+}
+
+// noteInvalidKey 在字段名无法解码（属于 JSON 语法错误）时仅推进键值状态：
+// 不覆盖已记录的字段名；语法错误留给后续 Unmarshal 报告。
+func (t *jsonPathTracker) noteInvalidKey() {
+	t.top().expectKey = false
+}
+
 // rejectDuplicateFields 按文件原文顺序扫描 JSON 令牌流，拒绝任何在同一对象内
 // 重复声明的字段名。字段名按解码后的字符串比较（"enabled" 与 "énabled"
 // 同名），大小写不同仍是不同字段，名字中的空白不裁剪。检查覆盖所有对象，
 // 包括附加字段里嵌套的对象；数组元素不属于这一检查。label 是根对象的位置
-// 前缀（"config" 或 "context"）。JSON 语法错误不在此报告，留给 Unmarshal。
+// 前缀（"config" 或 "context"）。对象层级、数组下标与字段路径由
+// jsonPathTracker 统一维护。JSON 语法错误不在此报告（令牌流失效即停止），
+// 留给 Unmarshal。
 func rejectDuplicateFields(raw []byte, label string) error {
 	dec := json.NewDecoder(bytes.NewReader(raw))
-	type frame struct {
-		path      string
-		object    bool
-		keys      map[string]struct{}
-		lastKey   string
-		expectKey bool
-		nextIndex int
-	}
-	var stack []*frame
-	// valueDone 在栈顶容器完成一个值（对象的一个字段值或数组的一个元素）后调用。
-	valueDone := func() {
-		if len(stack) == 0 {
-			return
-		}
-		top := stack[len(stack)-1]
-		if top.object {
-			top.expectKey = true
-		} else {
-			top.nextIndex++
-		}
-	}
-	childPath := func() string {
-		top := stack[len(stack)-1]
-		if top.object {
-			return top.path + "." + top.lastKey
-		}
-		return top.path + "[" + strconv.Itoa(top.nextIndex) + "]"
-	}
+	tracker := newJSONPathTracker(label)
 	for {
 		tok, err := dec.Token()
 		if err != nil {
@@ -297,34 +398,23 @@ func rejectDuplicateFields(raw []byte, label string) error {
 		switch t := tok.(type) {
 		case json.Delim:
 			switch t {
-			case '{', '[':
-				path := label
-				if len(stack) > 0 {
-					path = childPath()
-				}
-				f := &frame{path: path, object: t == '{', expectKey: true}
-				if f.object {
-					f.keys = make(map[string]struct{})
-				}
-				stack = append(stack, f)
+			case '{':
+				tracker.beginContainer(true)
+			case '[':
+				tracker.beginContainer(false)
 			case '}', ']':
-				stack = stack[:len(stack)-1]
-				valueDone()
+				tracker.endContainer()
 			}
 		case string:
-			if len(stack) > 0 && stack[len(stack)-1].object && stack[len(stack)-1].expectKey {
-				top := stack[len(stack)-1]
-				if _, dup := top.keys[t]; dup {
-					return fmt.Errorf("%s.%s: duplicate field %q", top.path, t, t)
+			if tracker.atKey() {
+				if err := tracker.noteKey(t); err != nil {
+					return err
 				}
-				top.keys[t] = struct{}{}
-				top.lastKey = t
-				top.expectKey = false
 			} else {
-				valueDone()
+				tracker.endValue()
 			}
 		default:
-			valueDone()
+			tracker.endValue()
 		}
 	}
 	return nil
@@ -336,51 +426,20 @@ func rejectDuplicateFields(raw []byte, label string) error {
 // 输入与真正的 "�" 被当作相同字符串参与求值，或让字段名在替换后被误判为重复，
 // 因此必须在解码前按原文拒绝。检查覆盖字段名与所有字符串值（包括规则的比较值、
 // in 列表元素以及附加字段里的字符串），一个文件有多个问题时报告原文中最先出现
-// 的一处。label 是根对象的位置前缀（"config" 或 "context"）。JSON 语法错误
-// 不在此报告，留给 Unmarshal。
+// 的一处。label 是根对象的位置前缀（"config" 或 "context"）。对象层级、数组
+// 下标与字段路径由 jsonPathTracker 统一维护；JSON 语法错误不在此报告，留给
+// Unmarshal。
 func rejectInvalidUnicodeEscapes(raw []byte, label string) error {
-	type frame struct {
-		path      string
-		object    bool
-		lastKey   string
-		expectKey bool
-		nextIndex int
-	}
-	var stack []*frame
-	valueDone := func() {
-		if len(stack) == 0 {
-			return
-		}
-		top := stack[len(stack)-1]
-		if top.object {
-			top.expectKey = true
-		} else {
-			top.nextIndex++
-		}
-	}
-	childPath := func() string {
-		top := stack[len(stack)-1]
-		if top.object {
-			return top.path + "." + top.lastKey
-		}
-		return top.path + "[" + strconv.Itoa(top.nextIndex) + "]"
-	}
+	tracker := newJSONPathTracker(label)
 	i := 0
 	for i < len(raw) {
 		c := raw[i]
 		switch {
 		case c == '{' || c == '[':
-			path := label
-			if len(stack) > 0 {
-				path = childPath()
-			}
-			stack = append(stack, &frame{path: path, object: c == '{', expectKey: c == '{'})
+			tracker.beginContainer(c == '{')
 			i++
 		case c == '}' || c == ']':
-			if len(stack) > 0 {
-				stack = stack[:len(stack)-1]
-			}
-			valueDone()
+			tracker.endContainer()
 			i++
 		case c == '"':
 			end := jsonStringEnd(raw, i)
@@ -389,29 +448,24 @@ func rejectInvalidUnicodeEscapes(raw []byte, label string) error {
 				contentEnd-- // 去掉右引号；未终止的字符串留给 Unmarshal 报告
 			}
 			content := raw[i+1 : contentEnd]
-			if bad := findBadUnicodeEscape(content); bad != nil {
-				if len(stack) > 0 && stack[len(stack)-1].object && stack[len(stack)-1].expectKey {
-					top := stack[len(stack)-1]
+			if tracker.atKey() {
+				if bad := findBadUnicodeEscape(content); bad != nil {
 					return fmt.Errorf("%s: field name %q contains invalid Unicode escape %s: Unicode escape does not form a complete character (%s)",
-						top.path, string(content), bad.escape, bad.detail)
+						tracker.currentPath(), string(content), bad.escape, bad.detail)
 				}
-				path := label
-				if len(stack) > 0 {
-					path = childPath()
-				}
-				return fmt.Errorf("%s: invalid Unicode escape %s: Unicode escape does not form a complete character (%s)",
-					path, bad.escape, bad.detail)
-			}
-			if len(stack) > 0 && stack[len(stack)-1].object && stack[len(stack)-1].expectKey {
-				top := stack[len(stack)-1]
-				var key string
 				// 转义已校验合法，解码用于定位路径；失败说明是语法错误，留给 Unmarshal。
-				if err := json.Unmarshal(raw[i:end], &key); err == nil {
-					top.lastKey = key
+				if name, ok := decodeJSONString(raw[i:end]); ok {
+					tracker.setKey(name)
+				} else {
+					tracker.noteInvalidKey()
 				}
-				top.expectKey = false
 			} else {
-				valueDone()
+				path := tracker.valuePath()
+				if bad := findBadUnicodeEscape(content); bad != nil {
+					return fmt.Errorf("%s: invalid Unicode escape %s: Unicode escape does not form a complete character (%s)",
+						path, bad.escape, bad.detail)
+				}
+				tracker.endValue()
 			}
 			i = end
 		case c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == ':' || c == ',':
@@ -421,10 +475,19 @@ func rejectInvalidUnicodeEscapes(raw []byte, label string) error {
 			for i < len(raw) && !isJSONStructural(raw[i]) {
 				i++
 			}
-			valueDone()
+			tracker.endValue()
 		}
 	}
 	return nil
+}
+
+// decodeJSONString 解码一个完整的 JSON 字符串字面量（含两侧引号）；ok 为 false
+// 表示字面量本身非法（未终止或转义写法错误等），属于 JSON 语法错误。
+func decodeJSONString(lit []byte) (s string, ok bool) {
+	if err := json.Unmarshal(lit, &s); err != nil {
+		return "", false
+	}
+	return s, true
 }
 
 // badEscape 描述一处不能组成完整字符的 \uXXXX 转义。
