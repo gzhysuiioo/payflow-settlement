@@ -462,6 +462,140 @@ func TestUniquenessErrorsDistinctFromDuplicateFields(t *testing.T) {
 	}
 }
 
+func TestInvalidUnicodeEscapesRejected(t *testing.T) {
+	// encoding/json 会把孤立代理项转义静默替换为 U+FFFD；这些输入必须明确失败，
+	// 且错误指出文件（config/context）、字段或数组位置，并说明转义不能组成完整字符。
+	const incomplete = "does not form a complete character"
+	configCases := []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{"eq value lone high surrogate", `{"flags":[{"key":"f","enabled":true,"default":false,"rules":[
+			{"id":"r","value":true,"conditions":[{"attribute":"a","op":"eq","value":"\uD800"}]}]}]}`,
+			`config.flags[0].rules[0].conditions[0].value`},
+		{"eq value lone low surrogate", `{"flags":[{"key":"f","enabled":true,"default":false,"rules":[
+			{"id":"r","value":true,"conditions":[{"attribute":"a","op":"eq","value":"\uDC00"}]}]}]}`,
+			`config.flags[0].rules[0].conditions[0].value`},
+		{"reversed pair", `{"flags":[{"key":"f","enabled":true,"default":false,"rules":[
+			{"id":"r","value":true,"conditions":[{"attribute":"a","op":"eq","value":"\uDC00\uD800"}]}]}]}`,
+			`conditions[0].value`},
+		{"high then non-surrogate escape", `{"flags":[{"key":"f","enabled":true,"default":false,"rules":[
+			{"id":"r","value":true,"conditions":[{"attribute":"a","op":"eq","value":"\uD800A"}]}]}]}`,
+			`conditions[0].value`},
+		{"high then high", `{"flags":[{"key":"f","enabled":true,"default":false,"rules":[
+			{"id":"r","value":true,"conditions":[{"attribute":"a","op":"eq","value":"\uD800\uD800"}]}]}]}`,
+			`conditions[0].value`}, {"high at end of string", `{"flags":[{"key":"f","enabled":true,"default":false,"rules":[
+			{"id":"r","value":true,"conditions":[{"attribute":"a","op":"eq","value":"x\uD800"}]}]}]}`,
+			`conditions[0].value`},
+		{"in-list element", `{"flags":[{"key":"f","enabled":true,"default":false,"rules":[
+			{"id":"r","value":true,"conditions":[{"attribute":"a","op":"in","value":["ok","\uD800"]}]}]}]}`,
+			`config.flags[0].rules[0].conditions[0].value[1]`},
+		{"flag key string", `{"flags":[{"key":"\uD800","enabled":true,"default":false,"rules":[]}]}`,
+			`config.flags[0].key`},
+		{"extra field value", `{"flags":[{"key":"f","enabled":true,"default":false,"rules":[],
+			"meta":{"note":"\uDFFF"}}]}`,
+			`config.flags[0].meta.note`},
+		{"disabled flag not exempt", `{"flags":[{"key":"f","enabled":false,"default":false,"rules":[
+			{"id":"r","value":true,"conditions":[{"attribute":"a","op":"eq","value":"\uD800"}]}]}]}`,
+			`conditions[0].value`},
+		{"unselected flag not exempt", `{"flags":[
+			{"key":"good","enabled":true,"default":false,"rules":[]},
+			{"key":"bad","enabled":true,"default":false,"rules":[
+				{"id":"r","value":true,"conditions":[{"attribute":"a","op":"eq","value":"\uD800"}]}]}]}`,
+			`config.flags[1].rules[0].conditions[0].value`},
+		{"first error in file order wins", `{"flags":[
+			{"key":"f","enabled":true,"default":false,"rules":[
+				{"id":"r","value":true,"conditions":[{"attribute":"a","op":"eq","value":"\uD800"}]}]},
+			{"key":"g","enabled":true,"default":false,"rules":[
+				{"id":"r","value":true,"conditions":[{"attribute":"a","op":"eq","value":"\uDC00"}]}]}]}`,
+			`config.flags[0].rules[0].conditions[0].value`},
+	}
+	for _, tc := range configCases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := ParseConfig([]byte(tc.raw))
+			if err == nil {
+				t.Fatalf("expected invalid Unicode escape error, got nil\nconfig: %s", tc.raw)
+			}
+			if !strings.Contains(err.Error(), incomplete) {
+				t.Fatalf("error = %q, want wording %q", err.Error(), incomplete)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("error = %q, want location %q", err.Error(), tc.want)
+			}
+		})
+	}
+
+	// 字段名本身非法：指出所属对象，并保留可辨认的原始转义内容。
+	_, err := ParseConfig([]byte(`{"flags":[{"key":"f","enabled":true,"default":false,"rules":[],
+		"met\uD800a":1}]}`))
+	if err == nil || !strings.Contains(err.Error(), `config.flags[0]`) ||
+		!strings.Contains(err.Error(), `\uD800`) || !strings.Contains(err.Error(), incomplete) {
+		t.Fatalf("bad field name in config: err=%v", err)
+	}
+
+	// 上下文同样检查值与字段名。
+	_, err = ParseContext([]byte(`{"plan":"\uD800"}`))
+	if err == nil || !strings.Contains(err.Error(), `context.plan`) ||
+		!strings.Contains(err.Error(), incomplete) {
+		t.Fatalf("context value: err=%v", err)
+	}
+	_, err = ParseContext([]byte(`{"pl\uDC00an":"pro"}`))
+	if err == nil || !strings.Contains(err.Error(), `context`) ||
+		!strings.Contains(err.Error(), `\uDC00`) || !strings.Contains(err.Error(), incomplete) {
+		t.Fatalf("context field name: err=%v", err)
+	}
+}
+
+func TestInvalidUnicodeEscapeNotEquatedWithReplacementChar(t *testing.T) {
+	// 规则要求属性值等于真正的 "�"：上下文提供 "\uD800" 不能在替换后命中规则，
+	// 整个求值必须失败。
+	cfg := `{"flags":[{"key":"f","enabled":true,"default":false,"rules":[
+		{"id":"r1","value":true,"conditions":[{"attribute":"plan","op":"eq","value":"�"}]}]}]}`
+	if _, err := ParseContext([]byte(`{"plan":"\uD800"}`)); err == nil {
+		t.Fatal("context with lone surrogate must be rejected, not replaced by U+FFFD")
+	}
+	c := mustParseConfig(t, cfg)
+	ctx := mustParseContext(t, `{"plan":"�"}`)
+	if got := c.Find("f").Evaluate(ctx); got.Reason != EvalRule {
+		t.Fatalf("literal U+FFFD still matches: %+v", got)
+	}
+	// 字段名被替换后也不能误报重复字段："\uD800x" 与 "�x" 本不应同名，
+	// 但非法转义必须先于重复字段检查以自身名义报错。
+	_, err := ParseContext([]byte(`{"\uD800x":"a","�x":"b"}`))
+	if err == nil || strings.Contains(err.Error(), "duplicate field") {
+		t.Fatalf("lone surrogate in field name must not surface as duplicate field: %v", err)
+	}
+}
+
+func TestValidUnicodeEscapesUnchanged(t *testing.T) {
+	// 正确配对的代理项转义与直接写出的同一字符按同一字符串比较。
+	// emojiEsc 是 "😀" 的代理项对转义形式（分两段书写仅为避免源码层面的转义歧义）。
+	emojiEsc := `\uD83D` + `\uDE00`
+	cfgEsc := `{"flags":[{"key":"f","enabled":true,"default":false,"rules":[
+		{"id":"r1","value":true,"conditions":[{"attribute":"emoji","op":"eq","value":"` + emojiEsc + `"}]}]}]}`
+	if got := eval(t, cfgEsc, "f", `{"emoji":"😀"}`); got.Reason != EvalRule {
+		t.Fatalf("paired escape equals literal: %+v", got)
+	}
+	cfgLit := `{"flags":[{"key":"f","enabled":true,"default":false,"rules":[
+		{"id":"r1","value":true,"conditions":[{"attribute":"emoji","op":"eq","value":"😀"}]}]}]}`
+	if got := eval(t, cfgLit, "f", `{"emoji":"`+emojiEsc+`"}`); got.Reason != EvalRule {
+		t.Fatalf("literal equals paired escape: %+v", got)
+	}
+	// 真正的 "�" 与 "�" 仍是合法字符串，不能一概禁止替换字符。
+	mustParseContext(t, `{"a":"�","b":"\u`+`FFFD"}`)
+	if got := eval(t, cfgLit, "f", `{"emoji":"�"}`); got.Reason != EvalDefault {
+		t.Fatalf("U+FFFD is just another string: %+v", got)
+	}
+	// 反斜杠转义后的 "\uD800" 是普通文本（内容为 \uD800 六个字符）。
+	mustParseContext(t, `{"a":"\\uD800"}`)
+	cfgText := `{"flags":[{"key":"f","enabled":true,"default":false,"rules":[
+		{"id":"r1","value":true,"conditions":[{"attribute":"a","op":"eq","value":"\\uD800"}]}]}]}`
+	if got := eval(t, cfgText, "f", `{"a":"\\uD800"}`); got.Reason != EvalRule {
+		t.Fatalf("escaped backslash text: %+v", got)
+	}
+}
+
 func TestEmptyFlagListAndFind(t *testing.T) {
 	cfg := mustParseConfig(t, `{"flags":[]}`)
 	if cfg.Find("missing") != nil {

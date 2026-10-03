@@ -254,6 +254,31 @@ func TestCLIErrorCases(t *testing.T) {
 			},
 			"not found",
 		},
+		{
+			"config lone surrogate escape",
+			func(t *testing.T) []string {
+				h := newHarness(t, `{"flags":[{"key":"f","enabled":true,"default":false,"rules":[
+					{"id":"r","value":true,"conditions":[{"attribute":"a","op":"eq","value":"\uD800"}]}]}]}`, goodCtx)
+				return h.evalArgs("f")
+			},
+			`config.flags[0].rules[0].conditions[0].value`,
+		},
+		{
+			"context lone surrogate escape",
+			func(t *testing.T) []string {
+				h := newHarness(t, goodCfg, `{"plan":"\uD800"}`)
+				return h.evalArgs("feature-a")
+			},
+			`context.plan`,
+		},
+		{
+			"context lone surrogate in field name",
+			func(t *testing.T) []string {
+				h := newHarness(t, goodCfg, `{"pl\uD800an":"pro"}`)
+				return h.evalArgs("feature-a")
+			},
+			`\uD800`,
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

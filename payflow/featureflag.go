@@ -99,6 +99,9 @@ func ParseConfig(raw []byte) (*Config, error) {
 	if !utf8.Valid(raw) {
 		return nil, fmt.Errorf("config: file is not valid UTF-8")
 	}
+	if err := rejectInvalidUnicodeEscapes(raw, "config"); err != nil {
+		return nil, err
+	}
 	if err := rejectDuplicateFields(raw, "config"); err != nil {
 		return nil, err
 	}
@@ -141,6 +144,9 @@ func ParseConfig(raw []byte) (*Config, error) {
 func ParseContext(raw []byte) (*Context, error) {
 	if !utf8.Valid(raw) {
 		return nil, fmt.Errorf("context: file is not valid UTF-8")
+	}
+	if err := rejectInvalidUnicodeEscapes(raw, "context"); err != nil {
+		return nil, err
 	}
 	if err := rejectDuplicateFields(raw, "context"); err != nil {
 		return nil, err
@@ -322,6 +328,217 @@ func rejectDuplicateFields(raw []byte, label string) error {
 		}
 	}
 	return nil
+}
+
+// rejectInvalidUnicodeEscapes 按文件原文顺序扫描 JSON 文本，拒绝任何不能组成
+// 完整字符的 \uXXXX 转义：孤立的高代理项、孤立的低代理项，以及不完整或顺序
+// 错误的代理项对。encoding/json 解码时会把这类转义静默替换为 U+FFFD，使非法
+// 输入与真正的 "�" 被当作相同字符串参与求值，或让字段名在替换后被误判为重复，
+// 因此必须在解码前按原文拒绝。检查覆盖字段名与所有字符串值（包括规则的比较值、
+// in 列表元素以及附加字段里的字符串），一个文件有多个问题时报告原文中最先出现
+// 的一处。label 是根对象的位置前缀（"config" 或 "context"）。JSON 语法错误
+// 不在此报告，留给 Unmarshal。
+func rejectInvalidUnicodeEscapes(raw []byte, label string) error {
+	type frame struct {
+		path      string
+		object    bool
+		lastKey   string
+		expectKey bool
+		nextIndex int
+	}
+	var stack []*frame
+	valueDone := func() {
+		if len(stack) == 0 {
+			return
+		}
+		top := stack[len(stack)-1]
+		if top.object {
+			top.expectKey = true
+		} else {
+			top.nextIndex++
+		}
+	}
+	childPath := func() string {
+		top := stack[len(stack)-1]
+		if top.object {
+			return top.path + "." + top.lastKey
+		}
+		return top.path + "[" + strconv.Itoa(top.nextIndex) + "]"
+	}
+	i := 0
+	for i < len(raw) {
+		c := raw[i]
+		switch {
+		case c == '{' || c == '[':
+			path := label
+			if len(stack) > 0 {
+				path = childPath()
+			}
+			stack = append(stack, &frame{path: path, object: c == '{', expectKey: c == '{'})
+			i++
+		case c == '}' || c == ']':
+			if len(stack) > 0 {
+				stack = stack[:len(stack)-1]
+			}
+			valueDone()
+			i++
+		case c == '"':
+			end := jsonStringEnd(raw, i)
+			contentEnd := end
+			if contentEnd > i+1 && raw[contentEnd-1] == '"' {
+				contentEnd-- // 去掉右引号；未终止的字符串留给 Unmarshal 报告
+			}
+			content := raw[i+1 : contentEnd]
+			if bad := findBadUnicodeEscape(content); bad != nil {
+				if len(stack) > 0 && stack[len(stack)-1].object && stack[len(stack)-1].expectKey {
+					top := stack[len(stack)-1]
+					return fmt.Errorf("%s: field name %q contains invalid Unicode escape %s: Unicode escape does not form a complete character (%s)",
+						top.path, string(content), bad.escape, bad.detail)
+				}
+				path := label
+				if len(stack) > 0 {
+					path = childPath()
+				}
+				return fmt.Errorf("%s: invalid Unicode escape %s: Unicode escape does not form a complete character (%s)",
+					path, bad.escape, bad.detail)
+			}
+			if len(stack) > 0 && stack[len(stack)-1].object && stack[len(stack)-1].expectKey {
+				top := stack[len(stack)-1]
+				var key string
+				// 转义已校验合法，解码用于定位路径；失败说明是语法错误，留给 Unmarshal。
+				if err := json.Unmarshal(raw[i:end], &key); err == nil {
+					top.lastKey = key
+				}
+				top.expectKey = false
+			} else {
+				valueDone()
+			}
+			i = end
+		case c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == ':' || c == ',':
+			i++
+		default:
+			// 数字与 true/false/null 等标量：跳过至下一个结构字符，按一个值计。
+			for i < len(raw) && !isJSONStructural(raw[i]) {
+				i++
+			}
+			valueDone()
+		}
+	}
+	return nil
+}
+
+// badEscape 描述一处不能组成完整字符的 \uXXXX 转义。
+type badEscape struct {
+	escape string // 原文中的转义序列，如 \uD800
+	detail string // 具体问题（孤立高代理项/孤立低代理项）
+}
+
+// jsonStringEnd 返回从 raw[i]（必须是 '"'）开始的字符串字面量结束位置
+// （右引号之后的下标）；未终止时返回 len(raw)。
+func jsonStringEnd(raw []byte, i int) int {
+	j := i + 1
+	for j < len(raw) {
+		switch raw[j] {
+		case '\\':
+			j += 2
+		case '"':
+			return j + 1
+		default:
+			j++
+		}
+	}
+	return len(raw)
+}
+
+// findBadUnicodeEscape 在字符串内容（不含引号）中查找第一处不能组成完整
+// 字符的 \uXXXX 转义；没有则返回 nil。反斜杠本身的转义（\\）先于 \u 判定，
+// 因此 "\\uD800" 只是普通文本。非法的 \u 写法（非 4 位十六进制）属于 JSON
+// 语法错误，不在此报告。
+func findBadUnicodeEscape(content []byte) *badEscape {
+	j := 0
+	for j < len(content) {
+		if content[j] != '\\' {
+			j++
+			continue
+		}
+		if j+1 >= len(content) {
+			break
+		}
+		if content[j+1] != 'u' {
+			j += 2
+			continue
+		}
+		if j+6 > len(content) || !isHex4(content[j+2:j+6]) {
+			j += 2
+			continue
+		}
+		cp := hexVal4(content[j+2 : j+6])
+		switch {
+		case cp >= 0xD800 && cp <= 0xDBFF:
+			// 高代理项只有紧跟一个低代理项转义才组成完整字符。
+			if j+12 <= len(content) && content[j+6] == '\\' && content[j+7] == 'u' &&
+				isHex4(content[j+8:j+12]) {
+				if lo := hexVal4(content[j+8 : j+12]); lo >= 0xDC00 && lo <= 0xDFFF {
+					j += 12
+					continue
+				}
+			}
+			return &badEscape{
+				escape: string(content[j : j+6]),
+				detail: "high surrogate is not followed by a low surrogate",
+			}
+		case cp >= 0xDC00 && cp <= 0xDFFF:
+			return &badEscape{
+				escape: string(content[j : j+6]),
+				detail: "low surrogate is not preceded by a high surrogate",
+			}
+		}
+		j += 6
+	}
+	return nil
+}
+
+// isJSONStructural 报告 b 是否为 JSON 结构字符或空白（标量值的边界）。
+func isJSONStructural(b byte) bool {
+	switch b {
+	case ' ', '\t', '\n', '\r', '{', '}', '[', ']', ':', ',', '"':
+		return true
+	}
+	return false
+}
+
+// isHex4 报告 b 是否恰好为 4 个十六进制数字。
+func isHex4(b []byte) bool {
+	if len(b) != 4 {
+		return false
+	}
+	for _, c := range b {
+		if !isHexDigit(c) {
+			return false
+		}
+	}
+	return true
+}
+
+func isHexDigit(c byte) bool {
+	return ('0' <= c && c <= '9') || ('a' <= c && c <= 'f') || ('A' <= c && c <= 'F')
+}
+
+// hexVal4 把 4 个十六进制数字解析为码点值；调用前须先经 isHex4 校验。
+func hexVal4(b []byte) int {
+	v := 0
+	for _, c := range b {
+		v <<= 4
+		switch {
+		case '0' <= c && c <= '9':
+			v |= int(c - '0')
+		case 'a' <= c && c <= 'f':
+			v |= int(c-'a') + 10
+		default: // 'A' <= c && c <= 'F'
+			v |= int(c-'A') + 10
+		}
+	}
+	return v
 }
 
 func parseFlag(raw any, index int) (Flag, error) {
