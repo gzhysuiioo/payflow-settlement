@@ -739,6 +739,137 @@ func TestLegacyExecuteAndReconcile(t *testing.T) {
 	}
 }
 
+// TestLegacyExecuteLargeAmountNoOverflow 验证大额付款的手续费不再因中间乘积
+// 溢出而算错：amount*feeBps 本身可能超过 int64，但只要最终总额可表示，
+// 就按精确总额判断余额。
+func TestLegacyExecuteLargeAmountNoOverflow(t *testing.T) {
+	const (
+		amount    = int64(4000000000000000000)
+		feeBps    = 30
+		wantFee   = int64(12000000000000000)
+		wantTotal = amount + wantFee // 4012000000000000000
+	)
+
+	// 余额恰好等于总额：成功，扣款额精确，编号被标记。
+	spent := map[string]bool{}
+	s := Execute(Intent{ID: "big", State: "pending", Amount: amount}, feeBps, spent, wantTotal)
+	if s.Status != "settled" {
+		t.Fatalf("exact balance should settle: %+v", s)
+	}
+	if s.Charged != wantTotal {
+		t.Fatalf("charged=%d want %d", s.Charged, wantTotal)
+	}
+	if s.FeeBps != feeBps || s.Intent != "big" || s.Ref != "settle:big" {
+		t.Fatalf("settlement fields: %+v", s)
+	}
+	if !spent["big"] {
+		t.Fatalf("id must be marked after success")
+	}
+
+	// 余额少一个最小单位：余额不足失败，不标记编号、不留引用、不报错扣款额。
+	spent = map[string]bool{}
+	s = Execute(Intent{ID: "big", State: "pending", Amount: amount}, feeBps, spent, wantTotal-1)
+	if s.Status != "failed" || s.Reason != reasonFunds {
+		t.Fatalf("one unit short should fail insufficient: %+v", s)
+	}
+	if s.Charged != 0 || s.Ref != "" {
+		t.Fatalf("failure must not charge or reference: %+v", s)
+	}
+	if spent["big"] {
+		t.Fatalf("failed id must not be marked")
+	}
+}
+
+// TestLegacyExecuteTotalOverflow 验证总额超出 int64 时必须拒绝，
+// 即使余额本身是 int64 最大值，也不能返回负数扣款或普通余额不足。
+func TestLegacyExecuteTotalOverflow(t *testing.T) {
+	spent := map[string]bool{}
+	s := Execute(Intent{ID: "max", State: "pending", Amount: math.MaxInt64}, 1, spent, math.MaxInt64)
+	if s.Status != "rejected" || s.Reason != reasonOverflow {
+		t.Fatalf("total overflow must be rejected: %+v", s)
+	}
+	if s.Charged != 0 || s.Ref != "" {
+		t.Fatalf("overflow rejection must not charge or reference: %+v", s)
+	}
+	if spent["max"] {
+		t.Fatalf("rejected id must not be marked")
+	}
+	// 溢出拒绝后修正费率（手续费为 0），同一编号仍可作为首次付款成功。
+	s = Execute(Intent{ID: "max", State: "pending", Amount: math.MaxInt64}, 0, spent, math.MaxInt64)
+	if s.Status != "settled" || s.Charged != math.MaxInt64 {
+		t.Fatalf("corrected request must settle as first payment: %+v", s)
+	}
+	if !spent["max"] {
+		t.Fatalf("successful retry must mark id")
+	}
+}
+
+// TestLegacyExecuteValidation 覆盖金额与费率的合法性检查及三类拒绝原因区分。
+func TestLegacyExecuteValidation(t *testing.T) {
+	cases := []struct {
+		name   string
+		amount int64
+		bps    int
+		reason string
+	}{
+		{"zero amount", 0, 0, reasonBadAmount},
+		{"negative amount", -1, 0, reasonBadAmount},
+		{"negative fee bps", 1, -1, "fee_bps must be within [0,10000], got -1"},
+		{"fee bps above 10000", 1, 10001, "fee_bps must be within [0,10000], got 10001"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			spent := map[string]bool{}
+			s := Execute(Intent{ID: "v", State: "pending", Amount: tc.amount}, tc.bps, spent, math.MaxInt64)
+			if s.Status != "rejected" || s.Reason != tc.reason {
+				t.Fatalf("got status=%s reason=%q want rejected/%q", s.Status, s.Reason, tc.reason)
+			}
+			if s.Charged != 0 || s.Ref != "" || spent["v"] {
+				t.Fatalf("rejection must have no charge/ref/mark: %+v spent=%v", s, spent)
+			}
+		})
+	}
+
+	// 费率边界 0 与 10000 合法。
+	for _, bps := range []int{0, 10000} {
+		spent := map[string]bool{}
+		if s := Execute(Intent{ID: "edge", State: "pending", Amount: 100}, bps, spent, math.MaxInt64); s.Status != "settled" {
+			t.Fatalf("bps=%d must be valid: %+v", bps, s)
+		}
+	}
+}
+
+// TestLegacyExecutePrecedenceAndRetry 验证判断顺序与“拒绝不占用编号”。
+func TestLegacyExecutePrecedenceAndRetry(t *testing.T) {
+	// 非 pending 优先于金额、费率、重复检查。
+	spent := map[string]bool{"a": true}
+	if s := Execute(Intent{ID: "a", State: "done", Amount: 0}, 10001, spent, 0); s.Status != "rejected" || s.Reason != reasonNotPending {
+		t.Fatalf("not-pending must take precedence: %+v", s)
+	}
+	// pending 但已结算优先于金额、费率检查。
+	if s := Execute(Intent{ID: "a", State: "pending", Amount: 0}, 10001, spent, 0); s.Status != "rejected" || s.Reason != reasonDuplicate {
+		t.Fatalf("duplicate must take precedence over amount/fee: %+v", s)
+	}
+
+	// 金额不合法的编号修正后作为首次付款成功（而非 duplicate）。
+	fresh := map[string]bool{}
+	if s := Execute(Intent{ID: "p", State: "pending", Amount: 0}, 0, fresh, 100); s.Status != "rejected" {
+		t.Fatalf("zero amount rejected: %+v", s)
+	}
+	if s := Execute(Intent{ID: "p", State: "pending", Amount: 100}, 0, fresh, 100); s.Status != "settled" || s.Charged != 100 {
+		t.Fatalf("corrected amount must settle as first payment: %+v", s)
+	}
+
+	// 余额不足失败后补足余额，同一编号仍可作为首次付款成功。
+	funds := map[string]bool{}
+	if s := Execute(Intent{ID: "q", State: "pending", Amount: 100}, 0, funds, 50); s.Status != "failed" {
+		t.Fatalf("insufficient: %+v", s)
+	}
+	if s := Execute(Intent{ID: "q", State: "pending", Amount: 100}, 0, funds, 100); s.Status != "settled" || s.Charged != 100 {
+		t.Fatalf("retry after top-up must settle as first payment: %+v", s)
+	}
+}
+
 // ===========================================================================
 // 退款（refund）测试
 // ===========================================================================
