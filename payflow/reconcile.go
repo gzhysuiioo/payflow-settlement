@@ -283,22 +283,60 @@ func newReconSide() reconSide {
 	return reconSide{charged: map[balanceKey]*big.Int{}, refunded: map[balanceKey]*big.Int{}}
 }
 
-func (s *reconSide) addCharged(k balanceKey, v int64) {
-	x := s.charged[k]
+// add 把一条流水或账本记录计入对应合计：payment 计入扣款，refund 计入退款。
+// 两类记录共用同一套累计逻辑，差别只在目标合集。
+func (s *reconSide) add(kind string, k balanceKey, v int64) {
+	m := s.charged
+	if kind == "refund" {
+		m = s.refunded
+	}
+	x := m[k]
 	if x == nil {
 		x = new(big.Int)
-		s.charged[k] = x
+		m[k] = x
 	}
 	x.Add(x, big.NewInt(v))
 }
 
-func (s *reconSide) addRefund(k balanceKey, v int64) {
-	x := s.refunded[k]
-	if x == nil {
-		x = new(big.Int)
-		s.refunded[k] = x
+// reconLane 汇集一类流水（付款或退款）参与逐条核对所需的全部账本视图与
+// 判定状态。付款与退款的逐条流程（范围外 → 整组重复 → 唯一核对）完全相同，
+// 差异只在匹配对象、关联信息与核对字段，全部收敛到各自的 lane：
+//   - records/byID：按成功顺序的记录引用（付款携带其退款编号，退款携带原
+//     付款编号），编号索引按类各自独立，同名编号也不会混为一笔；
+//   - inRange：该类记录自己的序号范围判断；
+//   - seen/covered/missing：输入位置统计、入选记录覆盖情况与缺失列表。
+type reconLane struct {
+	kind    string
+	inRange func(seq int64) bool
+	records []ReconRecordRef           // 按成功顺序排列
+	byID    map[string]*ReconRecordRef // 指向 records 中的元素
+	seen    map[string][]int           // 编号 → 全部输入位置
+	covered map[string]bool            // 唯一出现且命中入选记录的编号（含字段不符）
+	missing []ReconRecordRef           // 入选但流水未覆盖的记录，按成功顺序
+}
+
+func newReconLane(kind string, inRange func(seq int64) bool) *reconLane {
+	return &reconLane{
+		kind:    kind,
+		inRange: inRange,
+		byID:    map[string]*ReconRecordRef{},
+		seen:    map[string][]int{},
+		covered: map[string]bool{},
+		missing: []ReconRecordRef{},
 	}
-	x.Add(x, big.NewInt(v))
+}
+
+// index 在 records 全部就位后建立编号索引（元素地址在追加完成后才稳定）。
+func (l *reconLane) index() {
+	for i := range l.records {
+		l.byID[l.records[i].ID] = &l.records[i]
+	}
+}
+
+// attach 把命中记录（含关联信息）的独立副本挂到结果上。
+func attachRef(rec *ReconRecordRef) *ReconRecordRef {
+	cp := *rec
+	return &cp
 }
 
 // ReconcileFlow 对一批外部流水与当前账本状态做只读对账，核对范围为完整
@@ -383,191 +421,128 @@ func (l *Ledger) ReconcileFlowRanged(entries []FlowEntry, bounds ReconcileBounds
 	inRefRange := func(seq int64) bool { return seq > refAfter && seq <= refThrough }
 
 	// 结算编号 / 退款编号各自索引：同名编号也不会混为一笔。
-	// 关联索引始终基于完整历史：范围不切断付款与退款之间的关联。
-	payByID := make(map[string]*Record, len(st.Settlements))
-	for i := range st.Settlements {
-		payByID[st.Settlements[i].ID] = &st.Settlements[i]
-	}
-	refundByID := make(map[string]*RefundRecord, len(st.Refunds))
+	// 关联索引始终基于完整历史：范围不切断付款与退款之间的关联，
+	// 入选退款仍可指向范围外付款，入选付款仍携带范围外退款的信息。
 	refundOfPay := make(map[string]*RefundRecord, len(st.Refunds))
 	for i := range st.Refunds {
-		r := &st.Refunds[i]
-		refundByID[r.ID] = r
-		refundOfPay[r.SettlementID] = r
+		refundOfPay[st.Refunds[i].SettlementID] = &st.Refunds[i]
 	}
+	payLane := newReconLane("payment", inPayRange)
+	for i := range st.Settlements {
+		r := &st.Settlements[i]
+		payLane.records = append(payLane.records, paymentRef(r, refundOfPay[r.ID]))
+	}
+	payLane.index()
+	refundLane := newReconLane("refund", inRefRange)
+	for i := range st.Refunds {
+		refundLane.records = append(refundLane.records, refundRef(&st.Refunds[i]))
+	}
+	refundLane.index()
+	// lanes 的顺序即缺失报告与账本侧合计的处理顺序：先付款后退款。
+	lanes := []*reconLane{payLane, refundLane}
+	laneOf := map[string]*reconLane{"payment": payLane, "refund": refundLane}
 
 	// 统计每个 (kind,id) 在输入中出现的全部位置：出现多次则整组重复，
 	// 无论内容是否相同。
-	type idUse struct{ positions []int }
-	paySeen := map[string]*idUse{}
-	refundSeen := map[string]*idUse{}
 	for i := range entries {
 		e := &entries[i]
-		m := paySeen
-		if e.Kind == "refund" {
-			m = refundSeen
-		}
-		u := m[e.ID]
-		if u == nil {
-			u = &idUse{}
-			m[e.ID] = u
-		}
-		u.positions = append(u.positions, e.Index)
+		lane := laneOf[e.Kind]
+		lane.seen[e.ID] = append(lane.seen[e.ID], e.Index)
 	}
 
 	report := &ReconReport{
-		Results:         make([]ReconResult, 0, len(entries)),
-		MissingPayments: []ReconRecordRef{},
-		MissingRefunds:  []ReconRecordRef{},
-		NetDiff:         []ReconNetDiff{},
-		MaxPaymentSeq:   maxPay,
-		MaxRefundSeq:    maxRef,
-		PaymentAfter:    payAfter,
-		PaymentThrough:  payThrough,
-		RefundAfter:     refAfter,
-		RefundThrough:   refThrough,
+		Results:        make([]ReconResult, 0, len(entries)),
+		NetDiff:        []ReconNetDiff{},
+		MaxPaymentSeq:  maxPay,
+		MaxRefundSeq:   maxRef,
+		PaymentAfter:   payAfter,
+		PaymentThrough: payThrough,
+		RefundAfter:    refAfter,
+		RefundThrough:  refThrough,
 	}
 
 	ledgerSide := newReconSide()
 	flowSide := newReconSide()
-	coveredPay := map[string]bool{} // 唯一且命中账本入选记录的付款编号（含字段不符）
-	coveredRefund := map[string]bool{}
 
-	// 逐条结果（保持输入顺序）。
+	// 逐条结果（保持输入顺序）。两类流水共用同一条核对流水线，
+	// 类别差异（匹配对象、关联引用、合计方向、核对字段）由 lane 提供。
 	for i := range entries {
 		e := &entries[i]
+		lane := laneOf[e.Kind]
 		res := ReconResult{Index: e.Index, Kind: e.Kind, ID: e.ID}
 		k := balanceKey{e.Account, e.Asset}
-
-		uses := paySeen[e.ID]
-		var payRec *Record
-		var refRec *RefundRecord
-		inRange := false
-		if e.Kind == "payment" {
-			payRec = payByID[e.ID]
-			inRange = payRec != nil && inPayRange(payRec.Seq)
-		} else {
-			uses = refundSeen[e.ID]
-			refRec = refundByID[e.ID]
-			inRange = refRec != nil && inRefRange(refRec.Seq)
-		}
+		rec := lane.byID[e.ID]
 
 		// 1. 命中同类型同编号但记录在范围外：不比较字段、不计入流水侧汇总；
 		//    该编号在流水中出现多次时全部按 out_of_scope 处理（优先于整组重复）。
-		if (payRec != nil || refRec != nil) && !inRange {
+		if rec != nil && !lane.inRange(rec.Seq) {
 			res.Status = ReconOutOfScope
-			if e.Kind == "payment" {
-				ref := paymentRef(payRec, refundOfPay[e.ID])
-				res.Record = &ref
-			} else {
-				ref := refundRef(refRec)
-				res.Record = &ref
-			}
+			res.Record = attachRef(rec)
 			report.Results = append(report.Results, res)
 			continue
 		}
 
 		// 2. 记录在范围内或账本无此编号：保留整组重复判定，流水侧合计仍包含
 		//    每一条（范围内重复项与账本外流水逐条计入）。
-		if len(uses.positions) > 1 {
+		if positions := lane.seen[e.ID]; len(positions) > 1 {
 			res.Status = ReconDuplicate
-			res.Positions = append([]int(nil), uses.positions...)
-			if e.Kind == "payment" {
-				flowSide.addCharged(k, e.Charged)
-				if payRec != nil {
-					ref := paymentRef(payRec, refundOfPay[e.ID])
-					res.Record = &ref
-				}
-			} else {
-				flowSide.addRefund(k, e.Charged)
-				if refRec != nil {
-					ref := refundRef(refRec)
-					res.Record = &ref
-				}
+			res.Positions = append([]int(nil), positions...)
+			flowSide.add(lane.kind, k, e.Charged)
+			if rec != nil {
+				res.Record = attachRef(rec)
 			}
 			report.Results = append(report.Results, res)
 			continue
 		}
 
 		// 3. 唯一条目：命中入选记录则逐字段核对，否则账本缺这笔。
-		if e.Kind == "payment" {
-			flowSide.addCharged(k, e.Charged)
-			if payRec != nil {
-				coveredPay[e.ID] = true
-				ref := paymentRef(payRec, refundOfPay[e.ID])
-				res.Record = &ref
-				if diffs := comparePayment(payRec, e); len(diffs) > 0 {
-					res.Status = ReconFieldMismatch
-					res.Diffs = diffs
-				} else {
-					res.Status = ReconMatched
-				}
+		flowSide.add(lane.kind, k, e.Charged)
+		if rec != nil {
+			lane.covered[e.ID] = true
+			res.Record = attachRef(rec)
+			if diffs := compareFields(lane.kind, rec, e); len(diffs) > 0 {
+				res.Status = ReconFieldMismatch
+				res.Diffs = diffs
 			} else {
-				res.Status = ReconMissingInLedger
+				res.Status = ReconMatched
 			}
 		} else {
-			flowSide.addRefund(k, e.Charged)
-			if refRec != nil {
-				coveredRefund[e.ID] = true
-				ref := refundRef(refRec)
-				res.Record = &ref
-				if diffs := compareRefund(refRec, e); len(diffs) > 0 {
-					res.Status = ReconFieldMismatch
-					res.Diffs = diffs
-				} else {
-					res.Status = ReconMatched
-				}
-			} else {
-				res.Status = ReconMissingInLedger
-			}
+			res.Status = ReconMissingInLedger
 		}
 		report.Results = append(report.Results, res)
 	}
 
 	// 账本侧合计只包含入选记录：已退款的付款仍按原扣款计入，退款单独计入
 	// 退款侧；只选退款时扣款合计为零，不会顺带计入原付款。
-	for i := range st.Settlements {
-		r := &st.Settlements[i]
-		if inPayRange(r.Seq) {
-			ledgerSide.addCharged(balanceKey{r.Account, r.Asset}, r.Charged)
-		}
-	}
-	for i := range st.Refunds {
-		r := &st.Refunds[i]
-		if inRefRange(r.Seq) {
-			ledgerSide.addRefund(balanceKey{r.Account, r.Asset}, r.Charged)
+	for _, lane := range lanes {
+		for i := range lane.records {
+			r := &lane.records[i]
+			if lane.inRange(r.Seq) {
+				ledgerSide.add(lane.kind, balanceKey{r.Account, r.Asset}, r.Charged)
+			}
 		}
 	}
 
 	// 入选但流水未覆盖的成功记录另列缺失（先付款后退款，各按成功顺序）。
 	// 唯一出现即算覆盖（含字段不符）；重复组对应记录按规则不列为缺失；
 	// 范围外记录不列入缺失。
-	for i := range st.Settlements {
-		r := &st.Settlements[i]
-		if !inPayRange(r.Seq) {
-			continue
+	for _, lane := range lanes {
+		for i := range lane.records {
+			r := &lane.records[i]
+			if !lane.inRange(r.Seq) {
+				continue
+			}
+			if lane.covered[r.ID] {
+				continue
+			}
+			if len(lane.seen[r.ID]) > 1 {
+				continue
+			}
+			lane.missing = append(lane.missing, *r)
 		}
-		if coveredPay[r.ID] {
-			continue
-		}
-		if u := paySeen[r.ID]; u != nil && len(u.positions) > 1 {
-			continue
-		}
-		report.MissingPayments = append(report.MissingPayments, paymentRef(r, refundOfPay[r.ID]))
 	}
-	for i := range st.Refunds {
-		r := &st.Refunds[i]
-		if !inRefRange(r.Seq) {
-			continue
-		}
-		if coveredRefund[r.ID] {
-			continue
-		}
-		if u := refundSeen[r.ID]; u != nil && len(u.positions) > 1 {
-			continue
-		}
-		report.MissingRefunds = append(report.MissingRefunds, refundRef(r))
-	}
+	report.MissingPayments = payLane.missing
+	report.MissingRefunds = refundLane.missing
 
 	report.Totals = ReconTotals{
 		Ledger: buildTotalRows(ledgerSide),
@@ -577,8 +552,10 @@ func (l *Ledger) ReconcileFlowRanged(entries []FlowEntry, bounds ReconcileBounds
 	return report, nil
 }
 
-// comparePayment 比较付款的账户、资产、amount、fee、charged 五个字段。
-func comparePayment(r *Record, e *FlowEntry) []FieldDiff {
+// compareFields 逐字段核对流水与命中的账本记录：账户、资产、amount、fee、
+// charged 五个字段两类流水共用；退款额外核对原付款编号 settlement_id。
+// 每个不同字段都保留账本值与流水值。
+func compareFields(kind string, r *ReconRecordRef, e *FlowEntry) []FieldDiff {
 	var diffs []FieldDiff
 	addStr := func(field, ledger, flow string) {
 		if ledger != flow {
@@ -595,28 +572,9 @@ func comparePayment(r *Record, e *FlowEntry) []FieldDiff {
 	addInt("amount", r.Amount, e.Amount)
 	addInt("fee", r.Fee, e.Fee)
 	addInt("charged", r.Charged, e.Charged)
-	return diffs
-}
-
-// compareRefund 比较退款的账户、资产、三个金额及原付款编号。
-func compareRefund(r *RefundRecord, e *FlowEntry) []FieldDiff {
-	var diffs []FieldDiff
-	addStr := func(field, ledger, flow string) {
-		if ledger != flow {
-			diffs = append(diffs, FieldDiff{Field: field, Ledger: ledger, Flow: flow})
-		}
+	if kind == "refund" {
+		addStr("settlement_id", r.SettlementID, e.SettlementID)
 	}
-	addInt := func(field string, ledger, flow int64) {
-		if ledger != flow {
-			diffs = append(diffs, FieldDiff{Field: field, Ledger: fmt.Sprintf("%d", ledger), Flow: fmt.Sprintf("%d", flow)})
-		}
-	}
-	addStr("account", r.Account, e.Account)
-	addStr("asset", r.Asset, e.Asset)
-	addInt("amount", r.Amount, e.Amount)
-	addInt("fee", r.Fee, e.Fee)
-	addInt("charged", r.Charged, e.Charged)
-	addStr("settlement_id", r.SettlementID, e.SettlementID)
 	return diffs
 }
 
