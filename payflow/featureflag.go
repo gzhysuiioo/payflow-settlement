@@ -251,80 +251,145 @@ func MarshalResult(r EvalResult) ([]byte, error) {
 	return bytes.TrimRight(buf.Bytes(), "\n"), nil
 }
 
-// --- strict parsing helpers -------------------------------------------------
+// --- strict JSON scanning ---------------------------------------------------
+//
+// 非法 Unicode 转义检查与重复字段检查都在解码前按原文顺序遍历 JSON，并把每个
+// 值定位到“来源标识 + 完整字段位置”（对象层级、数组下标、字段路径）。容器栈
+// 与路径推进规则只在 jsonLocation 中维护一份：两个检查各自选择合适的令牌化
+// 方式（重复字段用 encoding/json 令牌流，非法转义用字节扫描），复用同一套
+// 定位规则，以后调整错误定位时不必同时改两处。
+
+// jsonContainer 是遍历过程中一层容器的定位状态。
+type jsonContainer struct {
+	path      string // 该容器本身的完整位置，如 config.flags[0].rules
+	object    bool   // true 为对象，false 为数组
+	lastKey   string // 对象内最近一个字段的解码后字段名
+	expectKey bool   // 对象的下一个字符串 token 是否是字段名
+	nextIndex int    // 数组下一个元素的下标
+}
+
+// jsonLocation 在一遍 JSON 遍历中维护容器栈与字段/数组位置。它只负责定位，
+// 不关心令牌如何切出：两个预解码检查分别用 json.Decoder 令牌流与字节扫描
+// 驱动同一组方法。
+type jsonLocation struct {
+	label string // 根位置前缀，即来源标识（"config" 或 "context"）
+	stack []*jsonContainer
+}
+
+// openContainer 在遇到 '{' 或 '[' 时入栈，新容器路径取父容器中下一个值的位置。
+func (l *jsonLocation) openContainer(object bool) {
+	path := l.label
+	if len(l.stack) > 0 {
+		path = l.nextValuePath()
+	}
+	l.stack = append(l.stack, &jsonContainer{path: path, object: object, expectKey: object})
+}
+
+// closeContainer 在遇到 '}' 或 ']' 时出栈；整个容器本身也是父容器的一个值。
+func (l *jsonLocation) closeContainer() {
+	if len(l.stack) > 0 {
+		l.stack = l.stack[:len(l.stack)-1]
+	}
+	l.valueDone()
+}
+
+// nextValuePath 返回栈顶容器中下一个值的完整位置：对象内为 path.key，数组内
+// 为 path[index]；栈为空（根值）时返回来源标识。
+func (l *jsonLocation) nextValuePath() string {
+	if len(l.stack) == 0 {
+		return l.label
+	}
+	top := l.stack[len(l.stack)-1]
+	if top.object {
+		return top.path + "." + top.lastKey
+	}
+	return top.path + "[" + strconv.Itoa(top.nextIndex) + "]"
+}
+
+// containerPath 返回栈顶容器自身的路径；字段名中的错误要指向所属对象。
+func (l *jsonLocation) containerPath() string {
+	if len(l.stack) == 0 {
+		return l.label
+	}
+	return l.stack[len(l.stack)-1].path
+}
+
+// valueDone 在一个字段值或数组元素完成后推进容器状态：对象转入等待下一个
+// 字段名，数组推进元素下标。
+func (l *jsonLocation) valueDone() {
+	if len(l.stack) == 0 {
+		return
+	}
+	top := l.stack[len(l.stack)-1]
+	if top.object {
+		top.expectKey = true
+	} else {
+		top.nextIndex++
+	}
+}
+
+// atKey 报告栈顶是否处于“等待字段名”状态。
+func (l *jsonLocation) atKey() bool {
+	if len(l.stack) == 0 {
+		return false
+	}
+	top := l.stack[len(l.stack)-1]
+	return top.object && top.expectKey
+}
+
+// fieldName 登记刚扫到的字段名并转入等待字段值状态，返回所属对象的路径。
+// decodedOK 为 false 时（字节扫描遇到解码失败的字段名）保留原字段名，具体
+// 语法错误留给后续解码报告。
+func (l *jsonLocation) fieldName(decoded string, decodedOK bool) string {
+	top := l.stack[len(l.stack)-1]
+	if decodedOK {
+		top.lastKey = decoded
+	}
+	top.expectKey = false
+	return top.path
+}
 
 // rejectDuplicateFields 按文件原文顺序扫描 JSON 令牌流，拒绝任何在同一对象内
 // 重复声明的字段名。字段名按解码后的字符串比较（"enabled" 与 "énabled"
 // 同名），大小写不同仍是不同字段，名字中的空白不裁剪。检查覆盖所有对象，
-// 包括附加字段里嵌套的对象；数组元素不属于这一检查。label 是根对象的位置
-// 前缀（"config" 或 "context"）。JSON 语法错误不在此报告，留给 Unmarshal。
+// 包括附加字段里嵌套的对象与数组中的对象；数组元素不属于这一检查。label 是
+// 根位置前缀（"config" 或 "context"）。JSON 语法错误不在此报告，留给解码。
 func rejectDuplicateFields(raw []byte, label string) error {
 	dec := json.NewDecoder(bytes.NewReader(raw))
-	type frame struct {
-		path      string
-		object    bool
-		keys      map[string]struct{}
-		lastKey   string
-		expectKey bool
-		nextIndex int
-	}
-	var stack []*frame
-	// valueDone 在栈顶容器完成一个值（对象的一个字段值或数组的一个元素）后调用。
-	valueDone := func() {
-		if len(stack) == 0 {
-			return
-		}
-		top := stack[len(stack)-1]
-		if top.object {
-			top.expectKey = true
-		} else {
-			top.nextIndex++
-		}
-	}
-	childPath := func() string {
-		top := stack[len(stack)-1]
-		if top.object {
-			return top.path + "." + top.lastKey
-		}
-		return top.path + "[" + strconv.Itoa(top.nextIndex) + "]"
-	}
+	loc := &jsonLocation{label: label}
+	// 各对象容器已见字段名集合，以容器路径为键（同一文档内对象路径唯一）。
+	seen := map[string]map[string]struct{}{}
 	for {
 		tok, err := dec.Token()
 		if err != nil {
-			// io.EOF 或语法错误；语法错误由后续 Unmarshal 报告。
+			// io.EOF 或语法错误；语法错误由后续解码报告。
 			break
 		}
 		switch t := tok.(type) {
 		case json.Delim:
 			switch t {
 			case '{', '[':
-				path := label
-				if len(stack) > 0 {
-					path = childPath()
-				}
-				f := &frame{path: path, object: t == '{', expectKey: true}
-				if f.object {
-					f.keys = make(map[string]struct{})
-				}
-				stack = append(stack, f)
+				loc.openContainer(t == '{')
 			case '}', ']':
-				stack = stack[:len(stack)-1]
-				valueDone()
+				loc.closeContainer()
 			}
 		case string:
-			if len(stack) > 0 && stack[len(stack)-1].object && stack[len(stack)-1].expectKey {
-				top := stack[len(stack)-1]
-				if _, dup := top.keys[t]; dup {
-					return fmt.Errorf("%s.%s: duplicate field %q", top.path, t, t)
+			if loc.atKey() {
+				containerPath := loc.fieldName(t, true)
+				keys := seen[containerPath]
+				if keys == nil {
+					keys = map[string]struct{}{}
+					seen[containerPath] = keys
 				}
-				top.keys[t] = struct{}{}
-				top.lastKey = t
-				top.expectKey = false
+				if _, dup := keys[t]; dup {
+					return fmt.Errorf("%s.%s: duplicate field %q", containerPath, t, t)
+				}
+				keys[t] = struct{}{}
 			} else {
-				valueDone()
+				loc.valueDone()
 			}
 		default:
-			valueDone()
+			loc.valueDone()
 		}
 	}
 	return nil
@@ -336,82 +401,42 @@ func rejectDuplicateFields(raw []byte, label string) error {
 // 输入与真正的 "�" 被当作相同字符串参与求值，或让字段名在替换后被误判为重复，
 // 因此必须在解码前按原文拒绝。检查覆盖字段名与所有字符串值（包括规则的比较值、
 // in 列表元素以及附加字段里的字符串），一个文件有多个问题时报告原文中最先出现
-// 的一处。label 是根对象的位置前缀（"config" 或 "context"）。JSON 语法错误
-// 不在此报告，留给 Unmarshal。
+// 的一处。label 是根位置前缀（"config" 或 "context"）。JSON 语法错误不在此
+// 报告，留给解码。
 func rejectInvalidUnicodeEscapes(raw []byte, label string) error {
-	type frame struct {
-		path      string
-		object    bool
-		lastKey   string
-		expectKey bool
-		nextIndex int
-	}
-	var stack []*frame
-	valueDone := func() {
-		if len(stack) == 0 {
-			return
-		}
-		top := stack[len(stack)-1]
-		if top.object {
-			top.expectKey = true
-		} else {
-			top.nextIndex++
-		}
-	}
-	childPath := func() string {
-		top := stack[len(stack)-1]
-		if top.object {
-			return top.path + "." + top.lastKey
-		}
-		return top.path + "[" + strconv.Itoa(top.nextIndex) + "]"
-	}
+	loc := &jsonLocation{label: label}
 	i := 0
 	for i < len(raw) {
 		c := raw[i]
 		switch {
 		case c == '{' || c == '[':
-			path := label
-			if len(stack) > 0 {
-				path = childPath()
-			}
-			stack = append(stack, &frame{path: path, object: c == '{', expectKey: c == '{'})
+			loc.openContainer(c == '{')
 			i++
 		case c == '}' || c == ']':
-			if len(stack) > 0 {
-				stack = stack[:len(stack)-1]
-			}
-			valueDone()
+			loc.closeContainer()
 			i++
 		case c == '"':
 			end := jsonStringEnd(raw, i)
 			contentEnd := end
 			if contentEnd > i+1 && raw[contentEnd-1] == '"' {
-				contentEnd-- // 去掉右引号；未终止的字符串留给 Unmarshal 报告
+				contentEnd-- // 去掉右引号；未终止的字符串留给解码阶段报告
 			}
 			content := raw[i+1 : contentEnd]
 			if bad := findBadUnicodeEscape(content); bad != nil {
-				if len(stack) > 0 && stack[len(stack)-1].object && stack[len(stack)-1].expectKey {
-					top := stack[len(stack)-1]
+				if loc.atKey() {
 					return fmt.Errorf("%s: field name %q contains invalid Unicode escape %s: Unicode escape does not form a complete character (%s)",
-						top.path, string(content), bad.escape, bad.detail)
-				}
-				path := label
-				if len(stack) > 0 {
-					path = childPath()
+						loc.containerPath(), string(content), bad.escape, bad.detail)
 				}
 				return fmt.Errorf("%s: invalid Unicode escape %s: Unicode escape does not form a complete character (%s)",
-					path, bad.escape, bad.detail)
+					loc.nextValuePath(), bad.escape, bad.detail)
 			}
-			if len(stack) > 0 && stack[len(stack)-1].object && stack[len(stack)-1].expectKey {
-				top := stack[len(stack)-1]
+			if loc.atKey() {
 				var key string
-				// 转义已校验合法，解码用于定位路径；失败说明是语法错误，留给 Unmarshal。
-				if err := json.Unmarshal(raw[i:end], &key); err == nil {
-					top.lastKey = key
-				}
-				top.expectKey = false
+				// 转义已校验合法，解码用于定位路径；失败说明是语法错误，留给解码。
+				err := json.Unmarshal(raw[i:end], &key)
+				loc.fieldName(key, err == nil)
 			} else {
-				valueDone()
+				loc.valueDone()
 			}
 			i = end
 		case c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == ':' || c == ',':
@@ -421,7 +446,7 @@ func rejectInvalidUnicodeEscapes(raw []byte, label string) error {
 			for i < len(raw) && !isJSONStructural(raw[i]) {
 				i++
 			}
-			valueDone()
+			loc.valueDone()
 		}
 	}
 	return nil
