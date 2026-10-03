@@ -127,6 +127,69 @@ func TestCLIEvaluateRepeatedIsStable(t *testing.T) {
 	}
 }
 
+func TestCLILoneSurrogateFails(t *testing.T) {
+	cases := []struct {
+		name    string
+		config  string
+		context string
+		wantSub []string
+	}{
+		{
+			"context lone high surrogate vs literal replacement char",
+			// 规则要求属性值等于真正的 "�"；上下文提供 "\uD800" 不得被替换后命中。
+			`{"flags":[{"key":"f","enabled":true,"default":false,"rules":[
+				{"id":"r","value":true,"conditions":[{"attribute":"plan","op":"eq","value":"�"}]}]}]}`,
+			`{"plan":"\uD800"}`,
+			[]string{"context.plan", "complete character"},
+		},
+		{
+			"config lone low surrogate in rule value",
+			`{"flags":[{"key":"f","enabled":true,"default":false,"rules":[
+				{"id":"r","value":true,"conditions":[{"attribute":"plan","op":"eq","value":"\uDC00"}]}]}]}`,
+			`{}`,
+			[]string{"config.flags[0].rules[0].conditions[0].value", "complete character"},
+		},
+		{
+			"config bad escape in unselected flag",
+			`{"flags":[
+				{"key":"good","enabled":true,"default":false,"rules":[]},
+				{"key":"bad","enabled":true,"default":false,"rules":[
+					{"id":"r","value":true,"conditions":[{"attribute":"a","op":"eq","value":"\uD800"}]}]}]}`,
+			`{}`,
+			[]string{"config.flags[1]", "complete character"},
+		},
+		{
+			"config bad escape in field name",
+			`{"flags":[{"key":"f","enabled":true,"default":false,"rules":[],"meta\uD800":1}]}`,
+			`{}`,
+			[]string{"config.flags[0]", `\uD800`, "field name"},
+		},
+		{
+			"context bad escape in field name",
+			validConfig,
+			`{"plan\uD800":"pro"}`,
+			[]string{"context", `\uD800`, "field name"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t, tc.config, tc.context)
+			code := run(h.evalArgs("f"), &h.stdout, &h.stderr)
+			if code == 0 {
+				t.Fatalf("expected non-zero exit, stdout=%q", h.stdout.String())
+			}
+			if h.stdout.Len() != 0 {
+				t.Fatalf("stdout must be empty on error, got: %q", h.stdout.String())
+			}
+			for _, sub := range tc.wantSub {
+				if !strings.Contains(h.stderr.String(), sub) {
+					t.Fatalf("stderr=%q, want substring %q", h.stderr.String(), sub)
+				}
+			}
+		})
+	}
+}
+
 func TestCLIErrorCases(t *testing.T) {
 	goodCfg := validConfig
 	goodCtx := `{}`

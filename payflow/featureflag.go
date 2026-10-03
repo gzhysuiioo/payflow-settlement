@@ -99,6 +99,9 @@ func ParseConfig(raw []byte) (*Config, error) {
 	if !utf8.Valid(raw) {
 		return nil, fmt.Errorf("config: file is not valid UTF-8")
 	}
+	if err := validateUnicodeEscapes(raw, "config"); err != nil {
+		return nil, err
+	}
 	if err := rejectDuplicateFields(raw, "config"); err != nil {
 		return nil, err
 	}
@@ -141,6 +144,9 @@ func ParseConfig(raw []byte) (*Config, error) {
 func ParseContext(raw []byte) (*Context, error) {
 	if !utf8.Valid(raw) {
 		return nil, fmt.Errorf("context: file is not valid UTF-8")
+	}
+	if err := validateUnicodeEscapes(raw, "context"); err != nil {
+		return nil, err
 	}
 	if err := rejectDuplicateFields(raw, "context"); err != nil {
 		return nil, err
@@ -246,6 +252,168 @@ func MarshalResult(r EvalResult) ([]byte, error) {
 }
 
 // --- strict parsing helpers -------------------------------------------------
+
+// validateUnicodeEscapes 按原文顺序扫描 JSON 文本里的每个字符串字面量（字段名与
+// 字符串值），拒绝无法组成完整字符的 Unicode 转义：孤立的高代理项、孤立的低代理项，
+// 以及不完整或顺序错误的代理项对。encoding/json 会把这类转义静默替换成 U+FFFD，
+// 使 "\uD800" 与真正的 "�" 无法区分、不同的坏字段名解码后撞名被误报重复，因此
+// 必须在解码与重复字段检查之前基于原文检查。正确配对的转义、直接写出的 "�" 与
+// 等价的 "\uFFFD" 转义、以及 "\\uD800" 这类反斜杠转义后的普通文本都合法。
+// label 是根对象的位置前缀（"config" 或 "context"）。JSON 语法错误（如
+// \u 后不足 4 位十六进制）不在此报告，留给 Unmarshal。
+func validateUnicodeEscapes(raw []byte, label string) error {
+	type frame struct {
+		path      string
+		object    bool
+		expectKey bool
+		nextIndex int
+		lastKey   string
+	}
+	var stack []*frame
+	childPath := func() string {
+		if len(stack) == 0 {
+			return label
+		}
+		top := stack[len(stack)-1]
+		if top.object {
+			return top.path + "." + top.lastKey
+		}
+		return top.path + "[" + strconv.Itoa(top.nextIndex) + "]"
+	}
+	i := 0
+	for i < len(raw) {
+		switch c := raw[i]; c {
+		case '{', '[':
+			stack = append(stack, &frame{path: childPath(), object: c == '{', expectKey: true})
+			i++
+		case '}', ']':
+			if len(stack) > 0 {
+				stack = stack[:len(stack)-1]
+			}
+			i++
+		case ',':
+			if len(stack) > 0 {
+				top := stack[len(stack)-1]
+				if top.object {
+					top.expectKey = true
+				} else {
+					top.nextIndex++
+				}
+			}
+			i++
+		case '"':
+			end, bad := scanStringEscapes(raw, i)
+			if end < 0 {
+				// 字符串未闭合：语法错误留给 Unmarshal 报告。
+				return nil
+			}
+			isKey := len(stack) > 0 && stack[len(stack)-1].object && stack[len(stack)-1].expectKey
+			if bad != "" {
+				if isKey {
+					return fmt.Errorf("%s: field name %s: invalid Unicode escape %s: escape does not form a complete character",
+						stack[len(stack)-1].path, quoteRawFieldName(raw[i+1:end-1]), bad)
+				}
+				return fmt.Errorf("%s: invalid Unicode escape %s: escape does not form a complete character", childPath(), bad)
+			}
+			if isKey {
+				top := stack[len(stack)-1]
+				var name string
+				if err := json.Unmarshal(raw[i:end], &name); err == nil {
+					top.lastKey = name
+				}
+				top.expectKey = false
+			}
+			i = end
+		default:
+			i++
+		}
+	}
+	return nil
+}
+
+// scanStringEscapes 从 raw[start]（必须是 '"'）扫描一个字符串字面量，返回闭引号
+// 之后的位置与第一个无法组成完整字符的 Unicode 转义原文（无问题为空串）。发现坏
+// 转义后仍扫描到字符串结束，保证 end 有效。字符串未闭合时 end=-1，语法问题留给
+// json.Unmarshal 报告。
+func scanStringEscapes(raw []byte, start int) (end int, bad string) {
+	j := start + 1
+	for j < len(raw) {
+		switch raw[j] {
+		case '"':
+			return j + 1, bad
+		case '\\':
+			if j+1 >= len(raw) {
+				return -1, bad
+			}
+			if raw[j+1] != 'u' {
+				// 包括 \\：反斜杠转义后的 uD800 只是普通文本。
+				j += 2
+				continue
+			}
+			r, ok := hex4(raw, j+2)
+			if !ok {
+				// \u 后不是 4 位十六进制：JSON 语法错误，留给 Unmarshal。
+				j += 2
+				continue
+			}
+			switch {
+			case r >= 0xD800 && r <= 0xDBFF:
+				// 高代理项必须紧跟一个 \uDC00–\uDFFF 的低代理项转义。
+				if j+12 <= len(raw) && raw[j+6] == '\\' && raw[j+7] == 'u' {
+					if r2, ok2 := hex4(raw, j+8); ok2 && r2 >= 0xDC00 && r2 <= 0xDFFF {
+						j += 12
+						continue
+					}
+				}
+				if bad == "" {
+					bad = string(raw[j : j+6])
+				}
+			case r >= 0xDC00 && r <= 0xDFFF:
+				if bad == "" {
+					bad = string(raw[j : j+6])
+				}
+			}
+			j += 6
+		default:
+			j++
+		}
+	}
+	return -1, bad
+}
+
+// hex4 读取 4 位十六进制数字；不足 4 位或含非十六进制字符时 ok=false。
+func hex4(raw []byte, i int) (r rune, ok bool) {
+	if i+4 > len(raw) {
+		return 0, false
+	}
+	var v uint32
+	for k := 0; k < 4; k++ {
+		c := raw[i+k]
+		var d byte
+		switch {
+		case c >= '0' && c <= '9':
+			d = c - '0'
+		case c >= 'a' && c <= 'f':
+			d = c - 'a' + 10
+		case c >= 'A' && c <= 'F':
+			d = c - 'A' + 10
+		default:
+			return 0, false
+		}
+		v = v<<4 | uint32(d)
+	}
+	return rune(v), true
+}
+
+// quoteRawFieldName 以原文形式引用字段名（保留 \u 转义以便辨认），过长时截断。
+func quoteRawFieldName(name []byte) string {
+	const max = 80
+	s := string(name)
+	if len(s) > max {
+		s = s[:max] + "..."
+	}
+	return strconv.Quote(s)
+}
 
 // rejectDuplicateFields 按文件原文顺序扫描 JSON 令牌流，拒绝任何在同一对象内
 // 重复声明的字段名。字段名按解码后的字符串比较（"enabled" 与 "énabled"
