@@ -197,50 +197,44 @@ func ParseContext(raw []byte) (*Context, error) {
 	if !ok {
 		return nil, fmt.Errorf("context: top level must be a JSON object")
 	}
-	// 值类型必须按原文顺序逐个判定：Go map 的遍历顺序不稳定，不能直接
-	// range root，否则同一文件在不同运行中可能报告不同属性。对象或数组
-	// 值整体算所属顶层属性的一个值，错误不指向其内部成员。
-	if err := checkContextValueTypes(raw); err != nil {
-		return nil, err
-	}
-	ctx := &Context{values: make(map[string]string, len(root))}
-	for k, v := range root {
-		// 经过 checkContextValueTypes 后所有值都是字符串；数字（含超出浮点
-		// 范围的 json.Number）、布尔、null、对象、数组都已按所属属性报错。
-		ctx.values[k] = v.(string)
-	}
-	return ctx, nil
+	// 语法校验通过后才建立可用属性：值类型检查与属性建立在同一次遍历中完成。
+	return buildContext(raw, root)
 }
 
-// checkContextValueTypes 按文件原文顺序扫描已通过语法与重复字段检查的
-// context 对象，报告第一个值不是字符串的顶层属性。键名使用解码后的文字
-// （合法的 \uXXXX 转义与直接字符同义；大小写与空白按原样保留）。嵌套
-// 对象或数组整体跳过，其内部成员不单独检查。
-func checkContextValueTypes(raw []byte) error {
+// buildContext 按文件原文顺序做一次流式遍历，同时完成顶层属性的值类型检查
+// 与可用属性的建立：字段名顺序取自令牌流（Go map 的遍历顺序不稳定，不能
+// 直接 range root，否则同一文件在不同运行中可能报告不同属性），属性值复用
+// 严格解码得出的 root——同一份上下文的值只解码一次。语法、重复字段与 Unicode
+// 转义已在此前校验，这里的令牌读取不会再遇到错误。键名使用解码后的文字
+// （合法的 \uXXXX 转义与直接字符同义；大小写与空白按原样保留）。对象或数组
+// 值整体算所属顶层属性的一个值，错误不指向其内部成员。
+func buildContext(raw []byte, root map[string]any) (*Context, error) {
 	dec := json.NewDecoder(bytes.NewReader(raw))
-	// UseNumber：数字按 json.Number 原样保留而不转 float64，使超出浮点范围
-	// 的合法数字（如 1e400）也能落到“值必须是字符串”的属性类型错误，而不是
-	// 在解码阶段被报成 JSON 语法问题。
-	dec.UseNumber()
-	// 第一个令牌必须是顶层对象的 '{'；非对象的情形在 ParseContext 中报告。
-	if tok, err := dec.Token(); err != nil || tok != json.Delim('{') {
-		return nil
+	// 消费顶层对象的 '{'；语法已由 unmarshalStrictJSON 校验。
+	if _, err := dec.Token(); err != nil {
+		return nil, fmt.Errorf("context: invalid JSON: %w", err)
 	}
+	ctx := &Context{values: make(map[string]string, len(root))}
 	for dec.More() {
 		keyTok, err := dec.Token()
 		if err != nil {
-			return nil // 语法错误留给严格解码的报错
+			return nil, fmt.Errorf("context: invalid JSON: %w", err)
 		}
 		key, _ := keyTok.(string)
-		var value any
-		if err := dec.Decode(&value); err != nil {
-			return nil // 语法错误留给严格解码的报错
+		// 值不再重复解码：RawMessage 只把读取位置推进到下一个字段，
+		// 实际值取自已严格解码的 root。数字（含超出浮点范围的 json.Number）、
+		// 布尔、null、对象、数组都在这里按所属属性报类型错误。
+		var skipped json.RawMessage
+		if err := dec.Decode(&skipped); err != nil {
+			return nil, fmt.Errorf("context: invalid JSON: %w", err)
 		}
-		if _, ok := value.(string); !ok {
-			return fmt.Errorf("%s: value must be a string", appendFieldPath("context", key))
+		s, ok := root[key].(string)
+		if !ok {
+			return nil, fmt.Errorf("%s: value must be a string", appendFieldPath("context", key))
 		}
+		ctx.values[key] = s
 	}
-	return nil
+	return ctx, nil
 }
 
 // Get looks up an attribute; an empty string is a legal value.
