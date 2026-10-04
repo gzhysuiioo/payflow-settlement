@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -644,7 +643,10 @@ func (l *Ledger) Submit(batch FeeBatch) (*BatchResult, error) {
 	l.reg.mu.Lock()
 	defer l.reg.mu.Unlock()
 
-	results := l.runBatch(batch, limits, l.reg.state, true)
+	// 真实提交：规则引擎逐项判定，可成功项由 persistingSink 原子落盘；
+	// 保存失败只回滚该项并报告 storage_error，前项成功保留、后项继续。
+	engine := newPaymentEngine(batch.FeeBps, limits, newPersistingSink(l, l.reg.state))
+	results := engine.process(batch.Intents)
 	return &BatchResult{Results: results}, nil
 }
 
@@ -678,8 +680,11 @@ func (l *Ledger) Preview(batch FeeBatch) (*PreviewResult, error) {
 	defer l.reg.mu.Unlock()
 
 	// 在快照副本上模拟：预览结束后真实状态与磁盘文件保持原样。
+	// previewSink 只推进副本内存状态、绝不落盘，因此结果中不会出现
+	// storage_error；规则流水线与真实提交完全相同。
 	sim := cloneState(l.reg.state)
-	results := l.runBatch(batch, limits, sim, false)
+	engine := newPaymentEngine(batch.FeeBps, limits, newPreviewSink(sim))
+	results := engine.process(batch.Intents)
 	return &PreviewResult{DryRun: true, Results: results}, nil
 }
 
@@ -691,175 +696,6 @@ func validateBatch(batch FeeBatch) (map[balanceKey]int64, error) {
 	}
 	// 限额非法是批次级错误：任何意图都不执行（空意图列表同样检查）。
 	return validateLimits(batch.Limits)
-}
-
-// runBatch 按输入顺序在给定状态 st 上处理整个批次，返回逐项结果。
-// persist 为 true 时（真实提交）每笔预计成功都先写入 st 再原子落盘，
-// 落盘失败回滚该项并报告 storage_error；为 false 时（预览）只在 st
-// （应为独立副本）上推进内存状态、绝不触碰磁盘，因此不会产生存储错误。
-// 调用方必须持有 reg.mu。
-func (l *Ledger) runBatch(batch FeeBatch, limits map[balanceKey]int64, st *ledgerState, persist bool) []ItemResult {
-	out := make([]ItemResult, 0, len(batch.Intents))
-
-	// 本次批次内各组合已消耗的额度，从零开始，仅预计成功的扣款计入。
-	used := make(map[balanceKey]int64, len(limits))
-
-	for i := range batch.Intents {
-		it := &batch.Intents[i]
-		res := ItemResult{ID: it.ID}
-
-		// 1. 参数校验。未通过的编号不占用去重资格。
-		amount, reason, ok := validateIntent(*it)
-		if !ok {
-			res.Status = StatusInvalid
-			res.Reason = reason
-			out = append(out, res)
-			continue
-		}
-
-		// 2. 已成功编号：字段与费率完全一致则幂等返回原记录；
-		//    任一不同则编号冲突。两者都不再扣款、不改原记录。
-		//    本批次内先（预计）成功的同编号项也在此被看到。
-		if rec, exists := findRecordIn(st.Settlements, it.ID); exists {
-			if sameRequest(rec, it, amount, batch.FeeBps) {
-				cp := rec
-				res.Status = StatusDuplicate
-				res.Reason = reasonDuplicate
-				res.Record = &cp
-			} else {
-				res.Status = StatusConflict
-				res.Reason = reasonConflict
-			}
-			out = append(out, res)
-			continue
-		}
-
-		// 3. 状态错误单独报告（不占用去重资格，之后可重新提交）。
-		if it.State != "" && it.State != "pending" {
-			res.Status = StatusState
-			res.Reason = reasonNotPending
-			out = append(out, res)
-			continue
-		}
-
-		// 4. 手续费与扣款总额（溢出明确按参数错误拒绝）。
-		fee := feeFor(amount, batch.FeeBps)
-		if fee > math.MaxInt64-amount {
-			res.Status = StatusInvalid
-			res.Reason = reasonOverflow
-			out = append(out, res)
-			continue
-		}
-		total := amount + fee
-
-		key := balanceKey{it.Account, it.Asset}
-
-		// 5. 本次批次限额（先于余额判断：同时超限与余额不足时报告超限）。
-		//    恰好达到上限仍允许；用 total > max-used 而非 used+total > max，
-		//    避免累计接近 int64 上界时溢出放行。失败不消耗额度。
-		if max, capped := limits[key]; capped {
-			if u := used[key]; total > max-u {
-				res.Status = StatusLimitExceeded
-				res.Reason = fmt.Sprintf(reasonLimitExceeded, it.Account, it.Asset, max, u, total)
-				out = append(out, res)
-				continue
-			}
-		}
-
-		// 6. 余额校验。不存在的账户/资产组合余额视为 0（不足）。
-		bal := st.Balances[key]
-		if total > bal {
-			res.Status = StatusFunds
-			res.Reason = reasonFunds
-			out = append(out, res)
-			continue
-		}
-
-		// 7. 预计成功：构造记录（序号按当前模拟历史长度连续递增）。
-		rec := Record{
-			ID:        it.ID,
-			Account:   it.Account,
-			Paymaster: it.Paymaster,
-			Asset:     it.Asset,
-			Amount:    amount,
-			Nonce:     it.Nonce,
-			FeeBps:    batch.FeeBps,
-			Fee:       fee,
-			Charged:   total,
-			Seq:       int64(len(st.Settlements)) + 1,
-		}
-
-		if persist {
-			// 真实提交：先在内存生效，再原子持久化；保存失败回滚该项，
-			// 不留成功记录、不占额度。
-			rollback := stageOn(st, key, bal-total, rec)
-			if err := l.persistLocked(); err != nil {
-				rollback()
-				res.Status = StatusStorage
-				res.Reason = err.Error()
-				out = append(out, res)
-				continue
-			}
-		} else {
-			// 预览：只推进副本状态，绝不落盘。
-			st.Balances[key] = bal - total
-			st.Settlements = append(st.Settlements, rec)
-		}
-
-		// 只有（预计）成功的扣款消耗额度；预览同样如此。
-		used[key] += total
-		cp := rec
-		res.Status = StatusSettled
-		res.Record = &cp
-		out = append(out, res)
-	}
-	return out
-}
-
-// cloneState 返回账本状态的独立深拷贝，供预览在副本上模拟而不触碰真实状态。
-func cloneState(st *ledgerState) *ledgerState {
-	cp := &ledgerState{
-		Version:     st.Version,
-		Initial:     make(map[balanceKey]int64, len(st.Initial)),
-		Balances:    make(map[balanceKey]int64, len(st.Balances)),
-		Settlements: append([]Record(nil), st.Settlements...),
-		Refunds:     append([]RefundRecord(nil), st.Refunds...),
-	}
-	for k, v := range st.Initial {
-		cp.Initial[k] = v
-	}
-	for k, v := range st.Balances {
-		cp.Balances[k] = v
-	}
-	return cp
-}
-
-// findRecordIn 在给定结算历史中按编号查找成功记录。
-func findRecordIn(records []Record, id string) (Record, bool) {
-	// 记录按成功顺序追加且 ID 唯一；单机账本量级直接扫描。
-	for _, r := range records {
-		if r.ID == id {
-			return r, true
-		}
-	}
-	return Record{}, false
-}
-
-// stageOn 在指定状态上应用一笔扣款与记录，返回回滚函数（恢复该项执行前的
-// 余额与记录长度）。
-func stageOn(st *ledgerState, key balanceKey, newBal int64, rec Record) func() {
-	oldBal, hadKey := st.Balances[key]
-	oldLen := len(st.Settlements)
-	st.Balances[key] = newBal
-	st.Settlements = append(st.Settlements, rec)
-	return func() {
-		if hadKey {
-			st.Balances[key] = oldBal
-		} else {
-			delete(st.Balances, key)
-		}
-		st.Settlements = st.Settlements[:oldLen]
-	}
 }
 
 // Refund 按输入顺序处理一个退款批次。各项独立处理：后项能看到前项成功退回的
@@ -1028,16 +864,6 @@ func (l *Ledger) findRecord(id string) (Record, bool) {
 		}
 	}
 	return Record{}, false
-}
-
-// sameRequest 比较全部付款字段与费率。付款字段：账户、付款方、资产、金额、nonce。
-func sameRequest(r Record, it *PaymentIntent, amount int64, feeBps int) bool {
-	return r.Account == it.Account &&
-		r.Paymaster == it.Paymaster &&
-		r.Asset == it.Asset &&
-		r.Amount == amount &&
-		r.Nonce == it.Nonce &&
-		r.FeeBps == feeBps
 }
 
 // Query 返回余额视图（按账户、资产排序，保证确定性）与按成功先后排列的记录。

@@ -601,6 +601,48 @@ func TestStorageFailureRollsBackItemOnly(t *testing.T) {
 	}
 }
 
+// 规格示例：余额与批次上限都为 100、费率为零。首项付款 70 保存失败后，
+// 后项付款 60 仍能成功（失败项回滚余额、历史且不占额度与编号）；最终只
+// 留下后一笔记录，余额为 40。
+func TestStorageFailureExampleRestoresBalanceQuotaAndSeq(t *testing.T) {
+	path := newTestLedger(t, []BalanceInit{{Account: "aa", Asset: "usdc", Balance: 100}})
+	l := openOrFail(t, path)
+	SetFailHook(l, &failOnce{remaining: 1}) // 仅首项保存失败
+	t.Cleanup(func() { SetFailHook(l, nil) })
+
+	res, err := l.Submit(FeeBatch{
+		FeeBps:  0,
+		Limits:  []ChargeLimit{limit("aa", "usdc", 100)},
+		Intents: []PaymentIntent{intent("boom", "aa", "usdc", 70), intent("ok", "aa", "usdc", 60)},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{StatusStorage, StatusSettled}
+	if got := statuses(res); fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("statuses=%v want %v", got, want)
+	}
+	if r := res.Results[1]; r.Record == nil || r.Record.Seq != 1 || r.Record.Charged != 60 {
+		t.Fatalf("later item must take seq 1 with charged 60: %+v", r.Record)
+	}
+	if bal, _ := l.Balance("aa", "usdc"); bal != 40 {
+		t.Fatalf("balance=%d want 40", bal)
+	}
+	snap, _ := l.Query()
+	if len(snap.Settlements) != 1 || snap.Settlements[0].ID != "ok" {
+		t.Fatalf("only the later record must remain: %+v", snap.Settlements)
+	}
+
+	// 失败编号未占用，且额度按批次从零：下一批次可用该编号再次付款。
+	retry, _ := l.Submit(FeeBatch{FeeBps: 0, Intents: []PaymentIntent{intent("boom", "aa", "usdc", 40)}})
+	if retry.Results[0].Status != StatusSettled || retry.Results[0].Record.Seq != 2 {
+		t.Fatalf("failed id must be reusable: %+v", retry.Results[0])
+	}
+	if bal, _ := l.Balance("aa", "usdc"); bal != 0 {
+		t.Fatalf("balance after retry=%d want 0", bal)
+	}
+}
+
 func TestStorageFailureLeavesOldFileIntact(t *testing.T) {
 	path := newTestLedger(t, []BalanceInit{{Account: "aa", Asset: "usdc", Balance: 100}})
 	l := openOrFail(t, path)

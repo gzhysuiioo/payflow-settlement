@@ -158,6 +158,35 @@ func TestPreviewIgnoresStorageFailures(t *testing.T) {
 	}
 }
 
+// 规格示例的预览面：即使真实保存会失败（故障注入对持久化恒失败），预览仍只
+// 按当前账本报告业务结果——首项预计成功，后项在已用 70 额度下超限——绝不
+// 出现 storage_error，也不改变真实余额与历史。
+func TestPreviewReportsBusinessResultDespitePersistFailure(t *testing.T) {
+	path := newTestLedger(t, []BalanceInit{{Account: "aa", Asset: "usdc", Balance: 100}})
+	l := openOrFail(t, path)
+	SetFailHook(l, &alwaysFailHook{})
+	t.Cleanup(func() { SetFailHook(l, nil) })
+
+	res, err := l.Preview(FeeBatch{
+		FeeBps:  0,
+		Limits:  []ChargeLimit{limit("aa", "usdc", 100)},
+		Intents: []PaymentIntent{intent("p1", "aa", "usdc", 70), intent("p2", "aa", "usdc", 60)},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := previewStatuses(res), []string{StatusSettled, StatusLimitExceeded}; strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("statuses=%v want %v", got, want)
+	}
+	if bal, _ := l.Balance("aa", "usdc"); bal != 100 {
+		t.Fatalf("preview changed balance: %d", bal)
+	}
+	snap, _ := l.Query()
+	if len(snap.Settlements) != 0 {
+		t.Fatalf("preview left records: %+v", snap.Settlements)
+	}
+}
+
 type alwaysFailHook struct{}
 
 func (alwaysFailHook) FailNextPersist() bool { return true }
