@@ -430,6 +430,160 @@ func TestCLIEvaluateBigNumberPrecedenceAndFix(t *testing.T) {
 	}
 }
 
+// TestCLIEvaluateRejectsTrailingContent 验证输入文件必须是一个完整 JSON 文档：
+// 完整对象之后出现第二个顶层值（即使本身合法）、未写完的内容或不能构成 JSON
+// 的字符时，命令非零退出、stdout 为空、stderr 指出是配置还是上下文且说明 JSON
+// 无效。作为第一份文档的 validConfig 与合法上下文自身满足全部字段规则，失败
+// 只能来自文件边界。尾随内容不含重复字段或非法转义，避免触发其他检查。
+func TestCLIEvaluateRejectsTrailingContent(t *testing.T) {
+	goodCtx := `{"plan":"pro","region":"cn"}`
+	trailings := []struct {
+		name   string
+		suffix string
+	}{
+		{"second object adjacent", `{"x":1}`},
+		{"second object after whitespace", " \t\r\n" + `{"x":1}`},
+		{"array", `["x"]`},
+		{"string", `"extra"`},
+		{"number", `42`},
+		{"true", `true`},
+		{"false", `false`},
+		{"null", `null`},
+		{"incomplete object", `{"x":`},
+		{"unterminated string", `"abc`},
+		{"lone closing brace", `}`},
+		{"non-JSON character", `@`},
+	}
+	for _, tc := range trailings {
+		t.Run("config/"+tc.name, func(t *testing.T) {
+			h := newHarness(t, validConfig+tc.suffix, goodCtx)
+			var stdout, stderr bytes.Buffer
+			if code := run(h.evalArgs("feature-a"), &stdout, &stderr); code == 0 {
+				t.Fatalf("expected non-zero exit, stdout=%q", stdout.String())
+			}
+			if stdout.Len() != 0 {
+				t.Fatalf("stdout must be empty, got %q", stdout.String())
+			}
+			if msg := stderr.String(); !strings.Contains(msg, "config: invalid JSON") {
+				t.Fatalf("stderr=%q, want config invalid JSON", msg)
+			}
+		})
+		t.Run("context/"+tc.name, func(t *testing.T) {
+			h := newHarness(t, validConfig, goodCtx+tc.suffix)
+			var stdout, stderr bytes.Buffer
+			if code := run(h.evalArgs("feature-a"), &stdout, &stderr); code == 0 {
+				t.Fatalf("expected non-zero exit, stdout=%q", stdout.String())
+			}
+			if stdout.Len() != 0 {
+				t.Fatalf("stdout must be empty, got %q", stdout.String())
+			}
+			if msg := stderr.String(); !strings.Contains(msg, "context: invalid JSON") {
+				t.Fatalf("stderr=%q, want context invalid JSON", msg)
+			}
+		})
+	}
+}
+
+func TestCLIEvaluateTrailingContentNotSkippedByOutcome(t *testing.T) {
+	// 请求的开关已关闭、或原本会立即命中规则，都不能跳过对剩余文件内容的检查。
+	goodCtx := `{"plan":"pro","region":"cn"}`
+	for _, tc := range []struct {
+		name string
+		key  string
+	}{
+		{"disabled flag", "feature-b"},
+		{"immediate rule hit", "feature-a"},
+		{"default fallback", "feature-c"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t, validConfig, goodCtx+` {}`)
+			var stdout, stderr bytes.Buffer
+			if code := run(h.evalArgs(tc.key), &stdout, &stderr); code == 0 {
+				t.Fatalf("trailing content must not be skipped, stdout=%q", stdout.String())
+			}
+			if stdout.Len() != 0 {
+				t.Fatalf("stdout must be empty, got %q", stdout.String())
+			}
+			if msg := stderr.String(); !strings.Contains(msg, "context: invalid JSON") {
+				t.Fatalf("stderr=%q, want context invalid JSON", msg)
+			}
+		})
+	}
+}
+
+func TestCLIEvaluateWhitespaceAroundDocument(t *testing.T) {
+	// 文件开头与结尾的空格、制表符、回车、换行不改变求值结果。
+	padded := newHarness(t, " \t\r\n"+validConfig+"\t \r\n", "\n\t "+`{"plan":"pro","region":"cn"}`+" \r\n")
+	plain := newHarness(t, validConfig, `{"plan":"pro","region":"cn"}`)
+	var paddedOut, plainOut bytes.Buffer
+	if code := run(padded.evalArgs("feature-a"), &paddedOut, &bytes.Buffer{}); code != 0 {
+		t.Fatalf("padded input must evaluate: exit=%d", code)
+	}
+	if code := run(plain.evalArgs("feature-a"), &plainOut, &bytes.Buffer{}); code != 0 {
+		t.Fatalf("plain input must evaluate: exit=%d", code)
+	}
+	if paddedOut.String() != plainOut.String() {
+		t.Fatalf("whitespace changed result: %q != %q", paddedOut.String(), plainOut.String())
+	}
+	var got map[string]any
+	if err := json.Unmarshal(paddedOut.Bytes(), &got); err != nil {
+		t.Fatalf("stdout is not a single JSON object: %q (%v)", paddedOut.String(), err)
+	}
+	if got["key"] != "feature-a" || got["value"] != true || got["reason"] != "rule" || got["ruleId"] != "r-pro" {
+		t.Fatalf("unexpected payload: %v", got)
+	}
+}
+
+func TestCLIEvaluateTrailingContentRemovalRestoresEvaluation(t *testing.T) {
+	// 同一份业务输入：上下文带尾随内容时被拒绝；移除后三种求值路径恢复正常——
+	// 首条完整命中规则决定结果、关闭开关固定 false、无命中采用默认值。
+	goodCtx := `{"plan":"pro","region":"cn"}`
+	h := newHarness(t, validConfig, goodCtx+` {"x":1}`)
+	var stdout, stderr bytes.Buffer
+	if code := run(h.evalArgs("feature-a"), &stdout, &stderr); code == 0 {
+		t.Fatal("trailing content must be rejected")
+	}
+
+	h = newHarness(t, validConfig, goodCtx)
+	stdout.Reset()
+	stderr.Reset()
+	if code := run(h.evalArgs("feature-a"), &stdout, &stderr); code != 0 || stderr.Len() != 0 {
+		t.Fatalf("rule hit: exit=%d stderr=%q", code, stderr.String())
+	}
+	var got map[string]any
+	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
+		t.Fatalf("stdout is not a single JSON object: %q (%v)", stdout.String(), err)
+	}
+	if got["key"] != "feature-a" || got["value"] != true || got["reason"] != "rule" || got["ruleId"] != "r-pro" {
+		t.Fatalf("first matching rule must decide: %v", got)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if code := run(h.evalArgs("feature-b"), &stdout, &stderr); code != 0 || stderr.Len() != 0 {
+		t.Fatalf("disabled: exit=%d stderr=%q", code, stderr.String())
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
+		t.Fatalf("disabled output: %q", stdout.String())
+	}
+	if got["value"] != false || got["reason"] != "disabled" || got["ruleId"] != nil {
+		t.Fatalf("disabled flag must stay false: %v", got)
+	}
+
+	h = newHarness(t, validConfig, `{}`)
+	stdout.Reset()
+	stderr.Reset()
+	if code := run(h.evalArgs("feature-c"), &stdout, &stderr); code != 0 || stderr.Len() != 0 {
+		t.Fatalf("default: exit=%d stderr=%q", code, stderr.String())
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
+		t.Fatalf("default output: %q", stdout.String())
+	}
+	if got["value"] != true || got["reason"] != "default" || got["ruleId"] != nil {
+		t.Fatalf("no match must fall back to default: %v", got)
+	}
+}
+
 func TestCLILegacyCommandsPreserved(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	if code := run([]string{"version"}, &stdout, &stderr); code != 0 || strings.TrimSpace(stdout.String()) != "payflow 0.1.0" {

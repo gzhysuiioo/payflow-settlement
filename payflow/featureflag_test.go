@@ -1047,6 +1047,102 @@ func TestValidUnicodeEscapesUnchanged(t *testing.T) {
 	}
 }
 
+// singleDocConfig 与 singleDocContext 自身满足全部字段规则：以它们为第一份
+// 文档的解析失败只能来自文件边界（尾随内容），不会与业务字段错误混淆。
+const singleDocConfig = `{"flags":[
+	{"key":"f","enabled":true,"default":false,"rules":[
+		{"id":"r1","value":true,"conditions":[{"attribute":"plan","op":"eq","value":"pro"}]}]},
+	{"key":"off","enabled":false,"default":true,"rules":[]}]}`
+const singleDocContext = `{"plan":"pro"}`
+
+func TestParseRejectsSecondTopLevelValue(t *testing.T) {
+	// 完整对象之后只允许 JSON 空白；第二个顶层值（即使本身合法）、未写完的
+	// 内容或不能构成 JSON 的字符都必须让整个文件失败，不能只返回前半段的结果。
+	// 尾随内容本身不含重复字段或非法转义，避免触发其他检查而掩盖边界错误。
+	trailings := []struct {
+		name   string
+		suffix string
+	}{
+		{"second object adjacent", `{"x":1}`},
+		{"second object after whitespace", " \t\r\n" + `{"x":1}`},
+		{"array", `["x"]`},
+		{"string", `"extra"`},
+		{"number", `42`},
+		{"true", `true`},
+		{"false", `false`},
+		{"null", `null`},
+		{"incomplete object", `{"x":`},
+		{"unterminated string", `"abc`},
+		{"lone closing brace", `}`},
+		{"non-JSON character", `@`},
+	}
+	for _, tc := range trailings {
+		t.Run("config/"+tc.name, func(t *testing.T) {
+			_, err := ParseConfig([]byte(singleDocConfig + tc.suffix))
+			if err == nil || !strings.Contains(err.Error(), "config: invalid JSON") {
+				t.Fatalf("err=%v, want config invalid JSON", err)
+			}
+		})
+		t.Run("context/"+tc.name, func(t *testing.T) {
+			_, err := ParseContext([]byte(singleDocContext + tc.suffix))
+			if err == nil || !strings.Contains(err.Error(), "context: invalid JSON") {
+				t.Fatalf("err=%v, want context invalid JSON", err)
+			}
+		})
+	}
+}
+
+func TestWhitespaceAroundDocumentIgnored(t *testing.T) {
+	// 文件开头与结尾的空格、制表符、回车、换行不影响解析与求值结果。
+	paddedCfg := " \t\r\n" + singleDocConfig + "\t \r\n"
+	paddedCtx := "\n\t " + singleDocContext + " \r\n"
+	got := eval(t, paddedCfg, "f", paddedCtx)
+	want := eval(t, singleDocConfig, "f", singleDocContext)
+	if !got.Equals(want) {
+		t.Fatalf("padded: got %+v, want %+v", got, want)
+	}
+	id := "r1"
+	if !got.Equals(EvalResult{Key: "f", Value: true, Reason: EvalRule, RuleID: &id}) {
+		t.Fatalf("padded result changed: %+v", got)
+	}
+}
+
+func TestStructuralCharsInsideStringsAreNotSecondDocument(t *testing.T) {
+	// 字符串里的大括号、方括号、转义引号与换行转义是合法内容，
+	// 不能被误判成文档结束后的第二个顶层值。
+	cfg := `{"flags":[{"key":"f","enabled":true,"default":false,"rules":[
+		{"id":"r1","value":true,"conditions":[{"attribute":"a","op":"eq","value":"x}{[\"}\n"}]}]}]}`
+	ctx := `{"a":"x}{[\"}\n","note":"tail } { ] [ \" \n still one doc"}`
+	got := eval(t, cfg, "f", ctx)
+	if got.Reason != EvalRule || !got.Value {
+		t.Fatalf("string content must not end the document: %+v", got)
+	}
+}
+
+func TestTrailingContentRemovalRestoresEvaluation(t *testing.T) {
+	// 同一份业务输入：带尾随内容时整个文件被拒绝；移除后恢复正常求值，
+	// 继续遵守关闭开关固定 false、首条命中规则决定结果、无命中取默认值。
+	if _, err := ParseConfig([]byte(singleDocConfig + ` {}`)); err == nil {
+		t.Fatal("config with trailing content must be rejected")
+	}
+	if _, err := ParseContext([]byte(singleDocContext + ` {}`)); err == nil {
+		t.Fatal("context with trailing content must be rejected")
+	}
+	cfg := mustParseConfig(t, singleDocConfig)
+	ctx := mustParseContext(t, singleDocContext)
+	if got := cfg.Find("off").Evaluate(ctx); got.Reason != EvalDisabled || got.Value {
+		t.Fatalf("disabled flag: %+v", got)
+	}
+	id := "r1"
+	if got := cfg.Find("f").Evaluate(ctx); !got.Equals(EvalResult{Key: "f", Value: true, Reason: EvalRule, RuleID: &id}) {
+		t.Fatalf("first matching rule: %+v", got)
+	}
+	defaultCtx := mustParseContext(t, `{"plan":"free"}`)
+	if got := cfg.Find("f").Evaluate(defaultCtx); got.Reason != EvalDefault || got.Value {
+		t.Fatalf("default fallback: %+v", got)
+	}
+}
+
 func TestEmptyFlagListAndFind(t *testing.T) {
 	cfg := mustParseConfig(t, `{"flags":[]}`)
 	if cfg.Find("missing") != nil {
