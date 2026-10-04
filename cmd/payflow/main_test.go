@@ -430,6 +430,138 @@ func TestCLIEvaluateBigNumberPrecedenceAndFix(t *testing.T) {
 	}
 }
 
+// trailingCtx 与 validConfig 配套：feature-a 立即命中 r-pro，feature-b 已关闭，
+// feature-c 无规则走默认值。
+const trailingCtx = `{"plan":"pro","region":"cn"}`
+
+func TestCLIEvaluateRejectsTrailingContent(t *testing.T) {
+	cases := []struct {
+		name    string
+		config  string
+		context string
+		key     string
+		wantSub string // stderr 需指出出错的是 config 还是 context，并说明 JSON 无效
+		forbid  string // 另一份文件的名字不得出现在错误里
+	}{
+		{"config second object adjacent", validConfig + `{"flags":[]}`, trailingCtx, "feature-a", "config: invalid JSON", "context"},
+		{"config second object spaced", validConfig + " \t\r\n" + `{"flags":[]}`, trailingCtx, "feature-a", "config: invalid JSON", "context"},
+		{"config trailing array", validConfig + `[1]`, trailingCtx, "feature-a", "config: invalid JSON", "context"},
+		{"config trailing string", validConfig + `"x"`, trailingCtx, "feature-a", "config: invalid JSON", "context"},
+		{"config trailing number", validConfig + `42`, trailingCtx, "feature-a", "config: invalid JSON", "context"},
+		{"config trailing bool", validConfig + `true`, trailingCtx, "feature-a", "config: invalid JSON", "context"},
+		{"config trailing null", validConfig + `null`, trailingCtx, "feature-a", "config: invalid JSON", "context"},
+		{"config trailing incomplete", validConfig + `{"flags":[`, trailingCtx, "feature-a", "config: invalid JSON", "context"},
+		{"config trailing garbage", validConfig + `###`, trailingCtx, "feature-a", "config: invalid JSON", "context"},
+		{"config trailing with disabled flag", validConfig + ` {}`, trailingCtx, "feature-b", "config: invalid JSON", "context"},
+		{"context second object adjacent", validConfig, trailingCtx + `{"plan":"pro"}`, "feature-a", "context: invalid JSON", "config"},
+		{"context second object spaced", validConfig, trailingCtx + "  " + `{"plan":"pro"}`, "feature-a", "context: invalid JSON", "config"},
+		{"context trailing array", validConfig, trailingCtx + `["x"]`, "feature-a", "context: invalid JSON", "config"},
+		{"context trailing string", validConfig, trailingCtx + `"x"`, "feature-a", "context: invalid JSON", "config"},
+		{"context trailing number", validConfig, trailingCtx + `42`, "feature-a", "context: invalid JSON", "config"},
+		{"context trailing bool", validConfig, trailingCtx + `false`, "feature-a", "context: invalid JSON", "config"},
+		{"context trailing null", validConfig, trailingCtx + `null`, "feature-a", "context: invalid JSON", "config"},
+		{"context trailing incomplete", validConfig, trailingCtx + `{"plan":`, "feature-a", "context: invalid JSON", "config"},
+		{"context trailing garbage", validConfig, trailingCtx + `???`, "feature-a", "context: invalid JSON", "config"},
+		{"context trailing with disabled flag", validConfig, trailingCtx + ` {}`, "feature-b", "context: invalid JSON", "config"},
+		{"both files trailing reports config", validConfig + ` {}`, trailingCtx + ` []`, "feature-a", "config: invalid JSON", "context"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t, tc.config, tc.context)
+			var stdout, stderr bytes.Buffer
+			code := run(h.evalArgs(tc.key), &stdout, &stderr)
+			if code == 0 {
+				t.Fatalf("expected non-zero exit")
+			}
+			if stdout.Len() != 0 {
+				t.Fatalf("stdout must be empty on trailing content, got: %q", stdout.String())
+			}
+			msg := stderr.String()
+			if !strings.Contains(msg, tc.wantSub) {
+				t.Fatalf("stderr=%q, want substring %q", msg, tc.wantSub)
+			}
+			if strings.Contains(msg, tc.forbid+":") {
+				t.Fatalf("stderr must blame only the file with trailing content: %q", msg)
+			}
+		})
+	}
+}
+
+func TestCLIEvaluateTrailingContentRemovalRestoresEvaluation(t *testing.T) {
+	h := newHarness(t, validConfig+" {}", trailingCtx+" []")
+	for _, key := range []string{"feature-a", "feature-b", "feature-c"} {
+		var stdout, stderr bytes.Buffer
+		if code := run(h.evalArgs(key), &stdout, &stderr); code == 0 {
+			t.Fatalf("%s: expected non-zero exit with trailing content", key)
+		} else if stdout.Len() != 0 {
+			t.Fatalf("%s: stdout must be empty with trailing content: %q", key, stdout.String())
+		}
+	}
+
+	// 移除两份文件的尾随内容后，同一份业务输入恢复正常求值。
+	if err := os.WriteFile(h.configPath, []byte(validConfig), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(h.contextPath, []byte(trailingCtx), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runAndExpect := func(key, want string) {
+		t.Helper()
+		var stdout, stderr bytes.Buffer
+		if code := run(h.evalArgs(key), &stdout, &stderr); code != 0 {
+			t.Fatalf("%s: exit=%d stderr=%s", key, code, stderr.String())
+		}
+		if got := strings.TrimSpace(stdout.String()); got != want {
+			t.Fatalf("%s: stdout=%q want %q", key, got, want)
+		}
+		if stderr.Len() != 0 {
+			t.Fatalf("%s: stderr must be empty: %q", key, stderr.String())
+		}
+	}
+	// 首条完整命中规则决定结果；关闭开关固定 false；无命中采用默认值。
+	runAndExpect("feature-a", `{"key":"feature-a","value":true,"reason":"rule","ruleId":"r-pro"}`)
+	runAndExpect("feature-b", `{"key":"feature-b","value":false,"reason":"disabled","ruleId":null}`)
+	runAndExpect("feature-c", `{"key":"feature-c","value":true,"reason":"default","ruleId":null}`)
+}
+
+func TestCLIEvaluateWhitespacePaddingKeepsResult(t *testing.T) {
+	// 文件首尾的空格、制表符、回车与换行不改变求值结果。
+	pad := " \t\r\n"
+	plain := newHarness(t, validConfig, trailingCtx)
+	var plainOut, plainErr bytes.Buffer
+	if code := run(plain.evalArgs("feature-a"), &plainOut, &plainErr); code != 0 {
+		t.Fatalf("plain: exit=%d stderr=%s", code, plainErr.String())
+	}
+	padded := newHarness(t, pad+validConfig+pad, pad+trailingCtx+pad)
+	var paddedOut, paddedErr bytes.Buffer
+	if code := run(padded.evalArgs("feature-a"), &paddedOut, &paddedErr); code != 0 {
+		t.Fatalf("padded: exit=%d stderr=%s", code, paddedErr.String())
+	}
+	if paddedOut.String() != plainOut.String() {
+		t.Fatalf("padded %q != plain %q", paddedOut.String(), plainOut.String())
+	}
+	want := `{"key":"feature-a","value":true,"reason":"rule","ruleId":"r-pro"}`
+	if got := strings.TrimSpace(plainOut.String()); got != want {
+		t.Fatalf("stdout=%q want %q", got, want)
+	}
+}
+
+func TestCLIEvaluateStringBracesAndEscapesStayContent(t *testing.T) {
+	// 字符串里的大括号、方括号、转义引号与换行转义不会被误判成第二份文档。
+	tricky := `a{b}[c]\"d\"\ne} {`
+	cfg := `{"flags":[{"key":"f","enabled":true,"default":false,"rules":[
+		{"id":"r1","value":true,"conditions":[{"attribute":"plan","op":"eq","value":"` + tricky + `"}]}]}]}`
+	h := newHarness(t, cfg, `{"plan":"`+tricky+`"}`)
+	var stdout, stderr bytes.Buffer
+	if code := run(h.evalArgs("f"), &stdout, &stderr); code != 0 {
+		t.Fatalf("exit=%d stderr=%s", code, stderr.String())
+	}
+	want := `{"key":"f","value":true,"reason":"rule","ruleId":"r1"}`
+	if got := strings.TrimSpace(stdout.String()); got != want {
+		t.Fatalf("stdout=%q want %q", got, want)
+	}
+}
+
 func TestCLILegacyCommandsPreserved(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	if code := run([]string{"version"}, &stdout, &stderr); code != 0 || strings.TrimSpace(stdout.String()) != "payflow 0.1.0" {

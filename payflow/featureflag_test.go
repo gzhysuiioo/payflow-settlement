@@ -1047,6 +1047,143 @@ func TestValidUnicodeEscapesUnchanged(t *testing.T) {
 	}
 }
 
+// --- 单文档边界：文件必须恰好是一个完整 JSON 文档 ---------------------------
+
+// boundaryConfig 与 boundaryContext 是字段完全合法的业务文档：尾随内容测试以
+// 它们为第一份文档，任何失败都只能来自文件边界，而不是业务字段校验。
+const boundaryConfig = `{"flags":[
+	{"key":"f","enabled":true,"default":false,"rules":[
+		{"id":"r-pro","value":true,"conditions":[{"attribute":"plan","op":"eq","value":"pro"}]}]},
+	{"key":"off","enabled":false,"default":true,"rules":[]}]}`
+const boundaryContext = `{"plan":"pro"}`
+
+func TestDocumentBoundaryWhitespaceIgnored(t *testing.T) {
+	// 文件开头与结尾允许 JSON 规定的空格、制表符、回车与换行，结果与无空白一致。
+	pad := " \t\r\n"
+	plain := eval(t, boundaryConfig, "f", boundaryContext)
+	padded := eval(t, pad+boundaryConfig+pad, "f", pad+boundaryContext+pad)
+	if !padded.Equals(plain) {
+		t.Fatalf("padded %+v != plain %+v", padded, plain)
+	}
+	if padded.Reason != EvalRule || padded.RuleID == nil || *padded.RuleID != "r-pro" {
+		t.Fatalf("expected r-pro rule hit, got %+v", padded)
+	}
+	// 关闭开关在带空白时同样固定 false。
+	off := eval(t, pad+boundaryConfig+pad, "off", pad+boundaryContext+pad)
+	if off.Reason != EvalDisabled || off.Value {
+		t.Fatalf("disabled flag with padding: %+v", off)
+	}
+}
+
+func TestSecondTopLevelValueRejected(t *testing.T) {
+	// 完整对象之后只允许空白：第二个值（即使本身合法 JSON）、未写完的内容或
+	// 非 JSON 字符都必须让整个文件失败，且按 JSON 语法错误报告。
+	suffixes := []struct {
+		name   string
+		suffix string
+	}{
+		{"second object adjacent", `{"flags":[]}`},
+		{"second object after whitespace", " \t\r\n" + `{"flags":[]}`},
+		{"array", `[1,2]`},
+		{"string", `"extra"`},
+		{"number", `42`},
+		{"bool", `true`},
+		{"null", `null`},
+		{"incomplete object", `{"flags":[`},
+		{"lone opening brace", `{`},
+		{"stray closing brace", `}`},
+		{"garbage word", `bogus`},
+		{"garbage symbol", `%`},
+	}
+	for _, tc := range suffixes {
+		t.Run("config/"+tc.name, func(t *testing.T) {
+			_, err := ParseConfig([]byte(boundaryConfig + tc.suffix))
+			if err == nil || !strings.Contains(err.Error(), "invalid JSON") {
+				t.Fatalf("err=%v, want invalid JSON", err)
+			}
+			if strings.Contains(err.Error(), "duplicate field") ||
+				strings.Contains(err.Error(), "value must be a string") {
+				t.Fatalf("boundary violation must not surface as a field error: %v", err)
+			}
+		})
+		t.Run("context/"+tc.name, func(t *testing.T) {
+			_, err := ParseContext([]byte(boundaryContext + tc.suffix))
+			if err == nil || !strings.Contains(err.Error(), "invalid JSON") {
+				t.Fatalf("err=%v, want invalid JSON", err)
+			}
+			if strings.Contains(err.Error(), "duplicate field") ||
+				strings.Contains(err.Error(), "value must be a string") {
+				t.Fatalf("boundary violation must not surface as a field error: %v", err)
+			}
+		})
+	}
+}
+
+func TestStringContentNotMistakenForSecondDocument(t *testing.T) {
+	// 字符串里的大括号、方括号、转义引号与换行转义都是内容，不是第二份文档。
+	trickyValue := `a{b}[c]\"d\"\ne} {`
+	ctxRaw := `{"plan":"` + trickyValue + `"}`
+	ctx := mustParseContext(t, ctxRaw)
+	want := "a{b}[c]\"d\"\ne} {" // JSON 解码后：\" 是引号，\n 是换行
+	if v, ok := ctx.Get("plan"); !ok || v != want {
+		t.Fatalf("decoded value = %q %v, want %q", v, ok, want)
+	}
+	// 配置中的比较值同理，且按解码后的原文命中规则。
+	cfgRaw := `{"flags":[{"key":"f","enabled":true,"default":false,"rules":[
+		{"id":"r1","value":true,"conditions":[{"attribute":"plan","op":"eq","value":"` + trickyValue + `"}]}]}]}`
+	got := eval(t, cfgRaw, "f", ctxRaw)
+	if got.Reason != EvalRule || got.RuleID == nil || *got.RuleID != "r1" {
+		t.Fatalf("tricky string must match verbatim: %+v", got)
+	}
+}
+
+func TestTrailingContentCheckedBeforeEvaluationOutcome(t *testing.T) {
+	// 请求的开关已关闭，或第一条规则立即命中，都不能跳过剩余文件内容的检查。
+	if _, err := ParseConfig([]byte(boundaryConfig + " null")); err == nil {
+		t.Fatal("config with trailing null must fail even though flag off is disabled")
+	}
+	if _, err := ParseContext([]byte(boundaryContext + ` {"plan":"pro"}`)); err == nil {
+		t.Fatal("context with trailing object must fail even though rule r-pro would hit immediately")
+	}
+	// 移除尾随内容后，同一份业务输入恢复正常求值。
+	cfg := mustParseConfig(t, boundaryConfig)
+	ctx := mustParseContext(t, boundaryContext)
+	if got := cfg.Find("off").Evaluate(ctx); got.Reason != EvalDisabled || got.Value {
+		t.Fatalf("disabled flag stays fixed false: %+v", got)
+	}
+	got := cfg.Find("f").Evaluate(ctx)
+	if got.Reason != EvalRule || got.RuleID == nil || *got.RuleID != "r-pro" || !got.Value {
+		t.Fatalf("first matching rule decides: %+v", got)
+	}
+	// 无命中时采用默认值。
+	other := mustParseContext(t, `{"plan":"free"}`)
+	if got := cfg.Find("f").Evaluate(other); got.Reason != EvalDefault || got.Value {
+		t.Fatalf("no match falls back to default: %+v", got)
+	}
+}
+
+func TestTrailingContentKeepsExistingErrorPriority(t *testing.T) {
+	// 既有检查的优先级不变：UTF-8、非法转义与重复字段仍先于文件边界问题报告。
+	if _, err := ParseConfig(append([]byte(boundaryConfig+" extra"), 0xff)); err == nil ||
+		!strings.Contains(err.Error(), "not valid UTF-8") {
+		t.Fatalf("utf8 must win over trailing content: %v", err)
+	}
+	if _, err := ParseContext([]byte(`{"plan":"\uD800"} trailing`)); err == nil ||
+		!strings.Contains(err.Error(), "does not form a complete character") {
+		t.Fatalf("invalid unicode escape must win over trailing content: %v", err)
+	}
+	if _, err := ParseContext([]byte(`{"plan":"free","plan":"pro"} trailing`)); err == nil ||
+		!strings.Contains(err.Error(), "duplicate field") {
+		t.Fatalf("duplicate field must win over trailing content: %v", err)
+	}
+	// 尾随的合法大数字是“第二个顶层值”，按 JSON 边界错误而非属性类型错误报告。
+	_, err := ParseContext([]byte(boundaryContext + " 1e400"))
+	if err == nil || !strings.Contains(err.Error(), "invalid JSON") ||
+		strings.Contains(err.Error(), "value must be a string") {
+		t.Fatalf("trailing big number is a boundary error, not a type error: %v", err)
+	}
+}
+
 func TestEmptyFlagListAndFind(t *testing.T) {
 	cfg := mustParseConfig(t, `{"flags":[]}`)
 	if cfg.Find("missing") != nil {
