@@ -115,8 +115,13 @@ func validateAndReplay(initial, final map[balanceKey]int64, records []Record, re
 
 	// 校验退款自身的不变式：字段非空、序列连续、引用的结算在退款时点已存在、
 	// 金额与去向与原结算逐字一致、每笔结算最多退回一次、退款编号全局唯一。
+	// 此外付款历史只会追加，因此按退款成功顺序（即记录顺序）看，after_seq
+	// 必须单调不减：后一笔退款落账时，已存在的结算不可能比前一笔退款时更少。
+	// 该规则针对整本账本的结算历史，与退款属于哪个账户、资产或引用哪笔付款无关。
 	seenRefund := map[string]bool{}
 	refundedBy := map[string]string{} // 结算编号 -> 首个退回它的退款编号
+	prevAfterSeq := int64(-1)
+	prevRefundID := ""
 	for i, rf := range refunds {
 		if rf.ID == "" {
 			return ledgerError(ErrCorrupt, "refund %d has empty id", i)
@@ -134,6 +139,13 @@ func validateAndReplay(initial, final map[balanceKey]int64, records []Record, re
 		if rf.AfterSeq < 0 || rf.AfterSeq > int64(len(records)) {
 			return ledgerError(ErrCorrupt, "refund %q references settlement outside history (after_seq=%d)", rf.ID, rf.AfterSeq)
 		}
+		if rf.AfterSeq < prevAfterSeq {
+			return ledgerError(ErrCorrupt,
+				"refund %q (seq %d) has after_seq %d, but previous refund %q (seq %d) already saw %d settlements: payment history only grows",
+				rf.ID, rf.Seq, rf.AfterSeq, prevRefundID, int64(i), prevAfterSeq)
+		}
+		prevAfterSeq = rf.AfterSeq
+		prevRefundID = rf.ID
 		var target *Record
 		for j := range records {
 			if records[j].Seq <= rf.AfterSeq && records[j].ID == rf.SettlementID {

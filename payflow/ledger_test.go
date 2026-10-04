@@ -1428,6 +1428,94 @@ func TestCorruptRefundLedgerRejected(t *testing.T) {
 	}
 }
 
+// 损坏检测：退款成功顺序中的 after_seq 必须单调不减——付款历史只会追加，
+// 后一笔退款落账时已存在的结算不可能比前一笔退款时更少。
+func TestRefundAfterSeqRegressionRejected(t *testing.T) {
+	k := balanceKey{"aa", "usdc"}
+	initial := map[balanceKey]int64{k: 1000}
+	p1 := Record{ID: "p1", Account: "aa", Paymaster: "pm", Asset: "usdc", Amount: 100, Nonce: 1, FeeBps: 0, Fee: 0, Charged: 100, Seq: 1}
+	p2 := Record{ID: "p2", Account: "aa", Paymaster: "pm", Asset: "usdc", Amount: 100, Nonce: 2, FeeBps: 0, Fee: 0, Charged: 100, Seq: 2}
+	rf := func(id, sid string, afterSeq, seq int64) RefundRecord {
+		return RefundRecord{ID: id, SettlementID: sid, Reason: "x", Account: "aa", Asset: "usdc", Amount: 100, Fee: 0, Charged: 100, AfterSeq: afterSeq, Seq: seq}
+	}
+	finalBack := map[balanceKey]int64{k: 1000} // 两笔各 100 全部退回
+
+	// 任务示例：r1（seq 1）在已有 2 笔付款时退回 p2（after_seq=2），
+	// r2（seq 2）却声称自己落账时只有 1 笔付款（after_seq=1）。
+	// 金额、目标、各自序号与最终余额单独都能核对上，仍必须拒绝。
+	err := validateAndReplay(initial, finalBack, []Record{p1, p2},
+		[]RefundRecord{rf("r1", "p2", 2, 1), rf("r1-target", "p1", 1, 2)})
+	if KindOf(err) != ErrCorrupt {
+		t.Fatalf("regressing after_seq: want ErrCorrupt, got %v", err)
+	}
+	le := err.(*LedgerError)
+	if !strings.Contains(le.Message, `"r1-target"`) || !strings.Contains(le.Message, `"r1"`) {
+		t.Fatalf("error must name both adjacent refunds, got %q", le.Message)
+	}
+
+	// 规则针对整本账本的付款历史：两笔退款属于不同账户/资产同样不放行。
+	kb := balanceKey{"bb", "usdc"}
+	pb1 := Record{ID: "pb1", Account: "bb", Paymaster: "pm", Asset: "usdc", Amount: 100, Nonce: 1, FeeBps: 0, Fee: 0, Charged: 100, Seq: 2}
+	crossInitial := map[balanceKey]int64{k: 1000, kb: 1000}
+	crossFinal := map[balanceKey]int64{k: 1000, kb: 1000}
+	rfb := rf("rb", "pb1", 2, 1)
+	rfb.Account = "bb"
+	rfa := rf("ra", "p1", 1, 2)
+	if err := validateAndReplay(crossInitial, crossFinal, []Record{p1, pb1},
+		[]RefundRecord{rfb, rfa}); KindOf(err) != ErrCorrupt {
+		t.Fatalf("cross-account regression: want ErrCorrupt, got %v", err)
+	}
+
+	// 相邻退款 after_seq 相等合法：两次退款之间没有新增成功付款。
+	if err := validateAndReplay(initial, finalBack, []Record{p1, p2},
+		[]RefundRecord{rf("r1", "p1", 2, 1), rf("r2", "p2", 2, 2)}); err != nil {
+		t.Fatalf("equal after_seq must be accepted: %v", err)
+	}
+
+	// 正常交错历史：付款→退款→再付款→再退款，after_seq 递增。
+	if err := validateAndReplay(initial, finalBack, []Record{p1, p2},
+		[]RefundRecord{rf("r1", "p1", 1, 1), rf("r2", "p2", 2, 2)}); err != nil {
+		t.Fatalf("interleaved history must be accepted: %v", err)
+	}
+}
+
+// 文件级：带合法校验和但 after_seq 倒退的账本，Open 必须报 corrupt_ledger，
+// 且不得改写被拒绝的文件。
+func TestOpenRejectsAfterSeqRegressionFile(t *testing.T) {
+	k := balanceKey{"aa", "usdc"}
+	st := &ledgerState{
+		Version:  ledgerVersion,
+		Initial:  map[balanceKey]int64{k: 1000},
+		Balances: map[balanceKey]int64{k: 1000},
+		Settlements: []Record{
+			{ID: "p1", Account: "aa", Paymaster: "pm", Asset: "usdc", Amount: 100, Nonce: 1, FeeBps: 0, Fee: 0, Charged: 100, Seq: 1},
+			{ID: "p2", Account: "aa", Paymaster: "pm", Asset: "usdc", Amount: 100, Nonce: 2, FeeBps: 0, Fee: 0, Charged: 100, Seq: 2},
+		},
+		Refunds: []RefundRecord{
+			{ID: "r1", SettlementID: "p2", Reason: "x", Account: "aa", Asset: "usdc", Amount: 100, Fee: 0, Charged: 100, AfterSeq: 2, Seq: 1},
+			{ID: "r2", SettlementID: "p1", Reason: "x", Account: "aa", Asset: "usdc", Amount: 100, Fee: 0, Charged: 100, AfterSeq: 1, Seq: 2},
+		},
+	}
+	data, err := json.Marshal(st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "ledger.json")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(path); KindOf(err) != ErrCorrupt {
+		t.Fatalf("Open: want ErrCorrupt, got %v", err)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, data) {
+		t.Fatalf("rejected ledger file must not be rewritten")
+	}
+}
+
 func refundStatuses(r *RefundBatchResult) []string {
 	out := make([]string, len(r.Results))
 	for i, x := range r.Results {
