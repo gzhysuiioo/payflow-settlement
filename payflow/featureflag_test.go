@@ -1250,3 +1250,229 @@ func TestEmptyFlagListAndFind(t *testing.T) {
 		t.Errorf("nil context on disabled flag: %+v", got)
 	}
 }
+
+// --- 附加字段（不参与求值的额外信息）-------------------------------------------
+
+// namedConfig 把一份配置文本与其变体名绑定，便于子测试定位。
+type namedConfig struct {
+	name string
+	raw  string
+}
+
+// extraFieldConfigVariants 返回三份开关定义完全相同的配置：不含附加字段的基准、
+// 在顶层/开关/规则/条件上附加了对象、数组、布尔、null 与合法大数字（1e400、
+// 1 后接 400 个 0 的整数）的完整版，以及修改部分附加值、移除一部分、新增另一
+// 部分的变体。三份配置对同一开关键与上下文必须给出完全一致的求值结果。
+func extraFieldConfigVariants() []namedConfig {
+	hugeInt := "1" + strings.Repeat("0", 400)
+	base := `{"flags":[
+		{"key":"f","enabled":true,"default":true,"rules":[
+			{"id":"r-deny","value":false,"conditions":[
+				{"attribute":"plan","op":"eq","value":"pro"},
+				{"attribute":"tier","op":"in","value":["a","b"]}]},
+			{"id":"r-allow","value":true,"conditions":[
+				{"attribute":"region","op":"eq","value":"cn"}]}]},
+		{"key":"off","enabled":false,"default":true,"rules":[]}]}`
+	rich := `{"meta":{"owner":"pay","big":1e400,"huge":` + hugeInt + `,"tags":["x",1e400],"ok":true,"nil":null},
+		"flags":[
+		{"key":"f","enabled":true,"default":true,"note":"主开关","labels":["a","b"],"reviewed":true,"archived":null,"rules":[
+			{"id":"r-deny","value":false,"comment":{"text":"先拒绝","n":1e400},"conditions":[
+				{"attribute":"plan","op":"eq","value":"pro","hint":"套餐"},
+				{"attribute":"tier","op":"in","value":["a","b"],"weight":1e400}]},
+			{"id":"r-allow","value":true,"conditions":[
+				{"attribute":"region","op":"eq","value":"cn"}]}]},
+		{"key":"off","enabled":false,"default":true,"rules":[],"meta":{"big":` + hugeInt + `}}]}`
+	alt := `{"meta":{"owner":"growth","big":-1e400},
+		"flags":[
+		{"key":"f","enabled":true,"default":true,"note":"改名","rules":[
+			{"id":"r-deny","value":false,"conditions":[
+				{"attribute":"plan","op":"eq","value":"pro"},
+				{"attribute":"tier","op":"in","value":["a","b"],"weight":2}]},
+			{"id":"r-allow","value":true,"since":"2026","conditions":[
+				{"attribute":"region","op":"eq","value":"cn"}]}]},
+		{"key":"off","enabled":false,"default":true,"rules":[]}],"footer":[1,2,3]}`
+	return []namedConfig{
+		{"no extra fields", base},
+		{"extra fields added", rich},
+		{"extra fields modified and removed", alt},
+	}
+}
+
+func TestExtraFieldsDoNotAffectEvaluation(t *testing.T) {
+	// 对同一份开关定义与合法上下文，增加、修改或移除附加字段后，结果中的
+	// 开关键、布尔值、命中原因与规则编号必须保持一致：附加信息不改变首条
+	// 完整命中规则的选择，也不会在没有规则命中时替代默认值。
+	denyID, allowID := "r-deny", "r-allow"
+	cases := []struct {
+		name string
+		key  string
+		ctx  string
+		want EvalResult
+	}{
+		// 上下文同时满足 r-deny 与 r-allow：靠前的 r-deny 立即定案为 false。
+		{"first matching rule wins", "f", `{"plan":"pro","tier":"a","region":"cn"}`,
+			EvalResult{Key: "f", Value: false, Reason: EvalRule, RuleID: &denyID}},
+		{"later rule when first misses", "f", `{"plan":"free","region":"cn"}`,
+			EvalResult{Key: "f", Value: true, Reason: EvalRule, RuleID: &allowID}},
+		{"default when no rule matches", "f", `{"plan":"free","region":"eu"}`,
+			EvalResult{Key: "f", Value: true, Reason: EvalDefault, RuleID: nil}},
+		{"disabled flag stays false", "off", `{"plan":"pro","tier":"a","region":"cn"}`,
+			EvalResult{Key: "off", Value: false, Reason: EvalDisabled, RuleID: nil}},
+	}
+	for _, variant := range extraFieldConfigVariants() {
+		for _, tc := range cases {
+			t.Run(variant.name+"/"+tc.name, func(t *testing.T) {
+				got := eval(t, variant.raw, tc.key, tc.ctx)
+				if !got.Equals(tc.want) {
+					t.Fatalf("got %+v, want %+v", got, tc.want)
+				}
+			})
+		}
+	}
+}
+
+func TestExtraFieldBigNumbersAccepted(t *testing.T) {
+	// 附加信息里语法合法但超出浮点范围的数字（1e400、-1e400、1 后接 400 个 0
+	// 的整数）必须能成功读取，不能被当成 JSON 无效；它们可以出现在顶层、
+	// 开关、规则、条件以及附加对象/数组内部。
+	hugeInt := "1" + strings.Repeat("0", 400)
+	cfg := `{"meta":[1e400,` + hugeInt + `],"flags":[
+		{"key":"f","enabled":true,"default":false,"big":1e400,"rules":[
+			{"id":"r","value":true,"huge":` + hugeInt + `,"conditions":[
+				{"attribute":"plan","op":"eq","value":"pro","neg":-1e400}]}]}]}`
+	c := mustParseConfig(t, cfg)
+	ctx := mustParseContext(t, `{"plan":"pro"}`)
+	id := "r"
+	want := EvalResult{Key: "f", Value: true, Reason: EvalRule, RuleID: &id}
+	if got := c.Find("f").Evaluate(ctx); !got.Equals(want) {
+		t.Fatalf("big numbers in extra fields must not disturb evaluation: got %+v, want %+v", got, want)
+	}
+}
+
+func TestExtraFieldDuplicateAfterBigNumber(t *testing.T) {
+	// 附加信息仍属于被完整检查的配置：合法大数字之后，同一附加对象再次声明
+	// 同名字段时必须报重复字段并指向它在配置中的位置，不能误报为大数字的
+	// 语法错误。
+	hugeInt := "1" + strings.Repeat("0", 400)
+	cases := []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{"after exponent overflow", `{"flags":[{"key":"f","enabled":true,"default":false,"rules":[],
+			"meta":{"n":1e400,"n":2}}]}`, `config.flags[0].meta.n`},
+		{"after 400-digit integer", `{"flags":[{"key":"f","enabled":true,"default":false,"rules":[],
+			"meta":{"n":` + hugeInt + `,"n":2}}]}`, `config.flags[0].meta.n`},
+		{"top-level extra object", `{"flags":[],"meta":{"n":1e400,"n":2}}`, `config.meta.n`},
+		{"nested inside extra array", `{"flags":[{"key":"f","enabled":true,"default":false,"rules":[],
+			"tags":[{"n":1e400,"n":2}]}]}`, `config.flags[0].tags[0].n`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := ParseConfig([]byte(tc.raw))
+			if err == nil {
+				t.Fatalf("expected duplicate field error, got nil\nconfig: %s", tc.raw)
+			}
+			msg := err.Error()
+			if !strings.Contains(msg, "duplicate field") || !strings.Contains(msg, tc.want) {
+				t.Fatalf("err=%q, want duplicate field at %s", msg, tc.want)
+			}
+			if strings.Contains(msg, "invalid JSON") {
+				t.Fatalf("legal big number must not be misreported as a syntax error: %q", msg)
+			}
+		})
+	}
+}
+
+func TestExtraFieldDuplicateInUnselectedOrDisabledFlag(t *testing.T) {
+	// 请求的开关本身完全合法、能直接得到结果，也不能跳过其他开关附加信息的
+	// 检查：未选中开关附加对象里的重复字段仍须整体失败。
+	_, err := ParseConfig([]byte(`{"flags":[
+		{"key":"good","enabled":true,"default":false,"rules":[]},
+		{"key":"bad","enabled":true,"default":false,"rules":[],"meta":{"x":1,"x":2}}]}`))
+	if err == nil || !strings.Contains(err.Error(), `config.flags[1].meta.x`) ||
+		!strings.Contains(err.Error(), "duplicate field") {
+		t.Fatalf("unselected flag extra duplicate: err=%v", err)
+	}
+	// 已关闭开关的附加对象同理。
+	_, err = ParseConfig([]byte(`{"flags":[
+		{"key":"off","enabled":false,"default":false,"rules":[],"meta":{"x":1,"x":2}}]}`))
+	if err == nil || !strings.Contains(err.Error(), `config.flags[0].meta.x`) ||
+		!strings.Contains(err.Error(), "duplicate field") {
+		t.Fatalf("disabled flag extra duplicate: err=%v", err)
+	}
+}
+
+func TestExtraFieldSameNameInDifferentObjectsAllowed(t *testing.T) {
+	// 同名字段出现在两个不同对象中不算重复：不同开关的附加对象、同一附加
+	// 对象的嵌套层、顶层与开关级都各自独立。
+	mustParseConfig(t, `{"flags":[
+		{"key":"f","enabled":true,"default":false,"rules":[],"meta":{"owner":"a"}},
+		{"key":"g","enabled":true,"default":false,"rules":[],"meta":{"owner":"b"}}]}`)
+	mustParseConfig(t, `{"flags":[{"key":"f","enabled":true,"default":false,"rules":[],
+		"meta":{"owner":"a","nested":{"owner":"b"}}}]}`)
+	mustParseConfig(t, `{"meta":{"owner":"a"},"flags":[
+		{"key":"f","enabled":true,"default":false,"rules":[],"meta":{"owner":"b"}}]}`)
+}
+
+func TestExtraFieldMalformedNumberRejected(t *testing.T) {
+	// 附加字段把数字写成缺少指数数字的 1e+ 时不是合法 JSON 数字：按 JSON
+	// 语法错误拒绝，与合法大数字被接受的行为明确区分。
+	for _, raw := range []string{
+		`{"flags":[{"key":"f","enabled":true,"default":false,"rules":[],
+			"meta":{"n":1e+}}]}`,
+		`{"flags":[],"meta":1e+}`,
+	} {
+		_, err := ParseConfig([]byte(raw))
+		if err == nil || !strings.Contains(err.Error(), "invalid JSON") {
+			t.Fatalf("malformed number in extra field: err=%v\nconfig: %s", err, raw)
+		}
+		if strings.Contains(err.Error(), "duplicate field") {
+			t.Fatalf("malformed number must not read as duplicate field: %v", err)
+		}
+	}
+}
+
+func TestExtraFieldsDoNotRelaxBusinessFields(t *testing.T) {
+	// 附加字段的兼容性不扩展到业务字段：开关、规则、条件的必填项、值类型与
+	// 唯一性要求在附加字段合法存在时仍按原约定执行。
+	cases := []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{"enabled missing", `{"flags":[{"key":"f","default":false,"rules":[],"meta":{"x":1}}]}`,
+			`flags[0].enabled`},
+		{"enabled wrong type", `{"flags":[{"key":"f","enabled":"yes","default":false,"rules":[],"meta":{"x":1}}]}`,
+			`flags[0].enabled`},
+		{"default null", `{"flags":[{"key":"f","enabled":true,"default":null,"rules":[],"meta":{"x":1}}]}`,
+			`flags[0].default`},
+		{"rule id empty", `{"flags":[{"key":"f","enabled":true,"default":false,"meta":{"x":1},"rules":[
+			{"id":"","value":true,"conditions":[{"attribute":"a","op":"eq","value":"x"}]}]}]}`,
+			`rules[0].id`},
+		{"eq value non-string", `{"flags":[{"key":"f","enabled":true,"default":false,"rules":[
+			{"id":"r","value":true,"conditions":[{"attribute":"a","op":"eq","value":1,"hint":"h"}]}]}]}`,
+			`conditions[0].value`},
+		{"duplicate flag key", `{"flags":[
+			{"key":"f","enabled":true,"default":false,"rules":[],"meta":{"x":1}},
+			{"key":"f","enabled":true,"default":false,"rules":[],"meta":{"x":2}}]}`,
+			`duplicate flag key`},
+		{"duplicate rule id", `{"flags":[{"key":"f","enabled":true,"default":false,"rules":[
+			{"id":"r","value":true,"note":"a","conditions":[{"attribute":"a","op":"eq","value":"x"}]},
+			{"id":"r","value":false,"note":"b","conditions":[{"attribute":"a","op":"eq","value":"y"}]}]}]}`,
+			`duplicate rule id`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := ParseConfig([]byte(tc.raw))
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("err=%v, want substring %q", err, tc.want)
+			}
+		})
+	}
+	// 上下文属性仍只允许字符串，与配置是否携带附加字段无关。
+	if _, err := ParseContext([]byte(`{"plan":1}`)); err == nil ||
+		!strings.Contains(err.Error(), "context.plan") {
+		t.Fatalf("context attributes must stay string-only: err=%v", err)
+	}
+}

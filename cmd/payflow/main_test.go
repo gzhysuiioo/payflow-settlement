@@ -626,3 +626,133 @@ func TestCLILegacyCommandsPreserved(t *testing.T) {
 		t.Fatalf("unknown command exit=%d want 2", code)
 	}
 }
+
+// extraCLIConfig 与 validConfig 的开关定义相同，另在顶层、开关、规则、条件上
+// 附带对象、数组、布尔、null 与语法合法但超出浮点范围的大数字（1e400、
+// 1 后接 400 个 0 的整数）。这些附加信息不参与求值。
+var extraCLIConfig = `{"meta":{"owner":"pay","big":1e400,"huge":` + "1" + strings.Repeat("0", 400) + `,"tags":["x",1e400],"ok":true,"nil":null},"flags":[
+	{"key":"feature-a","enabled":true,"default":false,"note":"A","labels":["a"],"reviewed":true,"archived":null,"rules":[
+		{"id":"r-pro","value":true,"comment":{"n":1e400},"conditions":[
+			{"attribute":"plan","op":"eq","value":"pro","hint":"plan"},
+			{"attribute":"region","op":"in","value":["cn","us"],"weight":1e400}]}]},
+	{"key":"feature-b","enabled":false,"default":true,"rules":[],"meta":{"big":1e400}},
+	{"key":"feature-c","enabled":true,"default":true,"rules":[]}]}`
+
+func TestCLIEvaluateExtraFieldsDoNotChangeResult(t *testing.T) {
+	// 附加信息不改变求值：带附加字段的配置与 validConfig 对同一开关键、同一
+	// 上下文的输出逐字节一致；stdout 仍是单个结果对象，stderr 为空。
+	cases := []struct {
+		name string
+		key  string
+		ctx  string
+	}{
+		{"first matching rule", "feature-a", `{"plan":"pro","region":"cn"}`},
+		{"default fallback", "feature-a", `{}`},
+		{"disabled flag", "feature-b", `{"plan":"pro","region":"cn"}`},
+		{"no rules default", "feature-c", `{}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			plain := newHarness(t, validConfig, tc.ctx)
+			extras := newHarness(t, extraCLIConfig, tc.ctx)
+			var plainOut, extraOut, extraErr bytes.Buffer
+			if code := run(plain.evalArgs(tc.key), &plainOut, &bytes.Buffer{}); code != 0 {
+				t.Fatalf("plain config: exit=%d", code)
+			}
+			if code := run(extras.evalArgs(tc.key), &extraOut, &extraErr); code != 0 {
+				t.Fatalf("config with extra fields: exit=%d stderr=%s", code, extraErr.String())
+			}
+			if extraErr.Len() != 0 {
+				t.Fatalf("stderr must be empty on success: %q", extraErr.String())
+			}
+			if extraOut.String() != plainOut.String() {
+				t.Fatalf("extra fields changed output: %q != %q", extraOut.String(), plainOut.String())
+			}
+			var got map[string]any
+			if err := json.Unmarshal(extraOut.Bytes(), &got); err != nil {
+				t.Fatalf("stdout is not a single JSON object: %q (%v)", extraOut.String(), err)
+			}
+			if got["key"] != tc.key {
+				t.Fatalf("unexpected payload: %v", got)
+			}
+		})
+	}
+}
+
+func TestCLIEvaluateExtraFieldFailures(t *testing.T) {
+	// 附加信息虽不参与求值，仍属于被完整检查的配置：其中的重复字段与无效
+	// JSON 都要非零退出、stdout 为空，stderr 指出问题来自配置，且原因能区分
+	// 重复字段与无效 JSON。
+	hugeInt := "1" + strings.Repeat("0", 400)
+	cases := []struct {
+		name    string
+		config  string
+		key     string
+		wantSub []string // stderr 必须包含的片段
+		notSub  []string // stderr 不得包含的片段
+	}{
+		{
+			"duplicate after exponent overflow in extra object",
+			`{"flags":[{"key":"f","enabled":true,"default":false,"rules":[],
+				"meta":{"n":1e400,"n":2}}]}`,
+			"f",
+			[]string{"config", "duplicate field", `config.flags[0].meta.n`},
+			[]string{"invalid JSON"},
+		},
+		{
+			"duplicate after 400-digit integer in extra object",
+			`{"flags":[{"key":"f","enabled":true,"default":false,"rules":[],
+				"meta":{"n":` + hugeInt + `,"n":2}}]}`,
+			"f",
+			[]string{"config", "duplicate field", `config.flags[0].meta.n`},
+			[]string{"invalid JSON"},
+		},
+		{
+			"duplicate in unselected flag extra field",
+			`{"flags":[
+				{"key":"good","enabled":true,"default":false,"rules":[]},
+				{"key":"bad","enabled":true,"default":false,"rules":[],"meta":{"x":1,"x":2}}]}`,
+			"good",
+			[]string{"config", "duplicate field", `config.flags[1].meta.x`},
+			nil,
+		},
+		{
+			"duplicate in disabled flag extra field",
+			`{"flags":[{"key":"off","enabled":false,"default":false,"rules":[],"meta":{"x":1,"x":2}}]}`,
+			"off",
+			[]string{"config", "duplicate field", `config.flags[0].meta.x`},
+			nil,
+		},
+		{
+			"malformed number in extra field",
+			`{"flags":[{"key":"f","enabled":true,"default":false,"rules":[],
+				"meta":{"n":1e+}}]}`,
+			"f",
+			[]string{"config: invalid JSON"},
+			[]string{"duplicate field"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t, tc.config, `{}`)
+			var stdout, stderr bytes.Buffer
+			if code := run(h.evalArgs(tc.key), &stdout, &stderr); code == 0 {
+				t.Fatalf("expected non-zero exit, stdout=%q", stdout.String())
+			}
+			if stdout.Len() != 0 {
+				t.Fatalf("stdout must be empty on error, got %q", stdout.String())
+			}
+			msg := stderr.String()
+			for _, want := range tc.wantSub {
+				if !strings.Contains(msg, want) {
+					t.Fatalf("stderr=%q, want substring %q", msg, want)
+				}
+			}
+			for _, not := range tc.notSub {
+				if strings.Contains(msg, not) {
+					t.Fatalf("stderr=%q, must not contain %q", msg, not)
+				}
+			}
+		})
+	}
+}
