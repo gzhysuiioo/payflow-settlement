@@ -237,7 +237,7 @@ func checkContextValueTypes(raw []byte) error {
 			return nil // 语法错误留给严格解码的报错
 		}
 		if _, ok := value.(string); !ok {
-			return fmt.Errorf("context.%s: value must be a string", key)
+			return fmt.Errorf("%s: value must be a string", appendFieldPath("context", key))
 		}
 	}
 	return nil
@@ -326,6 +326,56 @@ func MarshalResult(r EvalResult) ([]byte, error) {
 
 // --- strict parsing helpers -------------------------------------------------
 
+// isSimpleFieldName 报告字段名是否走点号连接：以 ASCII 字母或下划线开头，
+// 其后只能含 ASCII 字母、数字、下划线。其他任何名字（含点号、方括号、空白、
+// 空名、非 ASCII 字符）都改用方括号包住的 JSON 字符串定位，如
+// context["user.name"]、context[""]。
+func isSimpleFieldName(name string) bool {
+	if name == "" {
+		return false
+	}
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		// 非 ASCII 字节（UTF-8 续字节或首字节）一律不满足“仅 ASCII”的要求。
+		if c >= 0x80 {
+			return false
+		}
+		ok := ('a' <= c && c <= 'z') || ('A' <= c && c <= 'Z') || c == '_'
+		if i > 0 {
+			ok = ok || ('0' <= c && c <= '9')
+		}
+		if !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// appendFieldPath 在父位置后接上一个字段：简单字段名用点号连接，其余字段名
+// 用方括号包住一个 JSON 字符串，引号、反斜杠与控制字符按 JSON 转义显示
+// （Marshal 对 U+2028/U+2029 也会转义，但普通可见 Unicode 保持原样）。
+// 名字按 JSON 解码后的文字传入，因此直接字符与合法 \uXXXX 转义得到同一位置。
+func appendFieldPath(parent, name string) string {
+	if isSimpleFieldName(name) {
+		return parent + "." + name
+	}
+	return parent + "[" + jsonQuote(name) + "]"
+}
+
+// jsonQuote 把字符串渲染为带双引号的 JSON 字符串字面量：引号、反斜杠与控制
+// 字符按 JSON 转义（U+2028/U+2029 也会转义，避免定位文字被行分隔符拆行），
+// 其余可见字符（含 <>& 与非 ASCII 文字）保持原样。
+func jsonQuote(s string) string {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(s); err != nil {
+		// 不会发生：string 的 JSON 编码没有失败路径；保留一个确定的退路。
+		return strconv.Quote(s)
+	}
+	return string(bytes.TrimRight(buf.Bytes(), "\n"))
+}
+
 // jsonFrame 是 JSON 原文遍历中一个对象或数组的层级状态。重复字段检查与非法
 // Unicode 转义检查共用这一份层级与位置定义，调整错误定位时只需改这一处。
 type jsonFrame struct {
@@ -357,12 +407,12 @@ func (t *jsonPathTracker) top() *jsonFrame {
 	return t.stack[len(t.stack)-1]
 }
 
-// childPath 拼出栈顶容器内下一个子值的位置：对象的字段值用 .字段名，
-// 数组元素用 [下标]。
+// childPath 拼出栈顶容器内下一个子值的位置：对象的字段值按 appendFieldPath
+// 规则连接（简单名用点号，其余用方括号 JSON 字符串），数组元素用 [下标]。
 func (t *jsonPathTracker) childPath() string {
 	top := t.top()
 	if top.object {
-		return top.path + "." + top.lastKey
+		return appendFieldPath(top.path, top.lastKey)
 	}
 	return top.path + "[" + strconv.Itoa(top.nextIndex) + "]"
 }
@@ -430,7 +480,7 @@ func (t *jsonPathTracker) noteKey(name string) error {
 		top.keys = make(map[string]struct{})
 	}
 	if _, dup := top.keys[name]; dup {
-		return fmt.Errorf("%s.%s: duplicate field %q", top.path, name, name)
+		return fmt.Errorf("%s: duplicate field %s", appendFieldPath(top.path, name), jsonQuote(name))
 	}
 	top.keys[name] = struct{}{}
 	top.lastKey = name
@@ -800,10 +850,10 @@ func parseCondition(raw any, flagIndex, ruleIndex, condIndex int) (Condition, er
 func requireField(obj map[string]any, name, loc string) (any, error) {
 	v, ok := obj[name]
 	if !ok {
-		return nil, fmt.Errorf("%s.%s: field is required", loc, name)
+		return nil, fmt.Errorf("%s: field is required", appendFieldPath(loc, name))
 	}
 	if v == nil {
-		return nil, fmt.Errorf("%s.%s: must not be null", loc, name)
+		return nil, fmt.Errorf("%s: must not be null", appendFieldPath(loc, name))
 	}
 	return v, nil
 }
@@ -815,7 +865,7 @@ func requireArrayField(obj map[string]any, name, loc string) ([]any, error) {
 	}
 	arr, ok := v.([]any)
 	if !ok {
-		return nil, fmt.Errorf("%s.%s: must be an array", loc, name)
+		return nil, fmt.Errorf("%s: must be an array", appendFieldPath(loc, name))
 	}
 	return arr, nil
 }
@@ -827,10 +877,10 @@ func requireNonEmptyString(obj map[string]any, name, loc string) (string, error)
 	}
 	s, ok := v.(string)
 	if !ok {
-		return "", fmt.Errorf("%s.%s: must be a string", loc, name)
+		return "", fmt.Errorf("%s: must be a string", appendFieldPath(loc, name))
 	}
 	if s == "" {
-		return "", fmt.Errorf("%s.%s: must not be empty", loc, name)
+		return "", fmt.Errorf("%s: must not be empty", appendFieldPath(loc, name))
 	}
 	return s, nil
 }
@@ -842,7 +892,7 @@ func requireBool(obj map[string]any, name, loc string) (bool, error) {
 	}
 	b, ok := v.(bool)
 	if !ok {
-		return false, fmt.Errorf("%s.%s: must be a boolean", loc, name)
+		return false, fmt.Errorf("%s: must be a boolean", appendFieldPath(loc, name))
 	}
 	return b, nil
 }

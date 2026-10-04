@@ -413,16 +413,153 @@ func TestContextTypeErrorKeyDecoding(t *testing.T) {
 	if v, ok := ctx.Get("plan"); !ok || v != "pro" {
 		t.Fatalf("escaped key lookup: %q %v", v, ok)
 	}
-	// 大小写与空白按原样保留，不改变属性匹配与定位。
+	// 大小写与空白按原样保留，不改变属性匹配与定位；含空格的名字走方括号定位。
 	_, err = ParseContext([]byte(`{"Alpha ":7}`))
-	if err == nil || !strings.Contains(err.Error(), "context.Alpha ") {
+	if err == nil || !strings.Contains(err.Error(), `context["Alpha "]`) {
 		t.Fatalf("case/space key: err=%v", err)
 	}
-	// 配对的代理项转义解码后定位到同一属性名。
+	// 配对的代理项转义解码后定位到同一属性名；非 ASCII 名字用方括号 JSON 字符串。
 	emojiKey := `"\u` + `D83D\u` + `DE00"` // 解码后为 "😀"
 	_, err = ParseContext([]byte(`{"a":"x",` + emojiKey + `:2}`))
-	if err == nil || !strings.Contains(err.Error(), "context.😀") {
+	if err == nil || !strings.Contains(err.Error(), `context["😀"]`) {
 		t.Fatalf("surrogate pair key: err=%v", err)
+	}
+	// 直接写出的同一 emoji 名字必须得到相同定位（解码后文字一致）。
+	_, err = ParseContext([]byte(`{"a":"x","😀":2}`))
+	if err == nil || !strings.Contains(err.Error(), `context["😀"]`) {
+		t.Fatalf("literal emoji key: err=%v", err)
+	}
+}
+
+func TestFieldPathFormatting(t *testing.T) {
+	// 字段位置统一规则：简单字段名（ASCII 字母/下划线开头，仅含 ASCII 字母数字
+	// 下划线）继续用点号；其他名字在父位置后用方括号包住一个 JSON 字符串。
+	for _, tc := range []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{"dotted name is bracketed", `{"user.name":7}`, `context["user.name"]`},
+		{"empty name is bracketed", `{"":7}`, `context[""]`},
+		{"newline in name is json escaped", "{\"a\\nb\":7}", `context["a\nb"]`},
+		{"tab in name is json escaped", "{\"a\\tb\":7}", `context["a\tb"]`},
+		{"quote in name is json escaped", `{"a\"b":7}`, `context["a\"b"]`},
+		{"backslash in name is json escaped", `{"a\\b":7}`, `context["a\\b"]`},
+		{"brackets are not array indices", `{"names[0]":7}`, `context["names[0]"]`},
+		{"leading digit is bracketed", `{"0ab":7}`, `context["0ab"]`},
+		{"dash is bracketed", `{"a-b":7}`, `context["a-b"]`},
+		{"simple underscore stays dotted", `{"_":7}`, `context._`},
+		{"simple alnum stays dotted", `{"plan_2":7}`, `context.plan_2`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := ParseContext([]byte(tc.raw))
+			if err == nil {
+				t.Fatalf("expected type error, got nil")
+			}
+			if !strings.Contains(err.Error(), tc.want) ||
+				!strings.Contains(err.Error(), "value must be a string") {
+				t.Fatalf("err=%q want location %q", err.Error(), tc.want)
+			}
+			// 控制字符必须转义显示：定位文字本身不能被拆成多行。
+			if strings.Contains(strings.SplitN(err.Error(), ": ", 2)[0], "\n") {
+				t.Fatalf("location text must stay on one line: %q", err.Error())
+			}
+		})
+	}
+
+	// 合法 Unicode 转义先解码再定位：. 与直接写出的点号得到同一位置。
+	_, err := ParseContext([]byte(`{"user.name":7}`))
+	if err == nil || !strings.Contains(err.Error(), `context["user.name"]`) {
+		t.Fatalf("escaped dot key: err=%v", err)
+	}
+
+	// 重复字段同样按统一规则定位；名字渲染为 JSON 字符串。
+	_, err = ParseContext([]byte(`{"user.name":1,"user.name":2}`))
+	if err == nil || !strings.Contains(err.Error(), `context["user.name"]: duplicate field "user.name"`) {
+		t.Fatalf("duplicate dotted key: err=%v", err)
+	}
+	// 转义形式与直接字符是同名字段：重复检查与定位都按解码后的文字。
+	_, err = ParseContext([]byte(`{"x.y":1,"x.y":2}`))
+	if err == nil || !strings.Contains(err.Error(), `context["x.y"]: duplicate field "x.y"`) {
+		t.Fatalf("duplicate escaped key: err=%v", err)
+	}
+	_, err = ParseContext([]byte(`{"":1,"":2}`))
+	if err == nil || !strings.Contains(err.Error(), `context[""]: duplicate field ""`) {
+		t.Fatalf("duplicate empty key: err=%v", err)
+	}
+
+	// 配置附加字段名为 meta.info，其中嵌套对象的 owner 重复：
+	// 应显示 config.flags[0]["meta.info"].owner。
+	rawConfig := `{"flags":[{"key":"f","enabled":true,"default":false,"rules":[],
+		"meta.info":{"owner":"a","owner":"b"}}]}`
+	_, err = ParseConfig([]byte(rawConfig))
+	if err == nil || !strings.Contains(err.Error(), `config.flags[0]["meta.info"].owner`) ||
+		!strings.Contains(err.Error(), "duplicate field") {
+		t.Fatalf("nested duplicate under dotted extra field: err=%v", err)
+	}
+	// 附加字段数组元素里的点号字段名同样加方括号。
+	rawConfig = `{"flags":[{"key":"f","enabled":true,"default":false,"rules":[],
+		"tags":[{"v":1},{"a.b":1,"a.b":2}]}]}`
+	_, err = ParseConfig([]byte(rawConfig))
+	if err == nil || !strings.Contains(err.Error(), `config.flags[0].tags[1]["a.b"]`) ||
+		!strings.Contains(err.Error(), "duplicate field") {
+		t.Fatalf("duplicate in extra array element: err=%v", err)
+	}
+	// 顶层附加的点号字段名。
+	_, err = ParseConfig([]byte(`{"flags":[],"x.y":1,"x.y":2}`))
+	if err == nil || !strings.Contains(err.Error(), `config["x.y"]: duplicate field "x.y"`) {
+		t.Fatalf("duplicate dotted top-level extra field: err=%v", err)
+	}
+
+	// 点号字段名的值含不完整 Unicode 转义：错误位置用方括号包住字段名。
+	_, err = ParseContext([]byte(`{"user.name":"\uD800"}`))
+	if err == nil || !strings.Contains(err.Error(), `context["user.name"]`) ||
+		!strings.Contains(err.Error(), "does not form a complete character") {
+		t.Fatalf("bad escape under dotted key: err=%v", err)
+	}
+}
+
+func TestBadEscapeInFieldNameKeepsRawEscapeAndObjectPath(t *testing.T) {
+	// 字段名自身含不完整 Unicode 转义时：仍报告它不能组成完整字符，保留可辨认的
+	// 原始转义内容（\uD800 不被替换成别的字符），位置准确指向所属对象。
+	_, err := ParseContext([]byte(`{"bad\uD800name":1}`))
+	if err == nil {
+		t.Fatal("expected invalid Unicode escape error")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "does not form a complete character") ||
+		!strings.Contains(msg, `\uD800`) {
+		t.Fatalf("context bad field name: err=%v", msg)
+	}
+	// 所属对象是根对象；非法名字不能被渲染进定位（不能出现替换字符定位）。
+	if !strings.HasPrefix(strings.SplitN(msg, ": ", 2)[0], "context") ||
+		strings.Contains(msg, "context[") || strings.Contains(msg, "context.") {
+		t.Fatalf("location must point at the root object only: %q", msg)
+	}
+
+	// 配置里开关附加字段名含坏转义：所属对象位置为 config.flags[0]。
+	_, err = ParseConfig([]byte(`{"flags":[{"key":"f","enabled":true,"default":false,"rules":[],
+		"met\uD800a":1}]}`))
+	if err == nil || !strings.Contains(err.Error(), `config.flags[0]`) ||
+		!strings.Contains(err.Error(), `\uD800`) ||
+		!strings.Contains(err.Error(), "does not form a complete character") {
+		t.Fatalf("config bad extra field name: err=%v", err)
+	}
+
+	// 嵌套附加对象内的字段名含坏转义：位置指向该嵌套对象 config.flags[0].meta。
+	_, err = ParseConfig([]byte(`{"flags":[{"key":"f","enabled":true,"default":false,"rules":[],
+		"meta":{"o\uD800wner":1}}]}`))
+	if err == nil || !strings.Contains(err.Error(), `config.flags[0].meta`) ||
+		!strings.Contains(err.Error(), `\uD800`) {
+		t.Fatalf("bad field name in nested object: err=%v", err)
+	}
+
+	// 数组元素对象内的字段名含坏转义：位置指向该元素对象。
+	_, err = ParseConfig([]byte(`{"flags":[{"key":"f","enabled":true,"default":false,"rules":[],
+		"tags":[{"k\uDC00":1}]}]}`))
+	if err == nil || !strings.Contains(err.Error(), `config.flags[0].tags[0]`) ||
+		!strings.Contains(err.Error(), `\uDC00`) {
+		t.Fatalf("bad field name in array element: err=%v", err)
 	}
 }
 
