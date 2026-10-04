@@ -413,15 +413,17 @@ func TestContextTypeErrorKeyDecoding(t *testing.T) {
 	if v, ok := ctx.Get("plan"); !ok || v != "pro" {
 		t.Fatalf("escaped key lookup: %q %v", v, ok)
 	}
-	// 大小写与空白按原样保留，不改变属性匹配与定位。
+	// 大小写与空白按原样保留，不改变属性匹配与定位；含空白的名字不属于点号
+	// 名字，按 context["JSON 字符串"] 定位。
 	_, err = ParseContext([]byte(`{"Alpha ":7}`))
-	if err == nil || !strings.Contains(err.Error(), "context.Alpha ") {
+	if err == nil || !strings.Contains(err.Error(), `context["Alpha "]`) {
 		t.Fatalf("case/space key: err=%v", err)
 	}
-	// 配对的代理项转义解码后定位到同一属性名。
+	// 配对的代理项转义解码后定位到同一属性名；非 ASCII 名字用方括号包裹的
+	// JSON 字符串定位。
 	emojiKey := `"\u` + `D83D\u` + `DE00"` // 解码后为 "😀"
 	_, err = ParseContext([]byte(`{"a":"x",` + emojiKey + `:2}`))
-	if err == nil || !strings.Contains(err.Error(), "context.😀") {
+	if err == nil || !strings.Contains(err.Error(), `context["😀"]`) {
 		t.Fatalf("surrogate pair key: err=%v", err)
 	}
 }
@@ -922,5 +924,231 @@ func TestEmptyFlagListAndFind(t *testing.T) {
 	flag := (&Flag{Key: "f", Enabled: false})
 	if got := flag.Evaluate(nil); got.Reason != EvalDisabled {
 		t.Errorf("nil context on disabled flag: %+v", got)
+	}
+}
+
+func TestFieldLocationBracketRule(t *testing.T) {
+	// 点号名字保持原样；其余名字在父位置后用方括号包住一个 JSON 字符串。
+	cases := []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{"dotted attribute stays dotted", `{"plan":7}`, `context.plan: value must be a string`},
+		{"dot in name is bracketed", `{"user.name":7}`, `context["user.name"]: value must be a string`},
+		{"empty name", `{"":7}`, `context[""]: value must be a string`},
+		{"leading digit", `{"0a":7}`, `context["0a"]`},
+		{"hyphen", `{"a-b":7}`, `context["a-b"]`},
+		{"trailing space", `{"plan ":7}`, `context["plan "]`},
+		{"brackets are not indices", `{"x[0]":7}`, `context["x[0]"]`},
+		{"closing bracket only", `{"a]b":7}`, `context["a]b"]`},
+		{"dot only", `{".":7}`, `context["."]`},
+		{"quote escaped", `{"a\"b":7}`, `context["a\"b"]`},
+		{"backslash escaped", `{"a\\b":7}`, `context["a\\b"]`},
+		{"newline escaped as JSON", "{\"li\\nne\":7}", `context["li\nne"]`},
+		{"tab escaped as JSON", "{\"li\\tne\":7}", `context["li\tne"]`},
+		{"unicode escape decodes to simple name", `{"\u0070lan":7}`, `context.plan`},
+		{"unicode escape decodes to dotted name", `{"\u0078[0]":7}`, `context["x[0]"]`},
+		{"non-ascii name", `{"😀":7}`, `context["😀"]`},
+		{"surrogate pair equals literal name", `{"\uD83D\uDE00":7}`, `context["😀"]`},
+		{"first dotted bad attr in source order", `{"user.name":1,"later":2}`, `context["user.name"]`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := ParseContext([]byte(tc.raw))
+			if err == nil {
+				t.Fatalf("ParseContext(%s): expected error, got nil", tc.raw)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("err=%q, want location %q", err.Error(), tc.want)
+			}
+			// 定位文字不得被拆成多行：JSON 转义后的字段名里不应出现原始换行。
+			if loc := err.Error(); strings.Contains(loc, "\n") {
+				t.Fatalf("location must stay on one line: %q", loc)
+			}
+		})
+	}
+}
+
+func TestFieldLocationDirectAndEscapedNamesAgree(t *testing.T) {
+	// 直接字符与合法 Unicode 转义写出的同一名字得到相同定位：两者非字符串值
+	// 都报 context["user.name"]。
+	direct := `{"user.name":7}`
+	escaped := `{"\u0075ser.name":7}`
+	_, err1 := ParseContext([]byte(direct))
+	_, err2 := ParseContext([]byte(escaped))
+	if err1 == nil || err2 == nil {
+		t.Fatalf("both must fail: %v %v", err1, err2)
+	}
+	if err1.Error() != err2.Error() {
+		t.Fatalf("direct=%q escaped=%q, want identical locations", err1, err2)
+	}
+}
+
+func TestDuplicateFieldBracketLocations(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{"context dotted name", `{"user.name":1,"user.name":2}`,
+			`context["user.name"]: duplicate field "user.name"`},
+		{"context empty name", `{"":1,"":2}`, `context[""]: duplicate field ""`},
+		{"context brackets not indices", `{"x[0]":1,"x[0]":2}`, `context["x[0]"]`},
+		{"context escaped same as direct", `{"a.b":1,"\u0061.b":2}`, `context["a.b"]`},
+		{"context newline name", "{\"li\\nne\":1,\"li\\nne\":2}", `context["li\nne"]`},
+		{"config dotted extra with nested dup", `{"flags":[{"key":"f","enabled":true,"default":false,"rules":[],
+			"meta.info":{"owner":"a","owner":"b"}}]}`,
+			`config.flags[0]["meta.info"].owner`},
+		{"config dotted extra array element dup", `{"flags":[{"key":"f","enabled":true,"default":false,"rules":[],
+			"meta.info":[{"x":1,"x":2}]}]}`,
+			`config.flags[0]["meta.info"][0].x`},
+		{"config dotted top-level extra", `{"flags":[],"x.y":1,"x.y":2}`, `config["x.y"]`},
+		{"config empty extra nested dup", `{"flags":[{"key":"f","enabled":true,"default":false,"rules":[],
+			"":{"z":1,"z":2}}]}`,
+			`config.flags[0][""].z`},
+		{"config bracket-like extra name", `{"flags":[{"key":"f","enabled":true,"default":false,"rules":[],
+			"x[0]":{"z":1,"z":2}}]}`,
+			`config.flags[0]["x[0]"].z`},
+	}
+	parse := func(raw string) error {
+		if strings.HasPrefix(raw, `{"flags"`) {
+			_, err := ParseConfig([]byte(raw))
+			return err
+		}
+		_, err := ParseContext([]byte(raw))
+		return err
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := parse(tc.raw)
+			if err == nil {
+				t.Fatalf("expected duplicate field error, got nil\n%s", tc.raw)
+			}
+			if !strings.Contains(err.Error(), "duplicate field") || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("err=%q, want duplicate field at %q", err.Error(), tc.want)
+			}
+		})
+	}
+}
+
+func TestInvalidUnicodeEscapeBracketLocations(t *testing.T) {
+	const incomplete = "does not form a complete character"
+
+	// 直接逐例显式断言上下文与配置中的非法转义值位置。
+	check := func(t *testing.T, parse func([]byte) error, raw, want string) {
+		t.Helper()
+		if err := parse([]byte(raw)); err == nil {
+			t.Fatalf("expected invalid Unicode escape error, got nil\n%s", raw)
+		} else {
+			msg := err.Error()
+			if !strings.Contains(msg, incomplete) || !strings.Contains(msg, want) {
+				t.Fatalf("err=%q, want %q and %q", msg, want, incomplete)
+			}
+		}
+	}
+
+	t.Run("context dotted attr value explicit", func(t *testing.T) {
+		check(t, func(b []byte) error { _, e := ParseContext(b); return e },
+			`{"user.name":"\uD800"}`, `context["user.name"]`)
+	})
+	t.Run("context empty attr value explicit", func(t *testing.T) {
+		check(t, func(b []byte) error { _, e := ParseContext(b); return e },
+			`{"":"\uD800"}`, `context[""]`)
+	})
+	t.Run("config dotted extra nested value explicit", func(t *testing.T) {
+		check(t, func(b []byte) error { _, e := ParseConfig(b); return e },
+			`{"flags":[{"key":"f","enabled":true,"default":false,"rules":[],
+			"meta.info":{"owner":"\uD800"}}]}`,
+			`config.flags[0]["meta.info"].owner`)
+	})
+	t.Run("config dotted extra array element value explicit", func(t *testing.T) {
+		check(t, func(b []byte) error { _, e := ParseConfig(b); return e },
+			`{"flags":[{"key":"f","enabled":true,"default":false,"rules":[],
+			"meta.info":[{"v":"\uDC00"}]}]}`,
+			`config.flags[0]["meta.info"][0].v`)
+	})
+
+	// 字段名自身含非法转义：位置指向所属对象，原文转义可辨，且不被替换成
+	// U+FFFD 之类的其他字符。
+	t.Run("bad field name reports owner object", func(t *testing.T) {
+		_, err := ParseContext([]byte(`{"a\uD800b":1}`))
+		if err == nil {
+			t.Fatal("expected error")
+		}
+		msg := err.Error()
+		for _, frag := range []string{`context:`, `field name "a\\uD800b"`, `\uD800`, incomplete} {
+			if !strings.Contains(msg, frag) {
+				t.Fatalf("err=%q, want fragment %q", msg, frag)
+			}
+		}
+		if strings.Contains(msg, "\uFFFD") {
+			t.Fatalf("illegal name must not be replaced by U+FFFD: %q", msg)
+		}
+	})
+
+	t.Run("bad nested field name reports exact owner", func(t *testing.T) {
+		_, err := ParseConfig([]byte(`{"flags":[{"key":"f","enabled":true,"default":false,"rules":[],
+			"meta.info":{"bad\uDC00x":1}}]}`))
+		if err == nil {
+			t.Fatal("expected error")
+		}
+		msg := err.Error()
+		for _, frag := range []string{`config.flags[0]["meta.info"]:`, `\uDC00`, incomplete} {
+			if !strings.Contains(msg, frag) {
+				t.Fatalf("err=%q, want fragment %q", msg, frag)
+			}
+		}
+		if strings.Contains(msg, "\uFFFD") {
+			t.Fatalf("illegal name must not be replaced: %q", msg)
+		}
+	})
+
+	t.Run("bad field name inside array element object", func(t *testing.T) {
+		_, err := ParseConfig([]byte(`{"flags":[{"key":"f","enabled":true,"default":false,"rules":[],
+			"tags":[{"a\uD800":1}]}]}`))
+		if err == nil {
+			t.Fatal("expected error")
+		}
+		if msg := err.Error(); !strings.Contains(msg, `config.flags[0].tags[0]:`) ||
+			!strings.Contains(msg, `\uD800`) {
+			t.Fatalf("err=%q", msg)
+		}
+	})
+
+	t.Run("path after syntactically bad key keeps raw name", func(t *testing.T) {
+		// "\u" 是非法的 \u 写法（JSON 语法错误），但扫描继续；其后嵌套对象里
+		// 值的非法代理项错误必须以原始字段名定位，而不是错位到上一个字段或
+		// 产生 "context..x" 之类的位置。
+		raw := []byte("{\"\\u\":{\"x\":\"\\uD800\"}}")
+		_, err := ParseContext(raw)
+		if err == nil {
+			t.Fatal("expected error")
+		}
+		msg := err.Error()
+		if !strings.Contains(msg, incomplete) {
+			t.Fatalf("err=%q, want incomplete-character error", msg)
+		}
+		if !strings.Contains(msg, `context["\\u"].x`) {
+			t.Fatalf("err=%q, want raw-name owner path context[%q].x", msg, `\\u`)
+		}
+	})
+}
+
+func TestEvaluateWithBracketedAttributeName(t *testing.T) {
+	// 求值规则不变：含点号的属性名按解码后的完整名字存取，与 user 对象无关。
+	cfg := `{"flags":[{"key":"f","enabled":true,"default":false,"rules":[
+		{"id":"r1","value":true,"conditions":[{"attribute":"user.name","op":"eq","value":"alice"}]}]}]}`
+	got := eval(t, cfg, "f", `{"user.name":"alice"}`)
+	if got.Reason != EvalRule || got.RuleID == nil || *got.RuleID != "r1" {
+		t.Fatalf("dotted attribute match: %+v", got)
+	}
+	if got := eval(t, cfg, "f", `{"name":"alice"}`); got.Reason != EvalDefault {
+		t.Fatalf("unrelated attribute must not match user.name: %+v", got)
+	}
+	// 转义形式的属性名与直接字符同义，求值一致。
+	got = eval(t, cfg, "f", `{"\u0075ser.name":"alice"}`)
+	if got.Reason != EvalRule {
+		t.Fatalf("escaped attribute name must match: %+v", got)
 	}
 }

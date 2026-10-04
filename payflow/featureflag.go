@@ -131,6 +131,42 @@ func isJSONWhitespace(b byte) bool {
 	return b == ' ' || b == '\t' || b == '\n' || b == '\r'
 }
 
+// isSimpleFieldName 报告 name 是否为“点号名字”：以 ASCII 字母或下划线开头，
+// 其后仅含 ASCII 字母、数字与下划线。此类名字在位置中直接以点号连接。
+func isSimpleFieldName(name string) bool {
+	if name == "" {
+		return false
+	}
+	if !isFieldNameStart(name[0]) {
+		return false
+	}
+	for i := 1; i < len(name); i++ {
+		if !isFieldNameChar(name[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+func isFieldNameStart(b byte) bool {
+	return b == '_' || ('a' <= b && b <= 'z') || ('A' <= b && b <= 'Z')
+}
+
+func isFieldNameChar(b byte) bool {
+	return isFieldNameStart(b) || ('0' <= b && b <= '9')
+}
+
+// appendFieldPath 把一个字段名按统一规则追加到父位置 parent 之后：点号名字
+// （isSimpleFieldName）用 ".name" 连接；其他名字在父位置后接 "[<JSON 字符串>]"，
+// 字符串采用 JSON 编码（Go 的 strconv.Quote 与 JSON 对引号、反斜杠和控制字符
+// 的转义一致），如 parent + `["user.name"]`、parent + `[""]`。
+func appendFieldPath(parent, name string) string {
+	if isSimpleFieldName(name) {
+		return parent + "." + name
+	}
+	return parent + "[" + strconv.Quote(name) + "]"
+}
+
 // ParseConfig parses a config document from JSON bytes with strict typing.
 // 先解析到 any 再逐字段校验，以区分“字段缺失”与“显式提供的 false”。
 func ParseConfig(raw []byte) (*Config, error) {
@@ -170,7 +206,8 @@ func ParseConfig(raw []byte) (*Config, error) {
 			return nil, err
 		}
 		if prev, dup := seenKeys[flag.Key]; dup {
-			return nil, fmt.Errorf("config.flags[%d].key: duplicate flag key %q (first at flags[%d])", i, flag.Key, prev)
+			flagLoc := fmt.Sprintf("config.flags[%d]", i)
+			return nil, fmt.Errorf("%s: duplicate flag key %q (first at flags[%d])", appendFieldPath(flagLoc, "key"), flag.Key, prev)
 		}
 		seenKeys[flag.Key] = i
 		cfg.Flags = append(cfg.Flags, flag)
@@ -214,7 +251,8 @@ func ParseContext(raw []byte) (*Context, error) {
 
 // checkContextValueTypes 按文件原文顺序扫描已通过语法与重复字段检查的
 // context 对象，报告第一个值不是字符串的顶层属性。键名使用解码后的文字
-// （合法的 \uXXXX 转义与直接字符同义；大小写与空白按原样保留）。嵌套
+// （合法的 \uXXXX 转义与直接字符同义；大小写与空白按原样保留），并按统一
+// 规则定位：点号名字用 context.name，其余用 context["JSON 字符串"]。嵌套
 // 对象或数组整体跳过，其内部成员不单独检查。
 func checkContextValueTypes(raw []byte) error {
 	dec := json.NewDecoder(bytes.NewReader(raw))
@@ -237,7 +275,7 @@ func checkContextValueTypes(raw []byte) error {
 			return nil // 语法错误留给严格解码的报错
 		}
 		if _, ok := value.(string); !ok {
-			return fmt.Errorf("context.%s: value must be a string", key)
+			return fmt.Errorf("%s: value must be a string", appendFieldPath("context", key))
 		}
 	}
 	return nil
@@ -334,8 +372,13 @@ type jsonFrame struct {
 	// keys 记录本对象已声明的字段名（按解码后的字符串），仅重复字段检查使用；
 	// Unicode 遍历不登记字段，保持 nil。
 	keys map[string]struct{}
-	// lastKey 是对象最近一个字段名，用于拼出字段值的位置。
-	lastKey string
+	// lastKey 是对象最近一个字段名，用于拼出字段值的位置。字段名能正常
+	// JSON 解码时（lastKeyValid）保存解码后的文字；字段名含不能组成完整
+	// 字符的 Unicode 转义时保存字段名原文（不含两侧引号，保留 \uXXXX
+	// 等原始写法），且 lastKeyValid 为 false——这种名字无法解码，只能以
+	// 原文参与后续字段的定位。
+	lastKey      string
+	lastKeyValid bool
 	// expectKey 标记对象内下一个字符串是否为字段名。
 	expectKey bool
 	// nextIndex 是数组下一个元素的下标。
@@ -357,12 +400,17 @@ func (t *jsonPathTracker) top() *jsonFrame {
 	return t.stack[len(t.stack)-1]
 }
 
-// childPath 拼出栈顶容器内下一个子值的位置：对象的字段值用 .字段名，
-// 数组元素用 [下标]。
+// childPath 拼出栈顶容器内下一个子值的位置：对象的字段值按统一规则拼接
+// 字段名（点号名字用 .name，其余用 ["JSON 字符串"]），数组元素用 [下标]。
 func (t *jsonPathTracker) childPath() string {
 	top := t.top()
 	if top.object {
-		return top.path + "." + top.lastKey
+		if top.lastKeyValid {
+			return appendFieldPath(top.path, top.lastKey)
+		}
+		// 字段名本身无法解码（含非法转义）：把原文（反斜杠按 JSON 再转义一次）
+		// 放进方括号，不替换成 U+FFFD 之类的其他字符。
+		return top.path + "[" + strconv.Quote(top.lastKey) + "]"
 	}
 	return top.path + "[" + strconv.Itoa(top.nextIndex) + "]"
 }
@@ -430,10 +478,11 @@ func (t *jsonPathTracker) noteKey(name string) error {
 		top.keys = make(map[string]struct{})
 	}
 	if _, dup := top.keys[name]; dup {
-		return fmt.Errorf("%s.%s: duplicate field %q", top.path, name, name)
+		return fmt.Errorf("%s: duplicate field %q", appendFieldPath(top.path, name), name)
 	}
 	top.keys[name] = struct{}{}
 	top.lastKey = name
+	top.lastKeyValid = true
 	top.expectKey = false
 	return nil
 }
@@ -443,13 +492,19 @@ func (t *jsonPathTracker) noteKey(name string) error {
 func (t *jsonPathTracker) setKey(name string) {
 	top := t.top()
 	top.lastKey = name
+	top.lastKeyValid = true
 	top.expectKey = false
 }
 
-// noteInvalidKey 在字段名无法解码（属于 JSON 语法错误）时仅推进键值状态：
-// 不覆盖已记录的字段名；语法错误留给后续严格 JSON 解码报告。
-func (t *jsonPathTracker) noteInvalidKey() {
-	t.top().expectKey = false
+// setInvalidKey 在字段名含不能组成完整字符的 Unicode 转义时记录其原文
+// （不含两侧引号，保留 \uXXXX 等原始写法）：不替换成 U+FFFD 之类的其他字符，
+// 使同一对象内后续值的定位仍能准确指向所属对象。非法字段名不登记到重复
+// 字段集合——它本身已构成错误，且无法与解码后的名字比较。
+func (t *jsonPathTracker) setInvalidKey(rawName string) {
+	top := t.top()
+	top.lastKey = rawName
+	top.lastKeyValid = false
+	top.expectKey = false
 }
 
 // rejectDuplicateFields 按文件原文顺序扫描 JSON 令牌流，拒绝任何在同一对象内
@@ -526,14 +581,17 @@ func rejectInvalidUnicodeEscapes(raw []byte, label string) error {
 			content := raw[i+1 : contentEnd]
 			if tracker.atKey() {
 				if bad := findBadUnicodeEscape(content); bad != nil {
-					return fmt.Errorf("%s: field name %q contains invalid Unicode escape %s: Unicode escape does not form a complete character (%s)",
-						tracker.currentPath(), string(content), bad.escape, bad.detail)
+					// 字段名原文用 strconv.Quote 包成 JSON 字符串形式：其中的引号、
+					// 反斜杠与控制字符按 JSON 转义，而 \uXXXX 这类转义写法以反斜杠
+					// 转义后原样可辨（不会先解码再替换成别的字符）。
+					return fmt.Errorf("%s: field name %s contains invalid Unicode escape %s: Unicode escape does not form a complete character (%s)",
+						tracker.currentPath(), strconv.Quote(string(content)), bad.escape, bad.detail)
 				}
 				// 转义已校验合法，解码用于定位路径；失败说明是语法错误，留给严格 JSON 解码。
 				if name, ok := decodeJSONString(raw[i:end]); ok {
 					tracker.setKey(name)
 				} else {
-					tracker.noteInvalidKey()
+					tracker.setInvalidKey(string(content))
 				}
 			} else {
 				path := tracker.valuePath()
@@ -710,7 +768,8 @@ func parseFlag(raw any, index int) (Flag, error) {
 			return Flag{}, err
 		}
 		if prev, dup := seenRules[rule.ID]; dup {
-			return Flag{}, fmt.Errorf("%s.rules[%d].id: duplicate rule id %q (first at rules[%d])", loc, ri, rule.ID, prev)
+			return Flag{}, fmt.Errorf("%s: duplicate rule id %q (first at rules[%d])",
+				appendFieldPath(fmt.Sprintf("%s.rules[%d]", loc, ri), "id"), rule.ID, prev)
 		}
 		seenRules[rule.ID] = ri
 		flag.Rules = append(flag.Rules, rule)
@@ -737,7 +796,7 @@ func parseRule(raw any, flagIndex, ruleIndex int) (Rule, error) {
 		return Rule{}, err
 	}
 	if len(condsArr) == 0 {
-		return Rule{}, fmt.Errorf("%s.conditions: must contain at least one condition", loc)
+		return Rule{}, fmt.Errorf("%s: must contain at least one condition", appendFieldPath(loc, "conditions"))
 	}
 	rule := Rule{ID: id, Value: value}
 	for ci, cv := range condsArr {
@@ -769,41 +828,43 @@ func parseCondition(raw any, flagIndex, ruleIndex, condIndex int) (Condition, er
 		return Condition{}, err
 	}
 	cond := Condition{Attribute: attribute, Op: op}
+	valueLoc := appendFieldPath(loc, "value")
 	switch op {
 	case "eq":
 		s, ok := valueField.(string)
 		if !ok {
-			return Condition{}, fmt.Errorf("%s.value: must be a string when op is %q", loc, op)
+			return Condition{}, fmt.Errorf("%s: must be a string when op is %q", valueLoc, op)
 		}
 		cond.strVal = s
 	case "in":
 		arr, ok := valueField.([]any)
 		if !ok {
-			return Condition{}, fmt.Errorf("%s.value: must be an array when op is %q", loc, op)
+			return Condition{}, fmt.Errorf("%s: must be an array when op is %q", valueLoc, op)
 		}
 		if len(arr) == 0 {
-			return Condition{}, fmt.Errorf("%s.value: in-list must contain at least one item", loc)
+			return Condition{}, fmt.Errorf("%s: in-list must contain at least one item", valueLoc)
 		}
 		for ii, item := range arr {
 			s, ok := item.(string)
 			if !ok {
-				return Condition{}, fmt.Errorf("%s.value[%d]: must be a string", loc, ii)
+				return Condition{}, fmt.Errorf("%s[%d]: must be a string", valueLoc, ii)
 			}
 			cond.inVal = append(cond.inVal, s)
 		}
 	default:
-		return Condition{}, fmt.Errorf("%s.op: unknown operator %q (allowed: eq, in)", loc, op)
+		return Condition{}, fmt.Errorf("%s: unknown operator %q (allowed: eq, in)", appendFieldPath(loc, "op"), op)
 	}
 	return cond, nil
 }
 
 func requireField(obj map[string]any, name, loc string) (any, error) {
 	v, ok := obj[name]
+	field := appendFieldPath(loc, name)
 	if !ok {
-		return nil, fmt.Errorf("%s.%s: field is required", loc, name)
+		return nil, fmt.Errorf("%s: field is required", field)
 	}
 	if v == nil {
-		return nil, fmt.Errorf("%s.%s: must not be null", loc, name)
+		return nil, fmt.Errorf("%s: must not be null", field)
 	}
 	return v, nil
 }
@@ -815,7 +876,7 @@ func requireArrayField(obj map[string]any, name, loc string) ([]any, error) {
 	}
 	arr, ok := v.([]any)
 	if !ok {
-		return nil, fmt.Errorf("%s.%s: must be an array", loc, name)
+		return nil, fmt.Errorf("%s: must be an array", appendFieldPath(loc, name))
 	}
 	return arr, nil
 }
@@ -827,10 +888,10 @@ func requireNonEmptyString(obj map[string]any, name, loc string) (string, error)
 	}
 	s, ok := v.(string)
 	if !ok {
-		return "", fmt.Errorf("%s.%s: must be a string", loc, name)
+		return "", fmt.Errorf("%s: must be a string", appendFieldPath(loc, name))
 	}
 	if s == "" {
-		return "", fmt.Errorf("%s.%s: must not be empty", loc, name)
+		return "", fmt.Errorf("%s: must not be empty", appendFieldPath(loc, name))
 	}
 	return s, nil
 }
@@ -842,7 +903,7 @@ func requireBool(obj map[string]any, name, loc string) (bool, error) {
 	}
 	b, ok := v.(bool)
 	if !ok {
-		return false, fmt.Errorf("%s.%s: must be a boolean", loc, name)
+		return false, fmt.Errorf("%s: must be a boolean", appendFieldPath(loc, name))
 	}
 	return b, nil
 }
