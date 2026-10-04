@@ -78,6 +78,11 @@ func atomicWrite(path string, v any) error {
 // 结算与退款按各自成功历史交错：退款 r 只允许发生在序号 <= r.AfterSeq 的
 // 结算之后（AfterSeq 是退款落账时结算历史的长度）。这保留了
 // “付款 → 退款 → 再付款”的真实时间顺序，使中间余额与最终余额都可验证。
+//
+// 结算历史只会追加，因此按退款成功顺序看，AfterSeq 必须单调不减：
+// 后一次退款落账时已存在的结算不可能比前一次退款时更少。相邻退款
+// AfterSeq 相等是合法的（两次退款之间没有新增结算）；出现倒退即说明
+// 该历史无法由正常的付款与退款操作产生，整本账本判定为损坏。
 func validateAndReplay(initial, final map[balanceKey]int64, records []Record, refunds []RefundRecord) error {
 	// 先校验结算自身的结构不变式（余额相关的判定由后面的交错重放完成，
 	// 因为退款回收的余额允许同一笔钱被再次扣出，累计毛扣款可能超过初始余额）。
@@ -115,6 +120,9 @@ func validateAndReplay(initial, final map[balanceKey]int64, records []Record, re
 
 	// 校验退款自身的不变式：字段非空、序列连续、引用的结算在退款时点已存在、
 	// 金额与去向与原结算逐字一致、每笔结算最多退回一次、退款编号全局唯一。
+	// 退款按成功顺序保存，AfterSeq 必须单调不减：结算历史只追加，后一次退款
+	// 落账时已存在的结算数量不可能比前一次少。该规则针对整本账本的结算历史，
+	// 与两笔退款是否属于同一账户、同一资产或引用同一结算无关。
 	seenRefund := map[string]bool{}
 	refundedBy := map[string]string{} // 结算编号 -> 首个退回它的退款编号
 	for i, rf := range refunds {
@@ -133,6 +141,12 @@ func validateAndReplay(initial, final map[balanceKey]int64, records []Record, re
 		}
 		if rf.AfterSeq < 0 || rf.AfterSeq > int64(len(records)) {
 			return ledgerError(ErrCorrupt, "refund %q references settlement outside history (after_seq=%d)", rf.ID, rf.AfterSeq)
+		}
+		if i > 0 && rf.AfterSeq < refunds[i-1].AfterSeq {
+			prev := refunds[i-1]
+			return ledgerError(ErrCorrupt,
+				"refund %q (seq %d) has after_seq %d, but previous refund %q (seq %d) already saw %d settlements: settlement history only grows",
+				rf.ID, rf.Seq, rf.AfterSeq, prev.ID, prev.Seq, prev.AfterSeq)
 		}
 		var target *Record
 		for j := range records {
@@ -158,7 +172,8 @@ func validateAndReplay(initial, final map[balanceKey]int64, records []Record, re
 	}
 
 	// 按成功时间交错重放：第 s 笔结算之后落入 after_seq==s 的全部退款
-	// （退款之间按其自身序号；用分桶而非假定 after_seq 单调，以抵抗篡改数据）。
+	// （退款之间按其自身序号；after_seq 单调性已在上面强制，分桶只是
+	// 把退款归到各自时点，不依赖记录顺序之外的假设）。
 	// net[k] 为该组合截至当前时点的“净扣款”（扣款增加、退款减少），
 	// 必须始终落在 [0, initial]，且不发生 int64 溢出。
 	buckets := make([][]int, len(records)+1) // after_seq -> refunds 下标

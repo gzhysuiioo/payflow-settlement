@@ -1414,10 +1414,38 @@ func TestCorruptRefundLedgerRejected(t *testing.T) {
 		refunds: []RefundRecord{goodRF, rf2},
 	}
 
+	// “after_seq 倒退”：两笔各 100 的零费率付款先后成功；退款 r1（seq 1）退第二笔，
+	// 时点 after_seq=2；退款 r2（seq 2）退第一笔，时点却为 after_seq=1。
+	// 两笔退款各自的金额、目标、序号与最终余额都能单独核对上，但第二次退款
+	// 发生时不可能只剩一笔已完成付款——结算历史只追加，after_seq 不得倒退。
+	pay1 := Record{ID: "q1", Account: "aa", Paymaster: "pm", Asset: "usdc", Amount: 100, Nonce: 1, FeeBps: 0, Fee: 0, Charged: 100, Seq: 1}
+	pay2 := Record{ID: "q2", Account: "aa", Paymaster: "pm", Asset: "usdc", Amount: 100, Nonce: 2, FeeBps: 0, Fee: 0, Charged: 100, Seq: 2}
+	back1 := RefundRecord{ID: "b1", SettlementID: "q2", Reason: "x", Account: "aa", Asset: "usdc", Amount: 100, Fee: 0, Charged: 100, AfterSeq: 2, Seq: 1}
+	back2 := RefundRecord{ID: "b2", SettlementID: "q1", Reason: "x", Account: "aa", Asset: "usdc", Amount: 100, Fee: 0, Charged: 100, AfterSeq: 1, Seq: 2}
+	cases["after_seq regression"] = struct {
+		final   map[balanceKey]int64
+		records []Record
+		refunds []RefundRecord
+	}{
+		final:   map[balanceKey]int64{k: 1000},
+		records: []Record{pay1, pay2},
+		refunds: []RefundRecord{back1, back2},
+	}
+
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
-			if err := validateAndReplay(initial, tc.final, tc.records, tc.refunds); err == nil || KindOf(err) != ErrCorrupt {
+			err := validateAndReplay(initial, tc.final, tc.records, tc.refunds)
+			if err == nil || KindOf(err) != ErrCorrupt {
 				t.Fatalf("%s: want ErrCorrupt, got %v", name, err)
+			}
+			if name == "after_seq regression" {
+				// 错误说明要定位到发生倒退的退款，并带上相邻两笔的时点。
+				msg := err.Error()
+				for _, want := range []string{"b2", "b1", "after_seq"} {
+					if !strings.Contains(msg, want) {
+						t.Fatalf("error %q should mention %q", msg, want)
+					}
+				}
 			}
 		})
 	}
@@ -1425,6 +1453,20 @@ func TestCorruptRefundLedgerRejected(t *testing.T) {
 	// 健康的付款→退款账本必须通过。
 	if err := validateAndReplay(finalBack, finalBack, []Record{rec}, []RefundRecord{goodRF}); err != nil {
 		t.Fatalf("healthy refund ledger rejected: %v", err)
+	}
+
+	// 相邻退款 after_seq 相等是合法的：两次退款之间没有新增成功付款。
+	same1 := RefundRecord{ID: "s1", SettlementID: "q1", Reason: "x", Account: "aa", Asset: "usdc", Amount: 100, Fee: 0, Charged: 100, AfterSeq: 2, Seq: 1}
+	same2 := RefundRecord{ID: "s2", SettlementID: "q2", Reason: "x", Account: "aa", Asset: "usdc", Amount: 100, Fee: 0, Charged: 100, AfterSeq: 2, Seq: 2}
+	if err := validateAndReplay(initial, map[balanceKey]int64{k: 1000}, []Record{pay1, pay2}, []RefundRecord{same1, same2}); err != nil {
+		t.Fatalf("equal after_seq refunds rejected: %v", err)
+	}
+
+	// 正常交错历史（付款、退款、再付款、再退款）也必须通过。
+	inter1 := RefundRecord{ID: "t1", SettlementID: "q1", Reason: "x", Account: "aa", Asset: "usdc", Amount: 100, Fee: 0, Charged: 100, AfterSeq: 1, Seq: 1}
+	inter2 := RefundRecord{ID: "t2", SettlementID: "q2", Reason: "x", Account: "aa", Asset: "usdc", Amount: 100, Fee: 0, Charged: 100, AfterSeq: 2, Seq: 2}
+	if err := validateAndReplay(initial, map[balanceKey]int64{k: 1000}, []Record{pay1, pay2}, []RefundRecord{inter1, inter2}); err != nil {
+		t.Fatalf("interleaved pay/refund history rejected: %v", err)
 	}
 }
 
