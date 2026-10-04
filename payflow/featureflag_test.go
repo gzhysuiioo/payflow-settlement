@@ -372,6 +372,50 @@ func TestContextValueTypeErrorIsFirstInSourceOrder(t *testing.T) {
 	}
 }
 
+func TestContextOutOfRangeNumberIsTypeError(t *testing.T) {
+	// 超出 float64 范围的数字仍是合法 JSON 数字，只是不能作为属性值：
+	// 必须报告所属属性的类型错误，而不是“JSON 无效”。
+	bigInt := "1" + strings.Repeat("0", 400)
+	for _, tc := range []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{"big exponent after bool", `{"zeta":false,"alpha":1e400}`, "context.zeta"},
+		{"big exponent first", `{"alpha":1e400,"zeta":false}`, "context.alpha"},
+		{"positive exponent", `{"a":1e400}`, "context.a"},
+		{"negative exponent", `{"a":-1e400}`, "context.a"},
+		{"huge integer literal", `{"a":` + bigInt + `}`, "context.a"},
+		{"object member holds big number", `{"a":{"b":1e400}}`, "context.a"},
+		{"array member holds big number", `{"a":[1e400]}`, "context.a"},
+		{"after fixing first error", `{"zeta":"z","alpha":1e400}`, "context.alpha"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := ParseContext([]byte(tc.raw))
+			if err == nil || !strings.Contains(err.Error(), tc.want) ||
+				!strings.Contains(err.Error(), "value must be a string") {
+				t.Errorf("ParseContext(%s): err=%v want %q string-type error", tc.raw, err, tc.want)
+			}
+		})
+	}
+
+	// 大数字不能遮住按现有优先关系在前报告的错误。
+	if _, err := ParseContext([]byte(`{"a":1e400,"a":2}`)); err == nil ||
+		!strings.Contains(err.Error(), "duplicate field") {
+		t.Fatalf("duplicate field must not be masked by big number: %v", err)
+	}
+	if _, err := ParseContext([]byte(`{"zeta":1e400,"plan":"\uD800"}`)); err == nil ||
+		!strings.Contains(err.Error(), "does not form a complete character") {
+		t.Fatalf("invalid Unicode escape must not be masked by big number: %v", err)
+	}
+
+	// 写成字符串的 "1e400" 是合法属性值，原样参与字符串比较。
+	ctx := mustParseContext(t, `{"a":"1e400"}`)
+	if v, ok := ctx.Get("a"); !ok || v != "1e400" {
+		t.Fatalf("string-quoted big number must stay a string: %q %v", v, ok)
+	}
+}
+
 func TestContextNonStringValueShapes(t *testing.T) {
 	// 数字、布尔、null、数组、对象都不能作为顶层属性值；对象/数组值的错误
 	// 指向所属的顶层属性，不指向内部成员。
@@ -727,7 +771,7 @@ func TestValidUnicodeEscapesUnchanged(t *testing.T) {
 	if got := eval(t, cfgLit, "f", `{"emoji":"�"}`); got.Reason != EvalDefault {
 		t.Fatalf("U+FFFD is just another string: %+v", got)
 	}
-	// 反斜杠转义后的 "\uD800" 是普通文本（内容为 \uD800 六个字符）。
+	// 反斜杠转义后的 "\\uD800" 是普通文本（内容为 \\uD800 六个字符）。
 	mustParseContext(t, `{"a":"\\uD800"}`)
 	cfgText := `{"flags":[{"key":"f","enabled":true,"default":false,"rules":[
 		{"id":"r1","value":true,"conditions":[{"attribute":"a","op":"eq","value":"\\uD800"}]}]}]}`

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"strconv"
 	"unicode/utf8"
@@ -151,8 +152,20 @@ func ParseContext(raw []byte) (*Context, error) {
 	if err := rejectDuplicateFields(raw, "context"); err != nil {
 		return nil, err
 	}
+	// 数字按 json.Number 解码：1e400 这类超出 float64 范围的写法是合法 JSON
+	// 数字，只是不能作为属性值，类型错误由 checkContextValueTypes 按属性报告，
+	// 不能在这里被当成“JSON 无效”。
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
 	var doc any
-	if err := json.Unmarshal(raw, &doc); err != nil {
+	if err := dec.Decode(&doc); err != nil {
+		return nil, fmt.Errorf("context: invalid JSON: %w", err)
+	}
+	var extra any
+	if err := dec.Decode(&extra); err != io.EOF {
+		if err == nil {
+			return nil, fmt.Errorf("context: invalid JSON: unexpected data after top-level value")
+		}
 		return nil, fmt.Errorf("context: invalid JSON: %w", err)
 	}
 	root, ok := doc.(map[string]any)
@@ -178,6 +191,9 @@ func ParseContext(raw []byte) (*Context, error) {
 // 对象或数组整体跳过，其内部成员不单独检查。
 func checkContextValueTypes(raw []byte) error {
 	dec := json.NewDecoder(bytes.NewReader(raw))
+	// 数字按 json.Number 解码：超出 float64 范围的合法数字（如 1e400）不应
+	// 使 Decode 失败，而是作为非字符串值报告所属属性的类型错误。
+	dec.UseNumber()
 	// 第一个令牌必须是顶层对象的 '{'；非对象的情形在 ParseContext 中报告。
 	if tok, err := dec.Token(); err != nil || tok != json.Delim('{') {
 		return nil
@@ -417,6 +433,9 @@ func (t *jsonPathTracker) noteInvalidKey() {
 // 留给 Unmarshal。
 func rejectDuplicateFields(raw []byte, label string) error {
 	dec := json.NewDecoder(bytes.NewReader(raw))
+	// 数字按 json.Number 读取：1e400 这类超出 float64 范围的合法数字不能
+	// 中断令牌流，否则其后的重复字段会被大数字遮住。
+	dec.UseNumber()
 	tracker := newJSONPathTracker(label)
 	for {
 		tok, err := dec.Token()
