@@ -131,25 +131,50 @@ func isJSONWhitespace(b byte) bool {
 	return b == ' ' || b == '\t' || b == '\n' || b == '\r'
 }
 
-// ParseConfig parses a config document from JSON bytes with strict typing.
-// 先解析到 any 再逐字段校验，以区分“字段缺失”与“显式提供的 false”。
-func ParseConfig(raw []byte) (*Config, error) {
+// parseJSONDocument 执行配置与上下文两类输入共同维护的文档格式校验，使两份
+// JSON 对同一组格式规则给出一致的接受结果与错误定位。检查按固定先后顺序报告
+// 原文中的第一处问题：
+//  1. 非法 UTF-8 字节——最先检查，不被其后任何错误遮住；
+//  2. 不能组成完整字符的 \uXXXX 转义（字段名与字符串值同等检查）——先于
+//     重复字段，避免 encoding/json 把孤立代理项静默替换成 U+FFFD 后误判重复；
+//  3. 同一对象内的重复字段——先于业务字段问题；
+//  4. JSON 语法与单文档边界：只接受一个顶层值，完整文档后只允许空白，
+//     第二个值或其他尾随内容一律拒绝；
+//  5. 顶层必须是一个 JSON 对象。
+//
+// 这一步只判定文档格式：数字一律按原文保留（json.Number），语法合法但超出
+// 浮点范围的大数字不在此拒绝；具体字段的类型/必填/唯一性属于各自的业务规则，
+// 由调用方在取得 root 后按配置或上下文的约定继续校验。label 是本文档在错误
+// 信息中的名字（"config" 或 "context"）。
+func parseJSONDocument(raw []byte, label string) (map[string]any, error) {
 	if !utf8.Valid(raw) {
-		return nil, fmt.Errorf("config: file is not valid UTF-8")
+		return nil, fmt.Errorf("%s: file is not valid UTF-8", label)
 	}
-	if err := rejectInvalidUnicodeEscapes(raw, "config"); err != nil {
+	if err := rejectInvalidUnicodeEscapes(raw, label); err != nil {
 		return nil, err
 	}
-	if err := rejectDuplicateFields(raw, "config"); err != nil {
+	if err := rejectDuplicateFields(raw, label); err != nil {
 		return nil, err
 	}
 	doc, err := unmarshalStrictJSON(raw)
 	if err != nil {
-		return nil, fmt.Errorf("config: invalid JSON: %w", err)
+		return nil, fmt.Errorf("%s: invalid JSON: %w", label, err)
 	}
 	root, ok := doc.(map[string]any)
 	if !ok {
-		return nil, fmt.Errorf("config: top level must be a JSON object")
+		return nil, fmt.Errorf("%s: top level must be a JSON object", label)
+	}
+	return root, nil
+}
+
+// ParseConfig parses a config document from JSON bytes with strict typing.
+// 文档格式校验由 parseJSONDocument 与 ParseContext 共同维护；这里只继续处理
+// 配置自身的业务字段（开关、规则、条件与唯一性）。先解析到 any 再逐字段校验，
+// 以区分“字段缺失”与“显式提供的 false”。
+func ParseConfig(raw []byte) (*Config, error) {
+	root, err := parseJSONDocument(raw, "config")
+	if err != nil {
+		return nil, err
 	}
 	flagsRaw, present := root["flags"]
 	if !present {
@@ -179,23 +204,12 @@ func ParseConfig(raw []byte) (*Config, error) {
 }
 
 // ParseContext parses an attribute-name -> string context object; it may be empty.
+// 文档格式校验由 parseJSONDocument 与 ParseConfig 共同维护；这里只继续检查
+// 上下文自身的业务规则：每个顶层属性的值都必须是字符串。
 func ParseContext(raw []byte) (*Context, error) {
-	if !utf8.Valid(raw) {
-		return nil, fmt.Errorf("context: file is not valid UTF-8")
-	}
-	if err := rejectInvalidUnicodeEscapes(raw, "context"); err != nil {
-		return nil, err
-	}
-	if err := rejectDuplicateFields(raw, "context"); err != nil {
-		return nil, err
-	}
-	doc, err := unmarshalStrictJSON(raw)
+	root, err := parseJSONDocument(raw, "context")
 	if err != nil {
-		return nil, fmt.Errorf("context: invalid JSON: %w", err)
-	}
-	root, ok := doc.(map[string]any)
-	if !ok {
-		return nil, fmt.Errorf("context: top level must be a JSON object")
+		return nil, err
 	}
 	// 语法校验通过后才建立可用属性：值类型检查与属性建立在同一次遍历中完成。
 	return buildContext(raw, root)
