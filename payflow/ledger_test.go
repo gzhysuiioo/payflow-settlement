@@ -1875,3 +1875,238 @@ func TestChargeLimitAbsentOrEmptyMeansUnlimited(t *testing.T) {
 		l.Close()
 	}
 }
+
+// ---- 目录软链接：同一账本的两个路径共享同一份结算状态 ----
+
+// symlinkedLedger 在真实目录初始化账本，再建立指向该目录的软链接，
+// 返回真实路径与经软链接的路径。
+func symlinkedLedger(t *testing.T, init []BalanceInit) (realPath, linkPath string) {
+	t.Helper()
+	dir := t.TempDir()
+	realDir := filepath.Join(dir, "real")
+	if err := os.Mkdir(realDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	linkDir := filepath.Join(dir, "link")
+	if err := os.Symlink(realDir, linkDir); err != nil {
+		t.Fatal(err)
+	}
+	realPath = filepath.Join(realDir, "ledger.json")
+	if err := CreateLedger(realPath, init); err != nil {
+		t.Fatalf("CreateLedger: %v", err)
+	}
+	return realPath, filepath.Join(linkDir, "ledger.json")
+}
+
+func TestSymlinkHandlesShareState(t *testing.T) {
+	realPath, linkPath := symlinkedLedger(t, []BalanceInit{{Account: "aa", Asset: "usdc", Balance: 100}})
+	lReal := openOrFail(t, realPath)
+	lLink := openOrFail(t, linkPath)
+
+	// 经真实路径提交付款。
+	res, err := lReal.Submit(FeeBatch{FeeBps: 0, Intents: []PaymentIntent{intent("p1", "aa", "usdc", 60)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Results[0].Status != StatusSettled {
+		t.Fatalf("first submit: %+v", res.Results[0])
+	}
+
+	// 经软链接路径提交完全相同的请求：幂等返回原记录，不再扣款。
+	dup, err := lLink.Submit(FeeBatch{FeeBps: 0, Intents: []PaymentIntent{intent("p1", "aa", "usdc", 60)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dup.Results[0].Status != StatusDuplicate || dup.Results[0].Record == nil ||
+		dup.Results[0].Record.Seq != res.Results[0].Record.Seq {
+		t.Fatalf("want duplicate with original record, got %+v", dup.Results[0])
+	}
+
+	// 同一编号修改金额或费率：冲突，保留原记录。
+	modified := intent("p1", "aa", "usdc", 61)
+	conf, err := lLink.Submit(FeeBatch{FeeBps: 0, Intents: []PaymentIntent{modified}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if conf.Results[0].Status != StatusConflict {
+		t.Fatalf("want conflict, got %+v", conf.Results[0])
+	}
+	confFee, err := lReal.Submit(FeeBatch{FeeBps: 10, Intents: []PaymentIntent{intent("p1", "aa", "usdc", 60)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if confFee.Results[0].Status != StatusConflict {
+		t.Fatalf("fee change: want conflict, got %+v", confFee.Results[0])
+	}
+
+	// 两个路径查询到相同的余额与历史。
+	for name, l := range map[string]*Ledger{"real": lReal, "link": lLink} {
+		bal, err := l.Balance("aa", "usdc")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if bal != 40 {
+			t.Fatalf("%s handle: balance=%d, want 40", name, bal)
+		}
+		snap, err := l.Query()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(snap.Settlements) != 1 || snap.Settlements[0].ID != "p1" {
+			t.Fatalf("%s handle: settlements=%+v", name, snap.Settlements)
+		}
+	}
+}
+
+func TestSymlinkHandlesShareBalance(t *testing.T) {
+	realPath, linkPath := symlinkedLedger(t, []BalanceInit{{Account: "aa", Asset: "usdc", Balance: 100}})
+	lReal := openOrFail(t, realPath)
+	lLink := openOrFail(t, linkPath)
+
+	// 初始余额 100、费率 0：先成功的 70 立即影响另一路径上的 40。
+	res70, err := lReal.Submit(FeeBatch{FeeBps: 0, Intents: []PaymentIntent{intent("p70", "aa", "usdc", 70)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res70.Results[0].Status != StatusSettled {
+		t.Fatalf("p70: %+v", res70.Results[0])
+	}
+	res40, err := lLink.Submit(FeeBatch{FeeBps: 0, Intents: []PaymentIntent{intent("p40", "aa", "usdc", 40)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res40.Results[0].Status != StatusFunds {
+		t.Fatalf("p40: want insufficient_balance, got %+v", res40.Results[0])
+	}
+
+	// 失败项不留成功记录、不占序号；余额与文件内容与成功的那笔一致。
+	if bal, _ := lLink.Balance("aa", "usdc"); bal != 30 {
+		t.Fatalf("balance=%d, want 30", bal)
+	}
+	snap, err := lReal.Query()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snap.Settlements) != 1 || snap.Settlements[0].ID != "p70" || snap.Settlements[0].Seq != 1 {
+		t.Fatalf("settlements=%+v", snap.Settlements)
+	}
+	raw, err := os.ReadFile(realPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `"p70"`) || strings.Contains(string(raw), `"p40"`) {
+		t.Fatalf("ledger file must contain only the settled record: %s", raw)
+	}
+
+	// 关闭其中一个句柄不影响另一个继续使用。
+	if err := lReal.Close(); err != nil {
+		t.Fatal(err)
+	}
+	res30, err := lLink.Submit(FeeBatch{FeeBps: 0, Intents: []PaymentIntent{intent("p30", "aa", "usdc", 30)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res30.Results[0].Status != StatusSettled || res30.Results[0].Record.Seq != 2 {
+		t.Fatalf("p30 after close: %+v", res30.Results[0])
+	}
+	if bal, _ := lLink.Balance("aa", "usdc"); bal != 0 {
+		t.Fatalf("balance=%d, want 0", bal)
+	}
+}
+
+func TestSymlinkHandlesConcurrentSubmit(t *testing.T) {
+	realPath, linkPath := symlinkedLedger(t, []BalanceInit{{Account: "aa", Asset: "usdc", Balance: 100}})
+	lReal := openOrFail(t, realPath)
+	lLink := openOrFail(t, linkPath)
+
+	// 两个句柄同时提交 70 与 40：只能有一笔 settled，另一笔 insufficient_balance。
+	var wg sync.WaitGroup
+	statuses := make([]string, 2)
+	submit := func(idx int, l *Ledger, id string, amount int64) {
+		defer wg.Done()
+		res, err := l.Submit(FeeBatch{FeeBps: 0, Intents: []PaymentIntent{intent(id, "aa", "usdc", amount)}})
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		statuses[idx] = res.Results[0].Status
+	}
+	wg.Add(2)
+	go submit(0, lReal, "c70", 70)
+	go submit(1, lLink, "c40", 40)
+	wg.Wait()
+
+	settled := 0
+	for _, s := range statuses {
+		switch s {
+		case StatusSettled:
+			settled++
+		case StatusFunds:
+		default:
+			t.Fatalf("unexpected status %q", s)
+		}
+	}
+	if settled != 1 {
+		t.Fatalf("exactly one payment may settle, statuses=%v", statuses)
+	}
+	snap, err := lReal.Query()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snap.Settlements) != 1 {
+		t.Fatalf("settlements=%+v", snap.Settlements)
+	}
+	var wantBal int64
+	switch snap.Settlements[0].Charged {
+	case 70:
+		wantBal = 30
+	case 40:
+		wantBal = 60
+	default:
+		t.Fatalf("unexpected charged %d", snap.Settlements[0].Charged)
+	}
+	if bal, _ := lLink.Balance("aa", "usdc"); bal != wantBal {
+		t.Fatalf("balance=%d, want %d", bal, wantBal)
+	}
+}
+
+func TestSymlinkOpenErrors(t *testing.T) {
+	dir := t.TempDir()
+	realDir := filepath.Join(dir, "real")
+	if err := os.Mkdir(realDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	linkDir := filepath.Join(dir, "link")
+	if err := os.Symlink(realDir, linkDir); err != nil {
+		t.Fatal(err)
+	}
+
+	// 账本不存在：经软链接打开仍报 ledger_not_initialized，且不创建文件。
+	missing := filepath.Join(linkDir, "nope.json")
+	if _, err := Open(missing); KindOf(err) != ErrNotInit {
+		t.Fatalf("want ErrNotInit, got %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(realDir, "nope.json")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("failed open must not create a file, stat err=%v", err)
+	}
+
+	// 账本损坏：经软链接打开仍报 corrupt_ledger，且不被修复。
+	bad := filepath.Join(realDir, "bad.json")
+	if err := os.WriteFile(bad, []byte(`{"version":1,"checksum":"00"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(bad)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(filepath.Join(linkDir, "bad.json")); KindOf(err) != ErrCorrupt {
+		t.Fatalf("want ErrCorrupt, got %v", err)
+	}
+	after, err := os.ReadFile(bad)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatalf("corrupt ledger must not be repaired on open")
+	}
+}

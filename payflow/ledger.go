@@ -377,6 +377,20 @@ func decodeState(data []byte) (*ledgerState, error) {
 	return &state, nil
 }
 
+// canonicalLedgerPath 把绝对路径解析为账本的规范路径：解析目录与文件本身
+// 的符号链接，使同一账本经不同路径（如指向账本所在目录的软链接）打开时
+// 共享同一注册表项、同一份内存状态与互斥锁。账本文件尚不存在时（未初始化）
+// 解析其父目录；父目录也无法解析时退回原路径。
+func canonicalLedgerPath(abs string) string {
+	if resolved, err := filepath.EvalSymlinks(abs); err == nil {
+		return resolved
+	}
+	if resolved, err := filepath.EvalSymlinks(filepath.Dir(abs)); err == nil {
+		return filepath.Join(resolved, filepath.Base(abs))
+	}
+	return abs
+}
+
 // CreateLedger 在 path 处创建新账本。所有初始数据先校验，
 // 任一不合法则返回 ErrInvalid 且不创建任何文件；
 // 路径上已有账本则返回 ErrExists，绝不覆盖历史。
@@ -388,6 +402,7 @@ func CreateLedger(path string, init []BalanceInit) error {
 	if err != nil {
 		return ledgerError(ErrStorage, "resolve path: %v", err)
 	}
+	abs = canonicalLedgerPath(abs)
 
 	openMu.Lock()
 	defer openMu.Unlock()
@@ -441,8 +456,9 @@ func validateInitial(init []BalanceInit) error {
 	return nil
 }
 
-// Ledger 是一个可持久化的本地账本。同一进程内同一路径的多次 Open
-// 返回共享同一状态与互斥锁的实例，因此并发提交按同一本账本串行化。
+// Ledger 是一个可持久化的本地账本。同一进程内指向同一账本文件的多次 Open
+// （包括经目录软链接的不同路径）返回共享同一状态与互斥锁的实例，
+// 因此并发提交按同一本账本串行化。
 type Ledger struct {
 	path string
 	reg  *registryEntry
@@ -477,6 +493,7 @@ func Open(path string) (*Ledger, error) {
 	if err != nil {
 		return nil, ledgerError(ErrStorage, "resolve path: %v", err)
 	}
+	abs = canonicalLedgerPath(abs)
 
 	openMu.Lock()
 	defer openMu.Unlock()
