@@ -377,9 +377,28 @@ func decodeState(data []byte) (*ledgerState, error) {
 	return &state, nil
 }
 
+// canonicalPath 把账本路径规范化为不含软链接的真实路径：同一文件无论经真实
+// 目录还是指向该目录的软链接打开，都得到相同的键，从而共享进程内同一条注册
+// 表项（同一份状态与互斥锁）。文件本身尚不存在时（新建账本，或打开缺失文件），
+// 改为解析其父目录后接回文件名；父目录也无法解析时保留原绝对路径，由后续的
+// 文件操作报告原有的 ledger_not_initialized / 存储错误，且不会因此创建任何文件。
+func canonicalPath(abs string) string {
+	if real, err := filepath.EvalSymlinks(abs); err == nil {
+		return real
+	}
+	dir := filepath.Dir(abs)
+	if realDir, err := filepath.EvalSymlinks(dir); err == nil {
+		return filepath.Join(realDir, filepath.Base(abs))
+	}
+	return abs
+}
+
 // CreateLedger 在 path 处创建新账本。所有初始数据先校验，
 // 任一不合法则返回 ErrInvalid 且不创建任何文件；
 // 路径上已有账本则返回 ErrExists，绝不覆盖历史。
+//
+// 路径先规范化为真实路径（解析目录软链接），因此经软链接指向已有账本时
+// 同样报告 ErrExists，不会在别处另建一本账。
 func CreateLedger(path string, init []BalanceInit) error {
 	if err := validateInitial(init); err != nil {
 		return err
@@ -388,6 +407,7 @@ func CreateLedger(path string, init []BalanceInit) error {
 	if err != nil {
 		return ledgerError(ErrStorage, "resolve path: %v", err)
 	}
+	abs = canonicalPath(abs)
 
 	openMu.Lock()
 	defer openMu.Unlock()
@@ -472,11 +492,17 @@ var (
 
 // Open 打开（或复用）path 处的账本。账本必须已由 CreateLedger 初始化；
 // 文件缺失返回 ErrNotInit，内容损坏返回 ErrCorrupt，不会被当成空账本重来。
+//
+// 路径先规范化为真实路径（解析指向账本所在目录的软链接），因此同一本账本经
+// 真实目录路径或软链接路径打开时复用同一注册表项：共享同一份内存状态与互斥
+// 锁，任一句柄的成功付款/退款对另一句柄立即可见，幂等、冲突与余额判断在两
+// 个句柄间保持一致。
 func Open(path string) (*Ledger, error) {
 	abs, err := filepath.Abs(path)
 	if err != nil {
 		return nil, ledgerError(ErrStorage, "resolve path: %v", err)
 	}
+	abs = canonicalPath(abs)
 
 	openMu.Lock()
 	defer openMu.Unlock()
