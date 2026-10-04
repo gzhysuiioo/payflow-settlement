@@ -412,10 +412,15 @@ func CreateLedger(path string, init []BalanceInit) error {
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return ledgerError(ErrStorage, "stat %s: %v", abs, err)
 	}
+	// 已有句柄打开（或有在途操作）的路径不能再初始化：即便文件恰好被外部
+	// 删除，也不能用一本新账顶替正在使用的账本。无活动句柄时不做拦截——
+	// 是否已初始化完全由上面的磁盘检查决定。
 	if openRegistry[abs] != nil {
 		return ledgerError(ErrExists, "ledger is already initialized in this process")
 	}
 
+	// 文件存在即视为已初始化：CreateLedger 不预登记内存状态，账本是否存在、
+	// 内容是否完好一律以磁盘为准，首次 Open 必须实际读取并校验该文件。
 	state := &ledgerState{
 		Version:     ledgerVersion,
 		Initial:     make(map[balanceKey]int64, len(init)),
@@ -431,7 +436,8 @@ func CreateLedger(path string, init []BalanceInit) error {
 	if err := atomicWrite(abs, state); err != nil {
 		return err
 	}
-	openRegistry[abs] = &registryEntry{state: state}
+	// 不登记 openRegistry：尚未有任何句柄，首次 Open 必须以磁盘文件为准，
+	// 这样在初始化与首次打开之间删除、清空或篡改文件都会被如实发现。
 	return nil
 }
 
@@ -468,15 +474,23 @@ type Ledger struct {
 type registryEntry struct {
 	mu       sync.Mutex // 保护 state；整个批次串行持有
 	state    *ledgerState
-	refs     int        // 打开的句柄数
-	ops      int        // 正在执行的 Submit/Query 数
-	failHook FailWriter // 仅测试注入
+	holders  map[*Ledger]struct{} // 当前打开的句柄
+	ops      int                  // 正在执行的 Submit/Query 数（含已关闭句柄的在途操作）
+	failHook FailWriter           // 仅测试注入
+}
+
+// alive 报告该注册表项是否仍须保留：至少还有一个打开的句柄，或一个
+// （可能来自已关闭句柄的）在途操作。全为零时该项可被注销，此后的 Open
+// 重新以磁盘文件为准。
+// 调用方必须持有 openMu。
+func (r *registryEntry) alive() bool {
+	return len(r.holders) > 0 || r.ops > 0
 }
 
 // tryEvict 仅在没有句柄且没有在途操作时注销注册表项。
 // 调用方必须持有 openMu。
 func tryEvict(path string, reg *registryEntry) {
-	if reg.refs == 0 && reg.ops == 0 && openRegistry[path] == reg {
+	if !reg.alive() && openRegistry[path] == reg {
 		delete(openRegistry, path)
 	}
 }
@@ -499,8 +513,12 @@ func Open(path string) (*Ledger, error) {
 	defer openMu.Unlock()
 
 	if reg := openRegistry[abs]; reg != nil {
-		reg.refs++
-		return &Ledger{path: abs, reg: reg, open: true}, nil
+		// 同进程已有句柄（或在途操作）承接该账本：共享当前完整状态，不重新读盘。
+		// 注册表项只在存在活动句柄/在途操作期间保留，因此走到这里时磁盘文件
+		// 的状态已不再权威——例如它可能正被一笔在途付款以原子写替换。
+		h := &Ledger{path: abs, reg: reg, open: true}
+		reg.holders[h] = struct{}{}
+		return h, nil
 	}
 
 	data, err := os.ReadFile(abs)
@@ -530,9 +548,11 @@ func Open(path string) (*Ledger, error) {
 		return nil, err
 	}
 
-	reg := &registryEntry{state: state, refs: 1}
+	reg := &registryEntry{state: state, holders: map[*Ledger]struct{}{}}
+	h := &Ledger{path: abs, reg: reg, open: true}
+	reg.holders[h] = struct{}{}
 	openRegistry[abs] = reg
-	return &Ledger{path: abs, reg: reg, open: true}, nil
+	return h, nil
 }
 
 // Close 释放句柄；同一进程可再次 Open 同一文件并继续使用。
@@ -545,7 +565,7 @@ func (l *Ledger) Close() error {
 		return nil
 	}
 	l.open = false
-	l.reg.refs--
+	delete(l.reg.holders, l)
 	tryEvict(l.path, l.reg)
 	return nil
 }
