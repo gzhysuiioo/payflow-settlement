@@ -644,7 +644,7 @@ func (l *Ledger) Submit(batch FeeBatch) (*BatchResult, error) {
 	l.reg.mu.Lock()
 	defer l.reg.mu.Unlock()
 
-	results := l.runBatch(batch, limits, l.reg.state, true)
+	results := runBatch(batch, limits, l.reg.state, l.persistCharge)
 	return &BatchResult{Results: results}, nil
 }
 
@@ -679,7 +679,7 @@ func (l *Ledger) Preview(batch FeeBatch) (*PreviewResult, error) {
 
 	// 在快照副本上模拟：预览结束后真实状态与磁盘文件保持原样。
 	sim := cloneState(l.reg.state)
-	results := l.runBatch(batch, limits, sim, false)
+	results := runBatch(batch, limits, sim, simulateCharge)
 	return &PreviewResult{DryRun: true, Results: results}, nil
 }
 
@@ -693,127 +693,164 @@ func validateBatch(batch FeeBatch) (map[balanceKey]int64, error) {
 	return validateLimits(batch.Limits)
 }
 
+// chargeEffect 是一笔预计成功扣款的全部账本效果：扣哪个组合、扣多少、
+// 留下什么结算记录。它由付款规则产生，本身尚未生效；是否生效、如何生效
+// （真实落盘或预览模拟）由生效策略决定。
+type chargeEffect struct {
+	key    balanceKey
+	total  int64
+	record Record
+}
+
+// commitCharge 是扣款生效策略：把一笔预计成功的扣款应用到状态 st 上。
+// 返回 nil 表示已生效；返回非 nil 表示保存失败，且 st 必须已恢复到
+// 该项执行之前的余额与历史。
+type commitCharge func(st *ledgerState, eff chargeEffect) error
+
 // runBatch 按输入顺序在给定状态 st 上处理整个批次，返回逐项结果。
-// persist 为 true 时（真实提交）每笔预计成功都先写入 st 再原子落盘，
-// 落盘失败回滚该项并报告 storage_error；为 false 时（预览）只在 st
-// （应为独立副本）上推进内存状态、绝不触碰磁盘，因此不会产生存储错误。
-// 调用方必须持有 reg.mu。
-func (l *Ledger) runBatch(batch FeeBatch, limits map[balanceKey]int64, st *ledgerState, persist bool) []ItemResult {
+// 付款规则（judgeIntent）与扣款生效（commit）分离：规则只读取 st 与
+// 本批次已用额度给出判定和预计扣款效果，不改动任何状态；生效策略决定
+// 效果如何落地——真实提交先改内存再原子落盘、失败回滚并报告
+// storage_error，预览只在副本上推进内存状态、绝不落盘。两种操作共用
+// 同一份规则，因此逐项判定完全一致。调用方必须持有 reg.mu。
+func runBatch(batch FeeBatch, limits map[balanceKey]int64, st *ledgerState, commit commitCharge) []ItemResult {
 	out := make([]ItemResult, 0, len(batch.Intents))
 
-	// 本次批次内各组合已消耗的额度，从零开始，仅预计成功的扣款计入。
+	// 本次批次内各组合已消耗的额度，从零开始，仅成功生效的扣款计入。
 	used := make(map[balanceKey]int64, len(limits))
 
 	for i := range batch.Intents {
 		it := &batch.Intents[i]
-		res := ItemResult{ID: it.ID}
 
-		// 1. 参数校验。未通过的编号不占用去重资格。
-		amount, reason, ok := validateIntent(*it)
-		if !ok {
-			res.Status = StatusInvalid
-			res.Reason = reason
+		// 1. 规则判定：纯读取，不产生任何副作用。
+		res, charge := judgeIntent(it, batch.FeeBps, limits, used, st)
+		if charge == nil {
 			out = append(out, res)
 			continue
 		}
 
-		// 2. 已成功编号：字段与费率完全一致则幂等返回原记录；
-		//    任一不同则编号冲突。两者都不再扣款、不改原记录。
-		//    本批次内先（预计）成功的同编号项也在此被看到。
-		if rec, exists := findRecordIn(st.Settlements, it.ID); exists {
-			if sameRequest(rec, it, amount, batch.FeeBps) {
-				cp := rec
-				res.Status = StatusDuplicate
-				res.Reason = reasonDuplicate
-				res.Record = &cp
-			} else {
-				res.Status = StatusConflict
-				res.Reason = reasonConflict
-			}
+		// 2. 生效：保存失败时 commit 已回滚该项（余额与历史恢复原样），
+		//    该项报告 storage_error，不留记录、不占额度，后项继续处理。
+		if err := commit(st, *charge); err != nil {
+			res.Status = StatusStorage
+			res.Reason = err.Error()
 			out = append(out, res)
 			continue
 		}
 
-		// 3. 状态错误单独报告（不占用去重资格，之后可重新提交）。
-		if it.State != "" && it.State != "pending" {
-			res.Status = StatusState
-			res.Reason = reasonNotPending
-			out = append(out, res)
-			continue
+		// 3. 只有成功生效的扣款才消耗本批次额度（预览同样如此）。
+		used[charge.key] += charge.total
+		cp := charge.record
+		res.Status = StatusSettled
+		res.Record = &cp
+		out = append(out, res)
+	}
+	return out
+}
+
+// judgeIntent 按付款规则评估一项请求，只读取状态与额度用量，不产生副作用。
+// 返回逐项结果；预计成功时结果只填编号，扣款效果以 chargeEffect 描述，
+// 由调用方交给生效策略落地。判定顺序即对外约定：参数校验、已成功编号的
+// 重复/冲突、状态、溢出、本批次限额（先于余额）、余额。
+func judgeIntent(it *PaymentIntent, feeBps int, limits map[balanceKey]int64, used map[balanceKey]int64, st *ledgerState) (ItemResult, *chargeEffect) {
+	res := ItemResult{ID: it.ID}
+
+	// 1. 参数校验。未通过的编号不占用去重资格。
+	amount, reason, ok := validateIntent(*it)
+	if !ok {
+		res.Status = StatusInvalid
+		res.Reason = reason
+		return res, nil
+	}
+
+	// 2. 已成功编号：字段与费率完全一致则幂等返回原记录；
+	//    任一不同则编号冲突。两者都不再扣款、不改原记录。
+	//    本批次内先（预计）成功的同编号项也在此被看到。
+	if rec, exists := findRecordIn(st.Settlements, it.ID); exists {
+		if sameRequest(rec, it, amount, feeBps) {
+			cp := rec
+			res.Status = StatusDuplicate
+			res.Reason = reasonDuplicate
+			res.Record = &cp
+		} else {
+			res.Status = StatusConflict
+			res.Reason = reasonConflict
 		}
+		return res, nil
+	}
 
-		// 4. 手续费与扣款总额（溢出明确按参数错误拒绝）。
-		fee := feeFor(amount, batch.FeeBps)
-		if fee > math.MaxInt64-amount {
-			res.Status = StatusInvalid
-			res.Reason = reasonOverflow
-			out = append(out, res)
-			continue
+	// 3. 状态错误单独报告（不占用去重资格，之后可重新提交）。
+	if it.State != "" && it.State != "pending" {
+		res.Status = StatusState
+		res.Reason = reasonNotPending
+		return res, nil
+	}
+
+	// 4. 手续费与扣款总额（溢出明确按参数错误拒绝）。
+	fee := feeFor(amount, feeBps)
+	if fee > math.MaxInt64-amount {
+		res.Status = StatusInvalid
+		res.Reason = reasonOverflow
+		return res, nil
+	}
+	total := amount + fee
+
+	key := balanceKey{it.Account, it.Asset}
+
+	// 5. 本次批次限额（先于余额判断：同时超限与余额不足时报告超限）。
+	//    恰好达到上限仍允许；用 total > max-used 而非 used+total > max，
+	//    避免累计接近 int64 上界时溢出放行。失败不消耗额度。
+	if max, capped := limits[key]; capped {
+		if u := used[key]; total > max-u {
+			res.Status = StatusLimitExceeded
+			res.Reason = fmt.Sprintf(reasonLimitExceeded, it.Account, it.Asset, max, u, total)
+			return res, nil
 		}
-		total := amount + fee
+	}
 
-		key := balanceKey{it.Account, it.Asset}
+	// 6. 余额校验。不存在的账户/资产组合余额视为 0（不足）。
+	if total > st.Balances[key] {
+		res.Status = StatusFunds
+		res.Reason = reasonFunds
+		return res, nil
+	}
 
-		// 5. 本次批次限额（先于余额判断：同时超限与余额不足时报告超限）。
-		//    恰好达到上限仍允许；用 total > max-used 而非 used+total > max，
-		//    避免累计接近 int64 上界时溢出放行。失败不消耗额度。
-		if max, capped := limits[key]; capped {
-			if u := used[key]; total > max-u {
-				res.Status = StatusLimitExceeded
-				res.Reason = fmt.Sprintf(reasonLimitExceeded, it.Account, it.Asset, max, u, total)
-				out = append(out, res)
-				continue
-			}
-		}
-
-		// 6. 余额校验。不存在的账户/资产组合余额视为 0（不足）。
-		bal := st.Balances[key]
-		if total > bal {
-			res.Status = StatusFunds
-			res.Reason = reasonFunds
-			out = append(out, res)
-			continue
-		}
-
-		// 7. 预计成功：构造记录（序号按当前模拟历史长度连续递增）。
-		rec := Record{
+	// 7. 预计成功：描述扣款效果（序号按当前历史长度连续递增）。
+	return res, &chargeEffect{
+		key:   key,
+		total: total,
+		record: Record{
 			ID:        it.ID,
 			Account:   it.Account,
 			Paymaster: it.Paymaster,
 			Asset:     it.Asset,
 			Amount:    amount,
 			Nonce:     it.Nonce,
-			FeeBps:    batch.FeeBps,
+			FeeBps:    feeBps,
 			Fee:       fee,
 			Charged:   total,
 			Seq:       int64(len(st.Settlements)) + 1,
-		}
-
-		if persist {
-			// 真实提交：先在内存生效，再原子持久化；保存失败回滚该项，
-			// 不留成功记录、不占额度。
-			rollback := stageOn(st, key, bal-total, rec)
-			if err := l.persistLocked(); err != nil {
-				rollback()
-				res.Status = StatusStorage
-				res.Reason = err.Error()
-				out = append(out, res)
-				continue
-			}
-		} else {
-			// 预览：只推进副本状态，绝不落盘。
-			st.Balances[key] = bal - total
-			st.Settlements = append(st.Settlements, rec)
-		}
-
-		// 只有（预计）成功的扣款消耗额度；预览同样如此。
-		used[key] += total
-		cp := rec
-		res.Status = StatusSettled
-		res.Record = &cp
-		out = append(out, res)
+		},
 	}
-	return out
+}
+
+// simulateCharge 是预览的生效策略：只在（副本）状态上推进余额与历史，
+// 绝不触碰磁盘，因此不会失败，预览结果中也不会出现 storage_error。
+func simulateCharge(st *ledgerState, eff chargeEffect) error {
+	st.Balances[eff.key] -= eff.total
+	st.Settlements = append(st.Settlements, eff.record)
+	return nil
+}
+
+// persistCharge 是真实提交的生效策略：先在内存生效，再原子落盘；
+// 落盘失败回滚该项（恢复余额与历史），并返回存储错误。
+func (l *Ledger) persistCharge(st *ledgerState, eff chargeEffect) error {
+	rollback := stageOn(st, eff.key, st.Balances[eff.key]-eff.total, eff.record)
+	if err := l.persistLocked(); err != nil {
+		rollback()
+		return err
+	}
+	return nil
 }
 
 // cloneState 返回账本状态的独立深拷贝，供预览在副本上模拟而不触碰真实状态。
