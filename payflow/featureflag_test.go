@@ -66,6 +66,99 @@ func TestEvaluateRuleMatchOrder(t *testing.T) {
 	}
 }
 
+func TestEvaluateRulePriorityFalseWinsAndIsImmediate(t *testing.T) {
+	// 已启用的开关，default=true：r-deny 在前、返回 false，含一个 eq 与一个 in
+	// 条件（AND）；r-allow 在后、返回 true，且两条规则可以同时成立。
+	// 公开规则：按数组顺序，第一条所有条件都成立的规则立即定案——即使它返回
+	// false，也不能被后面的 true 规则或 true 默认值翻转。
+	rDenyFirst := `{"flags":[{"key":"f","enabled":true,"default":true,"rules":[
+		{"id":"r-deny","value":false,"conditions":[
+			{"attribute":"plan","op":"eq","value":"pro"},
+			{"attribute":"tier","op":"in","value":["a","b"]}]},
+		{"id":"r-allow","value":true,"conditions":[
+			{"attribute":"region","op":"eq","value":"cn"}]}]}]}`
+	denyID, allowID := "r-deny", "r-allow"
+
+	// 上下文同时满足两条规则：前面的 r-deny 获胜，结果为 false；reason=rule、
+	// ruleId 指向前一条，与后面的规则及默认值同为 true 无关。
+	got := eval(t, rDenyFirst, "f", `{"plan":"pro","tier":"a","region":"cn"}`)
+	want := EvalResult{Key: "f", Value: false, Reason: EvalRule, RuleID: &denyID}
+	if !got.Equals(want) {
+		t.Fatalf("both match, earlier false must decide: got %+v, want %+v", got, want)
+	}
+
+	// 只交换两条规则的配置位置，规则内容与上下文完全相同：改由原来的后一条
+	// r-allow 返回 true，命中原因与规则编号跟随获胜规则变化。
+	rAllowFirst := `{"flags":[{"key":"f","enabled":true,"default":true,"rules":[
+		{"id":"r-allow","value":true,"conditions":[
+			{"attribute":"region","op":"eq","value":"cn"}]},
+		{"id":"r-deny","value":false,"conditions":[
+			{"attribute":"plan","op":"eq","value":"pro"},
+			{"attribute":"tier","op":"in","value":["a","b"]}]}]}]}`
+	got = eval(t, rAllowFirst, "f", `{"plan":"pro","tier":"a","region":"cn"}`)
+	want = EvalResult{Key: "f", Value: true, Reason: EvalRule, RuleID: &allowID}
+	if !got.Equals(want) {
+		t.Fatalf("swap order, earlier true must decide: got %+v, want %+v", got, want)
+	}
+
+	// 前面的规则只有部分条件成立（eq 成立但 in 不成立）：任何单个条件成立都
+	// 不算命中，也不能因前一条返回 false 就停止；完整成立的后一条 r-allow 获胜。
+	got = eval(t, rDenyFirst, "f", `{"plan":"pro","tier":"c","region":"cn"}`)
+	want = EvalResult{Key: "f", Value: true, Reason: EvalRule, RuleID: &allowID}
+	if !got.Equals(want) {
+		t.Fatalf("partial match must fall through: got %+v, want %+v", got, want)
+	}
+	// 前一条的 eq 属性缺失（而非不等）：同样只是不命中，继续检查后一条。
+	got = eval(t, rDenyFirst, "f", `{"tier":"a","region":"cn"}`)
+	if !got.Equals(want) {
+		t.Fatalf("missing attr on earlier rule must fall through: got %+v, want %+v", got, want)
+	}
+
+	// 两条规则都不成立：采用 default=true，reason=default、ruleId=null，
+	// 与“某条规则返回 true”的命中（reason=rule 且带 ruleId）明确区分。
+	got = eval(t, rDenyFirst, "f", `{"plan":"free","tier":"c","region":"eu"}`)
+	want = EvalResult{Key: "f", Value: true, Reason: EvalDefault, RuleID: nil}
+	if !got.Equals(want) {
+		t.Fatalf("neither matches must use default: got %+v, want %+v", got, want)
+	}
+}
+
+func TestEvaluateRulePriorityEmptyStringMatchVsMissing(t *testing.T) {
+	// 前一条规则返回 false 且用 eq 比较空字符串，后一条返回 true 且可同时成立。
+	// 属性缺失表示该条件不成立（继续检查后一条）；显式提供 "" 是合法值，
+	// 前一条所有条件成立时真正获胜并立即定案为 false。
+	cfg := `{"flags":[{"key":"f","enabled":true,"default":true,"rules":[
+		{"id":"r-empty","value":false,"conditions":[
+			{"attribute":"note","op":"eq","value":""},
+			{"attribute":"tier","op":"in","value":["a","b"]}]},
+		{"id":"r-allow","value":true,"conditions":[
+			{"attribute":"region","op":"eq","value":"cn"}]}]}]}`
+	emptyID, allowID := "r-empty", "r-allow"
+
+	// note 缺失：r-empty 不命中，即使 tier 落在 in 列表内；继续到 r-allow。
+	got := eval(t, cfg, "f", `{"tier":"a","region":"cn"}`)
+	want := EvalResult{Key: "f", Value: true, Reason: EvalRule, RuleID: &allowID}
+	if !got.Equals(want) {
+		t.Fatalf("missing attribute must continue to later rule: got %+v, want %+v", got, want)
+	}
+
+	// note 显式为空字符串且另一条件成立：r-empty 完整命中，立即定案 false，
+	// 同时成立的 r-allow 与 true 默认值都不能改变结果。
+	got = eval(t, cfg, "f", `{"note":"","tier":"a","region":"cn"}`)
+	want = EvalResult{Key: "f", Value: false, Reason: EvalRule, RuleID: &emptyID}
+	if !got.Equals(want) {
+		t.Fatalf("explicit empty string makes earlier rule win: got %+v, want %+v", got, want)
+	}
+
+	// note 显式为空字符串但另一条件不成立：r-empty 仍不命中，继续到 r-allow，
+	// 不能把 eq 条件单独成立当成命中。
+	got = eval(t, cfg, "f", `{"note":"","tier":"c","region":"cn"}`)
+	want = EvalResult{Key: "f", Value: true, Reason: EvalRule, RuleID: &allowID}
+	if !got.Equals(want) {
+		t.Fatalf("empty eq alone must not match the rule: got %+v, want %+v", got, want)
+	}
+}
+
 func TestEvaluateDefault(t *testing.T) {
 	cfg := `{"flags":[{"key":"f","enabled":true,"default":true,"rules":[
 		{"id":"r1","value":false,"conditions":[{"attribute":"plan","op":"eq","value":"pro"}]}]}]}`
