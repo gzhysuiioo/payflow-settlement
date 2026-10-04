@@ -431,6 +431,8 @@ func CreateLedger(path string, init []BalanceInit) error {
 	if err := atomicWrite(abs, state); err != nil {
 		return err
 	}
+	// 登记只为阻止同进程重复初始化（文件随后被外部删除时仍报 ErrExists）；
+	// 它不代表已验证的账本：首次 Open 会丢弃该条目并以磁盘文件为准。
 	openRegistry[abs] = &registryEntry{state: state}
 	return nil
 }
@@ -488,6 +490,11 @@ var (
 
 // Open 打开（或复用）path 处的账本。账本必须已由 CreateLedger 初始化；
 // 文件缺失返回 ErrNotInit，内容损坏返回 ErrCorrupt，不会被当成空账本重来。
+//
+// 已有句柄在使用（含最后一个句柄关闭时仍有在途提交）时，新句柄共享该注册
+// 表项的完整内存状态；否则以磁盘文件此刻的内容为准——CreateLedger 留下的
+// 注册表项只用于阻止重复初始化，不能代替首次打开时的文件检查：文件在初始化
+// 之后被删除或篡改时，首次打开必须失败而不是发放基于初始化余额的句柄。
 func Open(path string) (*Ledger, error) {
 	abs, err := filepath.Abs(path)
 	if err != nil {
@@ -499,8 +506,14 @@ func Open(path string) (*Ledger, error) {
 	defer openMu.Unlock()
 
 	if reg := openRegistry[abs]; reg != nil {
-		reg.refs++
-		return &Ledger{path: abs, reg: reg, open: true}, nil
+		if reg.refs > 0 || reg.ops > 0 {
+			reg.refs++
+			return &Ledger{path: abs, reg: reg, open: true}, nil
+		}
+		// 尚无句柄使用过的条目只可能来自 CreateLedger（refs/ops 归零时
+		// Close/endOp 已将其注销）。丢弃它，首次打开改从磁盘加载并校验，
+		// 保证打开到的是该路径此刻保存的账本而非初始化时的内存快照。
+		delete(openRegistry, abs)
 	}
 
 	data, err := os.ReadFile(abs)
