@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"strconv"
 	"unicode/utf8"
@@ -93,6 +94,43 @@ func LoadContext(path string) (*Context, error) {
 	return ParseContext(raw)
 }
 
+// unmarshalStrictJSON 严格解码一个 UTF-8 JSON 文档到 any，并保持与
+// json.Unmarshal 相同的单文档语义：文档之后只允许空白，不允许第二个值。
+// 使用 json.Decoder + UseNumber：数字按原文保留为 json.Number，而不是强制
+// 转成 float64——语法合法但超出浮点范围的数字（如 1e400、由 1 后接 400 个 0
+// 组成的整数）不应被当成“JSON 无效”，它们是合法的 JSON 数字，由后续的值
+// 类型检查以所属字段的类型错误报告。
+func unmarshalStrictJSON(raw []byte) (any, error) {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	var doc any
+	if err := dec.Decode(&doc); err != nil {
+		return nil, err
+	}
+	// Decoder 本身容忍文档之后的额外 JSON 值，需显式补回 Unmarshal 的严格性。
+	offset := int(dec.InputOffset())
+	var extra any
+	if err := dec.Decode(&extra); err != io.EOF {
+		if err != nil {
+			return nil, err
+		}
+		for offset < len(raw) && isJSONWhitespace(raw[offset]) {
+			offset++
+		}
+		c := byte(0)
+		if offset < len(raw) {
+			c = raw[offset]
+		}
+		return nil, fmt.Errorf("invalid character %q after top-level value", c)
+	}
+	return doc, nil
+}
+
+// isJSONWhitespace 报告 b 是否为 JSON 允许的空白字节。
+func isJSONWhitespace(b byte) bool {
+	return b == ' ' || b == '\t' || b == '\n' || b == '\r'
+}
+
 // ParseConfig parses a config document from JSON bytes with strict typing.
 // 先解析到 any 再逐字段校验，以区分“字段缺失”与“显式提供的 false”。
 func ParseConfig(raw []byte) (*Config, error) {
@@ -105,8 +143,8 @@ func ParseConfig(raw []byte) (*Config, error) {
 	if err := rejectDuplicateFields(raw, "config"); err != nil {
 		return nil, err
 	}
-	var doc any
-	if err := json.Unmarshal(raw, &doc); err != nil {
+	doc, err := unmarshalStrictJSON(raw)
+	if err != nil {
 		return nil, fmt.Errorf("config: invalid JSON: %w", err)
 	}
 	root, ok := doc.(map[string]any)
@@ -151,8 +189,8 @@ func ParseContext(raw []byte) (*Context, error) {
 	if err := rejectDuplicateFields(raw, "context"); err != nil {
 		return nil, err
 	}
-	var doc any
-	if err := json.Unmarshal(raw, &doc); err != nil {
+	doc, err := unmarshalStrictJSON(raw)
+	if err != nil {
 		return nil, fmt.Errorf("context: invalid JSON: %w", err)
 	}
 	root, ok := doc.(map[string]any)
@@ -167,6 +205,8 @@ func ParseContext(raw []byte) (*Context, error) {
 	}
 	ctx := &Context{values: make(map[string]string, len(root))}
 	for k, v := range root {
+		// 经过 checkContextValueTypes 后所有值都是字符串；数字（含超出浮点
+		// 范围的 json.Number）、布尔、null、对象、数组都已按所属属性报错。
 		ctx.values[k] = v.(string)
 	}
 	return ctx, nil
@@ -178,6 +218,10 @@ func ParseContext(raw []byte) (*Context, error) {
 // 对象或数组整体跳过，其内部成员不单独检查。
 func checkContextValueTypes(raw []byte) error {
 	dec := json.NewDecoder(bytes.NewReader(raw))
+	// UseNumber：数字按 json.Number 原样保留而不转 float64，使超出浮点范围
+	// 的合法数字（如 1e400）也能落到“值必须是字符串”的属性类型错误，而不是
+	// 在解码阶段被报成 JSON 语法问题。
+	dec.UseNumber()
 	// 第一个令牌必须是顶层对象的 '{'；非对象的情形在 ParseContext 中报告。
 	if tok, err := dec.Token(); err != nil || tok != json.Delim('{') {
 		return nil
@@ -185,12 +229,12 @@ func checkContextValueTypes(raw []byte) error {
 	for dec.More() {
 		keyTok, err := dec.Token()
 		if err != nil {
-			return nil // 语法错误留给 Unmarshal 的报错
+			return nil // 语法错误留给严格解码的报错
 		}
 		key, _ := keyTok.(string)
 		var value any
 		if err := dec.Decode(&value); err != nil {
-			return nil
+			return nil // 语法错误留给严格解码的报错
 		}
 		if _, ok := value.(string); !ok {
 			return fmt.Errorf("context.%s: value must be a string", key)
@@ -403,7 +447,7 @@ func (t *jsonPathTracker) setKey(name string) {
 }
 
 // noteInvalidKey 在字段名无法解码（属于 JSON 语法错误）时仅推进键值状态：
-// 不覆盖已记录的字段名；语法错误留给后续 Unmarshal 报告。
+// 不覆盖已记录的字段名；语法错误留给后续严格 JSON 解码报告。
 func (t *jsonPathTracker) noteInvalidKey() {
 	t.top().expectKey = false
 }
@@ -414,14 +458,17 @@ func (t *jsonPathTracker) noteInvalidKey() {
 // 包括附加字段里嵌套的对象；数组元素不属于这一检查。label 是根对象的位置
 // 前缀（"config" 或 "context"）。对象层级、数组下标与字段路径由
 // jsonPathTracker 统一维护。JSON 语法错误不在此报告（令牌流失效即停止），
-// 留给 Unmarshal。
+// 留给严格 JSON 解码。
 func rejectDuplicateFields(raw []byte, label string) error {
 	dec := json.NewDecoder(bytes.NewReader(raw))
+	// UseNumber：数字以 json.Number 令牌返回而不转 float64，否则超出浮点范围
+	// 的合法数字（如 1e400）会让令牌流提前报错并中止，遮住其后的重复字段。
+	dec.UseNumber()
 	tracker := newJSONPathTracker(label)
 	for {
 		tok, err := dec.Token()
 		if err != nil {
-			// io.EOF 或语法错误；语法错误由后续 Unmarshal 报告。
+			// io.EOF 或语法错误；语法错误由后续严格 JSON 解码报告。
 			break
 		}
 		switch t := tok.(type) {
@@ -474,7 +521,7 @@ func rejectInvalidUnicodeEscapes(raw []byte, label string) error {
 			end := jsonStringEnd(raw, i)
 			contentEnd := end
 			if contentEnd > i+1 && raw[contentEnd-1] == '"' {
-				contentEnd-- // 去掉右引号；未终止的字符串留给 Unmarshal 报告
+				contentEnd-- // 去掉右引号；未终止的字符串留给严格 JSON 解码报告
 			}
 			content := raw[i+1 : contentEnd]
 			if tracker.atKey() {
@@ -482,7 +529,7 @@ func rejectInvalidUnicodeEscapes(raw []byte, label string) error {
 					return fmt.Errorf("%s: field name %q contains invalid Unicode escape %s: Unicode escape does not form a complete character (%s)",
 						tracker.currentPath(), string(content), bad.escape, bad.detail)
 				}
-				// 转义已校验合法，解码用于定位路径；失败说明是语法错误，留给 Unmarshal。
+				// 转义已校验合法，解码用于定位路径；失败说明是语法错误，留给严格 JSON 解码。
 				if name, ok := decodeJSONString(raw[i:end]); ok {
 					tracker.setKey(name)
 				} else {
