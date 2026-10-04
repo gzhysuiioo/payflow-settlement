@@ -584,6 +584,200 @@ func TestCLIEvaluateTrailingContentRemovalRestoresEvaluation(t *testing.T) {
 	}
 }
 
+// extraFieldsBaseCLIConfig 是附加字段 CLI 回归保障的基准配置：feature-hit 的首条
+// 完整命中规则返回 false（后一条规则与默认值同为 true），feature-default 无命中
+// 时取默认值 true，feature-off 已关闭。配置本身不含附加字段，作为移除附加字段的
+// 对照；extraFieldsFullCLIConfig 的开关定义与它完全相同，只多了各层级的附加字段。
+const extraFieldsBaseCLIConfig = `{"flags":[
+	{"key":"feature-hit","enabled":true,"default":true,"rules":[
+		{"id":"r-deny","value":false,"conditions":[
+			{"attribute":"plan","op":"eq","value":"pro"},
+			{"attribute":"region","op":"in","value":["cn","us"]}]},
+		{"id":"r-allow","value":true,"conditions":[
+			{"attribute":"plan","op":"eq","value":"pro"}]}]},
+	{"key":"feature-default","enabled":true,"default":true,"rules":[
+		{"id":"r-only","value":false,"conditions":[
+			{"attribute":"plan","op":"eq","value":"pro"}]}]},
+	{"key":"feature-off","enabled":false,"default":true,"rules":[]}]}`
+
+var extraFieldsFullCLIConfig = `{"flags":[
+	{"key":"feature-hit","enabled":true,"default":true,"rules":[
+		{"id":"r-deny","value":false,"conditions":[
+			{"attribute":"plan","op":"eq","value":"pro","note":{"owner":"team-a","limit":1e400}},
+			{"attribute":"region","op":"in","value":["cn","us"],"note":null}],
+			"note":["review",{"ceiling":1` + strings.Repeat("0", 400) + `}]},
+		{"id":"r-allow","value":true,"conditions":[
+			{"attribute":"plan","op":"eq","value":"pro"}],
+			"note":false}],
+		"note":{"since":"2026-01","tags":["beta",1e400],"archived":false}},
+	{"key":"feature-default","enabled":true,"default":true,"rules":[
+		{"id":"r-only","value":false,"conditions":[
+			{"attribute":"plan","op":"eq","value":"pro"}]}],
+		"note":null},
+	{"key":"feature-off","enabled":false,"default":true,"rules":[],
+		"note":{"reason":"legacy","threshold":-1e400}}],
+	"note":{"schema":1,"limits":[1e400,1` + strings.Repeat("0", 400) + `],"nullable":null}}`
+
+func TestCLIEvaluateExtraFieldsIgnored(t *testing.T) {
+	// 顶层、开关、规则、条件上的附加字段（对象/数组/布尔/null，含 1e400 与
+	// 1 后接 400 个 0 的合法大数字）不参与求值：与无附加字段的基准配置相比，
+	// 三种求值路径的标准输出逐字节一致，标准错误为空，退出码为 0。
+	cases := []struct {
+		name string
+		key  string
+		ctx  string
+	}{
+		{"first full match decides", "feature-hit", `{"plan":"pro","region":"cn"}`},
+		{"fall through to later rule", "feature-hit", `{"plan":"pro","region":"eu"}`},
+		{"no match uses default", "feature-default", `{"plan":"free"}`},
+		{"disabled stays disabled", "feature-off", `{"plan":"pro","region":"cn"}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			base := newHarness(t, extraFieldsBaseCLIConfig, tc.ctx)
+			full := newHarness(t, extraFieldsFullCLIConfig, tc.ctx)
+			var baseOut, baseErr, fullOut, fullErr bytes.Buffer
+			if code := run(base.evalArgs(tc.key), &baseOut, &baseErr); code != 0 {
+				t.Fatalf("baseline: exit=%d stderr=%s", code, baseErr.String())
+			}
+			if code := run(full.evalArgs(tc.key), &fullOut, &fullErr); code != 0 {
+				t.Fatalf("with extras: exit=%d stderr=%s", code, fullErr.String())
+			}
+			if fullErr.Len() != 0 {
+				t.Fatalf("stderr must be empty on success: %q", fullErr.String())
+			}
+			if fullOut.String() != baseOut.String() {
+				t.Fatalf("extras changed output: %q != %q", fullOut.String(), baseOut.String())
+			}
+			if strings.Count(strings.TrimSpace(fullOut.String()), "\n") != 0 {
+				t.Fatalf("stdout must contain exactly one JSON object line: %q", fullOut.String())
+			}
+			var got map[string]any
+			if err := json.Unmarshal(fullOut.Bytes(), &got); err != nil {
+				t.Fatalf("stdout is not a single JSON object: %q (%v)", fullOut.String(), err)
+			}
+			if got["key"] != tc.key {
+				t.Fatalf("unexpected payload: %v", got)
+			}
+		})
+	}
+
+	// 逐字段核对三种路径的完整结果：开关键、布尔值、命中原因与规则编号。
+	checks := []struct {
+		key    string
+		ctx    string
+		value  bool
+		reason string
+		ruleID any // nil 表示 JSON null
+	}{
+		{"feature-hit", `{"plan":"pro","region":"cn"}`, false, "rule", "r-deny"},
+		{"feature-hit", `{"plan":"pro","region":"eu"}`, true, "rule", "r-allow"},
+		{"feature-default", `{"plan":"free"}`, true, "default", nil},
+		{"feature-off", `{"plan":"pro","region":"cn"}`, false, "disabled", nil},
+	}
+	for _, tc := range checks {
+		h := newHarness(t, extraFieldsFullCLIConfig, tc.ctx)
+		var stdout, stderr bytes.Buffer
+		if code := run(h.evalArgs(tc.key), &stdout, &stderr); code != 0 || stderr.Len() != 0 {
+			t.Fatalf("%s: exit=%d stderr=%q", tc.key, code, stderr.String())
+		}
+		var got map[string]any
+		if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
+			t.Fatalf("%s: stdout=%q (%v)", tc.key, stdout.String(), err)
+		}
+		if got["key"] != tc.key || got["value"] != tc.value ||
+			got["reason"] != tc.reason || got["ruleId"] != tc.ruleID {
+			t.Fatalf("%s: unexpected payload: %v", tc.key, got)
+		}
+	}
+}
+
+func TestCLIEvaluateExtraFieldErrors(t *testing.T) {
+	// 附加信息虽不参与求值，仍属于被完整检查的配置：其中的重复字段与无效
+	// JSON 都要非零退出、标准输出为空、标准错误明确指出问题来自配置，
+	// 且重复字段与无效 JSON 的措辞可区分。
+	goodCtx := `{"plan":"pro","region":"cn"}`
+	cases := []struct {
+		name        string
+		config      string
+		key         string
+		wantSub     string
+		mustNotHave string
+	}{
+		{
+			"duplicate after big number in flag extra",
+			`{"flags":[{"key":"f","enabled":true,"default":false,"rules":[],
+				"meta":{"limit":1e400,"limit":2}}]}`,
+			"f",
+			`config.flags[0].meta.limit: duplicate field "limit"`,
+			"invalid JSON",
+		},
+		{
+			"duplicate after huge int in top-level extra",
+			`{"flags":[{"key":"f","enabled":true,"default":false,"rules":[]}],
+				"meta":{"limit":1` + strings.Repeat("0", 400) + `,"limit":2}}`,
+			"f",
+			`config.meta.limit: duplicate field "limit"`,
+			"invalid JSON",
+		},
+		{
+			"duplicate in unselected flag extra",
+			`{"flags":[
+				{"key":"good","enabled":true,"default":false,"rules":[]},
+				{"key":"bad","enabled":true,"default":false,"rules":[],
+					"meta":{"x":1,"x":2}}]}`,
+			"good",
+			`config.flags[1].meta.x: duplicate field "x"`,
+			"invalid JSON",
+		},
+		{
+			"duplicate in disabled flag extra",
+			`{"flags":[{"key":"off","enabled":false,"default":false,"rules":[],
+				"meta":{"x":1,"x":2}}]}`,
+			"off",
+			`config.flags[0].meta.x: duplicate field "x"`,
+			"invalid JSON",
+		},
+		{
+			"malformed number in flag extra",
+			`{"flags":[{"key":"f","enabled":true,"default":false,"rules":[],
+				"meta":{"limit":1e+}}]}`,
+			"f",
+			"config: invalid JSON",
+			"duplicate field",
+		},
+		{
+			"malformed number in condition extra",
+			`{"flags":[{"key":"f","enabled":true,"default":false,"rules":[
+				{"id":"r","value":true,"conditions":[
+					{"attribute":"plan","op":"eq","value":"pro","meta":[1e+]}]}]}]}`,
+			"f",
+			"config: invalid JSON",
+			"duplicate field",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t, tc.config, goodCtx)
+			var stdout, stderr bytes.Buffer
+			code := run(h.evalArgs(tc.key), &stdout, &stderr)
+			if code == 0 {
+				t.Fatalf("expected non-zero exit, stdout=%q", stdout.String())
+			}
+			if stdout.Len() != 0 {
+				t.Fatalf("stdout must be empty on error, got: %q", stdout.String())
+			}
+			msg := stderr.String()
+			if !strings.Contains(msg, tc.wantSub) {
+				t.Fatalf("stderr=%q, want substring %q", msg, tc.wantSub)
+			}
+			if strings.Contains(msg, tc.mustNotHave) {
+				t.Fatalf("stderr=%q must not contain %q", msg, tc.mustNotHave)
+			}
+		})
+	}
+}
+
 func TestCLILegacyCommandsPreserved(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	if code := run([]string{"version"}, &stdout, &stderr); code != 0 || strings.TrimSpace(stdout.String()) != "payflow 0.1.0" {
