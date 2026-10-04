@@ -66,6 +66,68 @@ func TestEvaluateRuleMatchOrder(t *testing.T) {
 	}
 }
 
+func TestEvaluateFirstMatchWinsEvenWhenFalse(t *testing.T) {
+	// 规则优先级回归保障：按配置数组顺序，第一条所有条件都成立的规则决定结果，
+	// 返回 false 同样立即定案。前条规则 r-block 返回 false，含一个 eq 条件
+	// （note 等于空字符串）和一个 in 条件；后条规则 r-allow 返回 true，
+	// 与前条可同时成立。默认值也是 true：结果必须来自获胜规则，而不是
+	// 后面的规则或默认值。
+	cfg := `{"flags":[{"key":"f","enabled":true,"default":true,"rules":[
+		{"id":"r-block","value":false,"conditions":[
+			{"attribute":"note","op":"eq","value":""},
+			{"attribute":"tier","op":"in","value":["gold","silver"]}]},
+		{"id":"r-allow","value":true,"conditions":[
+			{"attribute":"region","op":"eq","value":"cn"}]}]}]}`
+	// 只交换两条规则的配置位置，规则内容与默认值不变。
+	cfgSwapped := `{"flags":[{"key":"f","enabled":true,"default":true,"rules":[
+		{"id":"r-allow","value":true,"conditions":[
+			{"attribute":"region","op":"eq","value":"cn"}]},
+		{"id":"r-block","value":false,"conditions":[
+			{"attribute":"note","op":"eq","value":""},
+			{"attribute":"tier","op":"in","value":["gold","silver"]}]}]}]}`
+
+	assertResult := func(t *testing.T, got EvalResult, value bool, reason EvalReason, ruleID string) {
+		t.Helper()
+		want := EvalResult{Key: "f", Value: value, Reason: reason}
+		if ruleID != "" {
+			want.RuleID = &ruleID
+		}
+		if !got.Equals(want) {
+			t.Fatalf("got %+v, want %+v", got, want)
+		}
+	}
+
+	// 两条规则同时成立：前条 r-block 的 false 立即定案，不因后条规则
+	// 或默认值都是 true 而改变。
+	bothHit := `{"note":"","tier":"gold","region":"cn"}`
+	assertResult(t, eval(t, cfg, "f", bothHit), false, EvalRule, "r-block")
+	// 只交换配置位置、上下文相同：改由 r-allow 获胜，reason 与 ruleId
+	// 跟着获胜规则变化。
+	assertResult(t, eval(t, cfgSwapped, "f", bothHit), true, EvalRule, "r-allow")
+
+	// 前条规则只成立一部分条件、后条完整成立：采用后条的 true 与其编号。
+	// 任意单个条件成立都不算命中，前条返回 false 也不会阻止继续检查。
+	// eq 成立、in 不成立。
+	assertResult(t, eval(t, cfg, "f", `{"note":"","tier":"bronze","region":"cn"}`),
+		true, EvalRule, "r-allow")
+	// in 成立、eq 不成立（note 为非空字符串）。
+	assertResult(t, eval(t, cfg, "f", `{"note":"x","tier":"silver","region":"cn"}`),
+		true, EvalRule, "r-allow")
+
+	// 属性缺失仍表示对应条件不成立：note 缺失时前条不命中，继续检查后条；
+	// 显式空字符串是合法值，让前条真正获胜（见 bothHit 的 false 结果）。
+	assertResult(t, eval(t, cfg, "f", `{"tier":"gold","region":"cn"}`),
+		true, EvalRule, "r-allow")
+
+	// 两条规则都不成立时才采用 true 的默认值：reason=default、ruleId=null，
+	// 与返回相同布尔值的规则命中（reason=rule、ruleId=r-allow）保持区别。
+	got := eval(t, cfg, "f", `{"note":"x","tier":"bronze","region":"us"}`)
+	assertResult(t, got, true, EvalDefault, "")
+	if got.RuleID != nil {
+		t.Fatalf("default result must carry nil ruleId: %+v", got)
+	}
+}
+
 func TestEvaluateDefault(t *testing.T) {
 	cfg := `{"flags":[{"key":"f","enabled":true,"default":true,"rules":[
 		{"id":"r1","value":false,"conditions":[{"attribute":"plan","op":"eq","value":"pro"}]}]}]}`
