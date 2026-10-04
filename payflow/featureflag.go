@@ -189,58 +189,52 @@ func ParseContext(raw []byte) (*Context, error) {
 	if err := rejectDuplicateFields(raw, "context"); err != nil {
 		return nil, err
 	}
-	doc, err := unmarshalStrictJSON(raw)
-	if err != nil {
+	// 先对整份文档做严格语法校验（含“文档之后只允许空白”），保证其后的
+	// 任何 JSON 语法问题都先于属性类型错误报告。
+	if _, err := unmarshalStrictJSON(raw); err != nil {
 		return nil, fmt.Errorf("context: invalid JSON: %w", err)
 	}
-	root, ok := doc.(map[string]any)
-	if !ok {
-		return nil, fmt.Errorf("context: top level must be a JSON object")
-	}
-	// 值类型必须按原文顺序逐个判定：Go map 的遍历顺序不稳定，不能直接
-	// range root，否则同一文件在不同运行中可能报告不同属性。对象或数组
-	// 值整体算所属顶层属性的一个值，错误不指向其内部成员。
-	if err := checkContextValueTypes(raw); err != nil {
-		return nil, err
-	}
-	ctx := &Context{values: make(map[string]string, len(root))}
-	for k, v := range root {
-		// 经过 checkContextValueTypes 后所有值都是字符串；数字（含超出浮点
-		// 范围的 json.Number）、布尔、null、对象、数组都已按所属属性报错。
-		ctx.values[k] = v.(string)
-	}
-	return ctx, nil
+	return parseContextAttributes(raw)
 }
 
-// checkContextValueTypes 按文件原文顺序扫描已通过语法与重复字段检查的
-// context 对象，报告第一个值不是字符串的顶层属性。键名使用解码后的文字
-// （合法的 \uXXXX 转义与直接字符同义；大小写与空白按原样保留）。嵌套
-// 对象或数组整体跳过，其内部成员不单独检查。
-func checkContextValueTypes(raw []byte) error {
+// parseContextAttributes 按文件原文顺序单次遍历已通过全部前置校验的
+// context 对象：在同一次解码中判定每个顶层属性的值类型并把字符串值收进
+// 可用属性表，不再为“类型检查”和“建立属性”分别解析同一份原文。
+// 值类型必须按原文顺序逐个判定：Go map 的遍历顺序不稳定，不能先收进 map
+// 再检查，否则同一文件在不同运行中可能报告不同属性。对象或数组值整体算
+// 所属顶层属性的一个值，错误不指向其内部成员。键名使用解码后的文字
+// （合法的 \uXXXX 转义与直接字符同义；大小写与空白按原样保留）。
+func parseContextAttributes(raw []byte) (*Context, error) {
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	// UseNumber：数字按 json.Number 原样保留而不转 float64，使超出浮点范围
 	// 的合法数字（如 1e400）也能落到“值必须是字符串”的属性类型错误，而不是
 	// 在解码阶段被报成 JSON 语法问题。
 	dec.UseNumber()
-	// 第一个令牌必须是顶层对象的 '{'；非对象的情形在 ParseContext 中报告。
+	// 第一个令牌必须是顶层对象的 '{'；语法已校验，令牌流必定完整。
 	if tok, err := dec.Token(); err != nil || tok != json.Delim('{') {
-		return nil
+		return nil, fmt.Errorf("context: top level must be a JSON object")
 	}
+	ctx := &Context{values: make(map[string]string)}
 	for dec.More() {
 		keyTok, err := dec.Token()
 		if err != nil {
-			return nil // 语法错误留给严格解码的报错
+			return nil, fmt.Errorf("context: invalid JSON: %w", err)
 		}
 		key, _ := keyTok.(string)
 		var value any
 		if err := dec.Decode(&value); err != nil {
-			return nil // 语法错误留给严格解码的报错
+			return nil, fmt.Errorf("context: invalid JSON: %w", err)
 		}
-		if _, ok := value.(string); !ok {
-			return fmt.Errorf("%s: value must be a string", appendFieldPath("context", key))
+		s, ok := value.(string)
+		if !ok {
+			// 数字（含超出浮点范围的 json.Number）、布尔、null、对象、数组
+			// 都按所属顶层属性报类型错误。
+			return nil, fmt.Errorf("%s: value must be a string", appendFieldPath("context", key))
 		}
+		// 重复字段已在前置检查中拒绝，这里每个键只出现一次。
+		ctx.values[key] = s
 	}
-	return nil
+	return ctx, nil
 }
 
 // Get looks up an attribute; an empty string is a legal value.
