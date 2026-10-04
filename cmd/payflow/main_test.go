@@ -297,6 +297,147 @@ func TestCLIErrorCases(t *testing.T) {
 	}
 }
 
+// TestCLIEvaluateOutOfRangeNumbersAreTypeErrors 端到端锁定：上下文里未加
+// 引号的 1e400、-1e400 与 1 后接 400 个 0 的整数是合法 JSON 中的错误属性
+// 类型——非零退出、stdout 为空、stderr 指出属性并说明必须是字符串，而不是
+// JSON 语法错误。开关关闭或规则不引用该属性都不能放行。
+func TestCLIEvaluateOutOfRangeNumbersAreTypeErrors(t *testing.T) {
+	hugeInt := "1" + strings.Repeat("0", 400)
+	cases := []struct {
+		name string
+		key  string
+		ctx  string
+		want string
+	}{
+		{"1e400", "feature-a", `{"plan":1e400}`, "context.plan"},
+		{"-1e400", "feature-a", `{"plan":-1e400}`, "context.plan"},
+		{"400-digit integer", "feature-a", `{"plan":` + hugeInt + `}`, "context.plan"},
+		{"disabled flag does not exempt", "feature-b", `{"plan":1e400}`, "context.plan"},
+		{"unreferenced attribute", "feature-a", `{"plan":"pro","region":"cn","extra":-1e400}`, "context.extra"},
+		{"inside object points to top key", "feature-a", `{"plan":{"x":1e400}}`, "context.plan"},
+		{"inside array points to top key", "feature-a", `{"plan":[1e400]}`, "context.plan"},
+		{"bool error before big number wins", "feature-a", `{"zeta":false,"plan":1e400}`, "context.zeta"},
+		{"big number first wins", "feature-a", `{"plan":1e400,"zeta":false}`, "context.plan"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t, validConfig, tc.ctx)
+			var stdout, stderr bytes.Buffer
+			code := run(h.evalArgs(tc.key), &stdout, &stderr)
+			if code == 0 {
+				t.Fatalf("expected non-zero exit")
+			}
+			if stdout.Len() != 0 {
+				t.Fatalf("stdout must be empty on error, got: %q", stdout.String())
+			}
+			msg := stderr.String()
+			if !strings.Contains(msg, tc.want) || !strings.Contains(msg, "value must be a string") {
+				t.Fatalf("stderr=%q, want %s string-type error", msg, tc.want)
+			}
+			if strings.Contains(msg, "invalid JSON") || strings.Contains(msg, "invalid character") {
+				t.Fatalf("legal out-of-range number must not be a JSON syntax error: %q", msg)
+			}
+		})
+	}
+}
+
+// TestCLIEvaluateBigNumberPrecedenceAndSyntax 端到端锁定：完整输入检查优先
+// 于属性类型检查（大数字之后的重复字段先报），而 1e+ 这类无效数字写法仍是
+// JSON 语法错误。
+func TestCLIEvaluateBigNumberPrecedenceAndSyntax(t *testing.T) {
+	cases := []struct {
+		name string
+		ctx  string
+		want string
+	}{
+		{"duplicate after big number", `{"a":1e400,"b":1,"b":2}`, `context.b: duplicate field "b"`},
+		{"duplicate after negative big number", `{"a":-1e400,"b":1,"b":2}`, `context.b: duplicate field "b"`},
+		{"duplicate of the big-number attr", `{"a":1e400,"a":2}`, `context.a: duplicate field "a"`},
+		{"malformed exponent 1e+", `{"a":1e+}`, "invalid JSON"},
+		{"malformed exponent beats later duplicate", `{"a":1e+,"b":1,"b":2}`, "invalid JSON"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t, validConfig, tc.ctx)
+			var stdout, stderr bytes.Buffer
+			code := run(h.evalArgs("feature-a"), &stdout, &stderr)
+			if code == 0 {
+				t.Fatalf("expected non-zero exit")
+			}
+			if stdout.Len() != 0 {
+				t.Fatalf("stdout must be empty on error, got: %q", stdout.String())
+			}
+			if !strings.Contains(stderr.String(), tc.want) {
+				t.Fatalf("stderr=%q, want substring %q", stderr.String(), tc.want)
+			}
+		})
+	}
+}
+
+// TestCLIEvaluateQuotedBigNumberMatchesRule 端到端锁定：大数字文本加上引号
+// 后就是合法字符串，按原文参与 eq 匹配：成功时 stdout 仍是包含开关键、布尔
+// 结果、命中原因和规则编号的单个 JSON 对象，stderr 为空，文本不被当成数值
+// 改写。关闭开关场景也保持既有 disabled 行为。
+func TestCLIEvaluateQuotedBigNumberMatchesRule(t *testing.T) {
+	hugeInt := "1" + strings.Repeat("0", 400)
+	bigConfig := `{"flags":[
+		{"key":"big","enabled":true,"default":false,"rules":[
+			{"id":"r-big","value":true,"conditions":[
+				{"attribute":"v","op":"eq","value":"1e400"},
+				{"attribute":"w","op":"eq","value":"-1e400"},
+				{"attribute":"n","op":"eq","value":"` + hugeInt + `"}]}]},
+		{"key":"off","enabled":false,"default":true,"rules":[]}]}`
+	h := newHarness(t, bigConfig, `{"v":"1e400","w":"-1e400","n":"`+hugeInt+`"}`)
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"evaluate", h.configPath, "big", h.contextPath}, &stdout, &stderr); code != 0 {
+		t.Fatalf("exit=%d stderr=%s", code, stderr.String())
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr must be empty on success, got: %q", stderr.String())
+	}
+	var got map[string]any
+	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
+		t.Fatalf("stdout is not a single JSON object: %q (%v)", stdout.String(), err)
+	}
+	if got["key"] != "big" || got["value"] != true || got["reason"] != "rule" || got["ruleId"] != "r-big" {
+		t.Fatalf("unexpected payload: %v", got)
+	}
+	if strings.Count(strings.TrimSpace(stdout.String()), "\n") != 0 {
+		t.Fatalf("stdout must contain exactly one JSON object line: %q", stdout.String())
+	}
+
+	// 文本差一个字符就不命中（不能在数值意义上被归一化）。
+	miss := newHarness(t, bigConfig, `{"v":"1e400","w":"-1e400","n":"`+hugeInt+`x"}`)
+	var out2, err2 bytes.Buffer
+	if code := run([]string{"evaluate", miss.configPath, "big", miss.contextPath}, &out2, &err2); code != 0 {
+		t.Fatalf("miss run exit=%d stderr=%s", code, err2.String())
+	}
+	var missResult map[string]any
+	if err := json.Unmarshal(out2.Bytes(), &missResult); err != nil {
+		t.Fatalf("miss output: %v", err)
+	}
+	if missResult["reason"] != "default" || missResult["value"] != false {
+		t.Fatalf("quoted text must compare verbatim: %v", missResult)
+	}
+
+	// 关闭的开关上，带大数字字符串的上下文仍走既有 disabled 路径。
+	off := newHarness(t, bigConfig, `{"anything":"1e400"}`)
+	var out3, err3 bytes.Buffer
+	if code := run([]string{"evaluate", off.configPath, "off", off.contextPath}, &out3, &err3); code != 0 {
+		t.Fatalf("disabled run exit=%d stderr=%s", code, err3.String())
+	}
+	var offResult map[string]any
+	if err := json.Unmarshal(out3.Bytes(), &offResult); err != nil {
+		t.Fatalf("disabled output: %v", err)
+	}
+	if offResult["value"] != false || offResult["reason"] != "disabled" || offResult["ruleId"] != nil {
+		t.Fatalf("disabled behavior changed: %v", offResult)
+	}
+	if err3.Len() != 0 {
+		t.Fatalf("disabled success must leave stderr empty: %q", err3.String())
+	}
+}
+
 func TestCLILegacyCommandsPreserved(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	if code := run([]string{"version"}, &stdout, &stderr); code != 0 || strings.TrimSpace(stdout.String()) != "payflow 0.1.0" {

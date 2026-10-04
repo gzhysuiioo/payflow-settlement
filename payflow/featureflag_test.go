@@ -736,6 +736,219 @@ func TestValidUnicodeEscapesUnchanged(t *testing.T) {
 	}
 }
 
+// TestContextOutOfRangeFloatNumbersAreTypeErrors 锁定：语法合法但超出普通
+// 浮点范围的 JSON 数字（1e400、-1e400、1 后接 400 个 0 的整数）是“合法
+// JSON 中的错误属性类型”，而不是 JSON 语法错误；失败信息指出该属性并说明
+// 值必须是字符串。
+func TestContextOutOfRangeFloatNumbersAreTypeErrors(t *testing.T) {
+	hugeInt := "1" + strings.Repeat("0", 400)
+	for _, tc := range []struct {
+		name string
+		raw  string
+	}{
+		{"positive exponent overflow", `{"plan":1e400}`},
+		{"negative exponent overflow", `{"plan":-1e400}`},
+		{"400-digit integer", `{"plan":` + hugeInt + `}`},
+		// 前有合法属性不改变后一个大数字属性的归属。
+		{"after a string attr", `{"region":"cn","plan":1e400}`},
+		{"after an empty string attr", `{"region":"","plan":-1e400}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := ParseContext([]byte(tc.raw))
+			if err == nil {
+				t.Fatalf("ParseContext(%s): expected error, got nil", tc.raw)
+			}
+			msg := err.Error()
+			if !strings.Contains(msg, "context.plan") {
+				t.Fatalf("error = %q, want location context.plan", msg)
+			}
+			if !strings.Contains(msg, "value must be a string") {
+				t.Fatalf("error = %q, want type-error wording", msg)
+			}
+			if strings.Contains(msg, "invalid JSON") || strings.Contains(msg, "invalid character") {
+				t.Fatalf("legal out-of-range number must be a type error, not a JSON syntax error: %q", msg)
+			}
+		})
+	}
+
+	// 即使规则不引用该属性，输入也不能通过：上下文先于求值完整校验。
+	cfg := `{"flags":[{"key":"f","enabled":true,"default":true,"rules":[
+		{"id":"r1","value":true,"conditions":[{"attribute":"tier","op":"eq","value":"x"}]}]}]}`
+	mustParseConfig(t, cfg) // 配置本身合法；下面验证上下文校验与求值无关
+	for _, raw := range []string{`{"unused":1e400}`, `{"unused":-1e400}`, `{"unused":` + hugeInt + `}`} {
+		if _, err := ParseContext([]byte(raw)); err == nil ||
+			!strings.Contains(err.Error(), "context.unused") {
+			t.Errorf("unreferenced attr %s must still fail validation: %v", raw, err)
+		}
+	}
+	// 关闭的开关同样不能让这种输入通过。
+	offCfg := `{"flags":[{"key":"f","enabled":false,"default":true,"rules":[]}]}`
+	offFlag := mustParseConfig(t, offCfg).Find("f")
+	if _, err := ParseContext([]byte(`{"anything":1e400}`)); err == nil ||
+		!strings.Contains(err.Error(), "context.anything") {
+		t.Fatalf("big number must be rejected for a disabled flag too: %v", err)
+	}
+	if got := offFlag.Evaluate(mustParseContext(t, `{"anything":"1e400"}`)); got.Reason != EvalDisabled {
+		t.Fatalf("disabled flag with valid string attrs: got %+v", got)
+	}
+}
+
+// TestContextBigNumberInsideContainerPointsToTopAttribute 锁定：属性值是
+// 含有大数字的对象或数组时，错误仍归属于整个顶层属性，不指向内部成员。
+func TestContextBigNumberInsideContainerPointsToTopAttribute(t *testing.T) {
+	hugeInt := "1" + strings.Repeat("0", 400)
+	for _, tc := range []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{"object with exponent overflow", `{"a":"ok","b":{"inner":1e400}}`, "context.b"},
+		{"array with exponent overflow", `{"a":"ok","b":[1e400]}`, "context.b"},
+		{"deep object", `{"a":"x","b":{"deep":{"k":-1e400}}}`, "context.b"},
+		{"deep array", `{"a":"x","b":[[1e400]]}`, "context.b"},
+		{"huge int in object", `{"a":"x","b":{"k":` + hugeInt + `}}`, "context.b"},
+		{"mixed container first bad", `{"a":"x","b":{"n":1,"big":1e400,"s":"y"}}`, "context.b"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := ParseContext([]byte(tc.raw))
+			if err == nil {
+				t.Fatalf("expected type error, got nil\ncontext: %s", tc.raw)
+			}
+			msg := err.Error()
+			// 错误定位只能停在顶层属性：整个容器算一个值，不指向内部成员。
+			if !strings.HasPrefix(msg, tc.want+":") || !strings.Contains(msg, "value must be a string") {
+				t.Fatalf("error = %q, want prefix %q with string-type wording", msg, tc.want+":")
+			}
+		})
+	}
+}
+
+// TestContextBigNumberFirstErrorInSourceOrder 锁定：多个属性类型不正确时
+// 报告原文里最先出现的那个；布尔值错误不能被后面的大数字盖住，调整顺序
+// 或修正第一处后报告新的第一处。
+func TestContextBigNumberFirstErrorInSourceOrder(t *testing.T) {
+	hugeInt := "1" + strings.Repeat("0", 400)
+	checkFirst := func(t *testing.T, raw, want string) {
+		t.Helper()
+		var first string
+		for i := 0; i < 20; i++ {
+			_, err := ParseContext([]byte(raw))
+			if err == nil {
+				t.Fatalf("iter %d: expected error", i)
+			}
+			if i == 0 {
+				first = err.Error()
+			} else if err.Error() != first {
+				t.Fatalf("iter %d: %q != %q", i, err.Error(), first)
+			}
+		}
+		if !strings.Contains(first, want) || !strings.Contains(first, "value must be a string") {
+			t.Fatalf("first error = %q, want %s", first, want)
+		}
+	}
+	// 前面的布尔错误优先于后面的大数字（三种写法都要验证）。
+	checkFirst(t, `{"zeta":false,"plan":"pro","alpha":1e400}`, "context.zeta")
+	checkFirst(t, `{"zeta":false,"plan":"pro","alpha":-1e400}`, "context.zeta")
+	checkFirst(t, `{"zeta":false,"plan":"pro","alpha":`+hugeInt+`}`, "context.zeta")
+	// 大数字放在最前：报告它本身，不被后面的布尔错误盖住。
+	checkFirst(t, `{"plan":1e400,"zeta":false}`, "context.plan")
+	checkFirst(t, `{"plan":-1e400,"zeta":false}`, "context.plan")
+	checkFirst(t, `{"plan":`+hugeInt+`,"zeta":false}`, "context.plan")
+	// 把第一处改为字符串后，应报告剩余属性中最先出现的一处（大数字）。
+	_, err := ParseContext([]byte(`{"zeta":"z","plan":"pro","alpha":1e400}`))
+	if err == nil || !strings.Contains(err.Error(), "context.alpha") {
+		t.Fatalf("after fixing zeta: err=%v want context.alpha", err)
+	}
+	_, err = ParseContext([]byte(`{"zeta":"z","plan":` + hugeInt + `}`))
+	if err == nil || !strings.Contains(err.Error(), "context.plan") {
+		t.Fatalf("after fixing zeta (huge int): err=%v want context.plan", err)
+	}
+}
+
+// TestContextBigNumberCompleteInputChecksTakePrecedence 锁定：完整输入检查
+// （重复字段、代理项转义、JSON 语法）优先于属性类型检查——大数字不能遮住
+// 它后面的重复字段，也不能把语法错误变成类型错误。
+func TestContextBigNumberCompleteInputChecksTakePrecedence(t *testing.T) {
+	hugeInt := "1" + strings.Repeat("0", 400)
+	// 大数字属性在先、其后同对象存在重复字段：优先指出重复字段及其位置。
+	for _, raw := range []string{
+		`{"a":1e400,"b":1,"b":2}`,
+		`{"a":-1e400,"b":1,"b":2}`,
+		`{"a":` + hugeInt + `,"b":1,"b":2}`,
+		`{"a":{"x":1e400},"b":1,"b":2}`,
+		`{"a":[1e400],"b":1,"b":2}`,
+	} {
+		_, err := ParseContext([]byte(raw))
+		if err == nil || !strings.Contains(err.Error(), `context.b: duplicate field "b"`) {
+			t.Errorf("dup precedence for %s: err=%v", raw, err)
+		}
+	}
+	// 大数字属性自身重复：重复字段错误归属于该属性。
+	_, err := ParseContext([]byte(`{"a":1e400,"a":2}`))
+	if err == nil || !strings.Contains(err.Error(), `context.a: duplicate field "a"`) {
+		t.Fatalf("dup on big-number attr: err=%v", err)
+	}
+	// 嵌套对象内的重复字段同样先于更早属性的类型错误。
+	_, err = ParseContext([]byte(`{"a":1e400,"o":{"k":1,"k":2}}`))
+	if err == nil || !strings.Contains(err.Error(), `context.o.k: duplicate field "k"`) {
+		t.Fatalf("nested dup precedence: err=%v", err)
+	}
+	// 不能组成完整字符的 \u 转义先于较早属性的类型错误。
+	_, err = ParseContext([]byte(`{"a":1e400,"b":"\uD800"}`))
+	if err == nil || !strings.Contains(err.Error(), "context.b") ||
+		!strings.Contains(err.Error(), "does not form a complete character") {
+		t.Fatalf("unicode-escape precedence: err=%v", err)
+	}
+	// 数字写法本身无效（1e+）仍报 JSON 语法错误，即使后面有重复字段。
+	for _, raw := range []string{
+		`{"a":1e+}`,
+		`{"a":1e+,"b":1,"b":2}`,
+		`{"plan":1e+}`,
+	} {
+		_, err := ParseContext([]byte(raw))
+		if err == nil || !strings.Contains(err.Error(), "invalid JSON") {
+			t.Errorf("malformed number %s must be a JSON syntax error: err=%v", raw, err)
+		}
+	}
+}
+
+// TestQuotedBigNumberIsOrdinaryString 锁定：给相同数字文本加上引号后，它
+// 就是普通字符串——按原文参与 eq 匹配，不被当成数值、改写或拒绝。三种
+// 写法（1e400、-1e400、400 位整数）都要按原文保留并命中。
+func TestQuotedBigNumberIsOrdinaryString(t *testing.T) {
+	hugeInt := "1" + strings.Repeat("0", 400)
+	for _, tc := range []struct {
+		name string
+		text string
+	}{
+		{"1e400", "1e400"},
+		{"-1e400", "-1e400"},
+		{"huge-int", hugeInt},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// 属性名避开数字文本本身可能引入的歧义；value 里完整保留原文。
+			cfg := `{"flags":[{"key":"f","enabled":true,"default":false,"rules":[
+				{"id":"r-big","value":true,"conditions":[
+					{"attribute":"v","op":"eq","value":"` + tc.text + `"}]}]}]}`
+			got := eval(t, cfg, "f", `{"v":"`+tc.text+`"}`)
+			id := "r-big"
+			want := EvalResult{Key: "f", Value: true, Reason: EvalRule, RuleID: &id}
+			if !got.Equals(want) {
+				t.Fatalf("quoted big number must match eq verbatim: got %+v", got)
+			}
+			// 未加引号的同一文本必须被拒绝，二者不能被等价处理。
+			if _, err := ParseContext([]byte(`{"v":` + tc.text + `}`)); err == nil {
+				t.Fatalf("unquoted %s must fail", tc.text)
+			}
+			// 不同的数字文本只是不同的字符串，不能在数值意义上被当作相等。
+			miss := eval(t, cfg, "f", `{"v":"`+tc.text+`x"}`)
+			if miss.Reason != EvalDefault {
+				t.Fatalf("different string must not match: got %+v", miss)
+			}
+		})
+	}
+}
+
 func TestEmptyFlagListAndFind(t *testing.T) {
 	cfg := mustParseConfig(t, `{"flags":[]}`)
 	if cfg.Find("missing") != nil {
