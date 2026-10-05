@@ -4,9 +4,11 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"math"
 	"os"
 	"path/filepath"
+	"syscall"
 )
 
 // atomicWrite 将 v 以 JSON 原子写入 path：
@@ -63,6 +65,82 @@ func atomicWrite(path string, v any) error {
 		removeTemp()
 		return ledgerError(ErrStorage, "rename into place: %v", err)
 	}
+	if d, err := os.Open(dir); err == nil {
+		_ = d.Sync()
+		_ = d.Close()
+	}
+	return nil
+}
+
+// createExclusive 在 path 处排他地创建新账本文件，绝不覆盖任何已有路径项。
+//
+// 与 atomicWrite 的关键区别在最后一步：临时文件完整落盘后，用 link(2)
+// （ATOMIC_CREATE：目标存在即失败）把它发布到 path，而不是 rename。
+// 这使“检查路径是否占用”和“创建账本”成为内核里的同一个原子操作：
+//   - 普通文件、目录、损坏或空文件：EEXIST，原内容逐字节不变；
+//   - path 上是符号链接（无论其目标存在与否、指向文件还是目录）：
+//     link 不跟随符号链接，一律 EEXIST，链接本身与其去向保持不变，
+//     也不会顺着悬空链接把目标文件创建出来；
+//   - 经指向目录的符号链接访问一个尚未占用的文件位置时，目录项原本
+//     不存在，创建照常成功。
+//
+// 多个进程同时初始化同一尚不存在的路径时，只有一个 link 成功；
+// 失败者拿到 EEXIST 并清理自己的临时文件，不会触碰胜出者的文件。
+// 由于发布用的是硬链接而非 rename，胜出者磁盘上的文件从发布那一刻起
+// 就是已 fsync 的完整内容（临时文件与 path 指向同一个 inode），
+// 崩溃后同样只可能看到“完整新账本”或“路径不存在”，没有半成品。
+//
+// path 占用时返回带 ErrExists 的账本错误；其余创建/写入失败返回
+// ErrStorage 且不留下账本文件或临时文件。
+func createExclusive(path string, v any) error {
+	data, err := json.Marshal(v)
+	if err != nil {
+		return ledgerError(ErrStorage, "encode ledger: %v", err)
+	}
+	data = append(data, '\n')
+
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return ledgerError(ErrStorage, "create ledger directory %s: %v", dir, err)
+	}
+
+	tmp, err := os.CreateTemp(dir, ".ledger-*.tmp")
+	if err != nil {
+		return ledgerError(ErrStorage, "create temp file in %s: %v", dir, err)
+	}
+	tmpName := tmp.Name()
+	removeTemp := func() { _ = os.Remove(tmpName) }
+
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		removeTemp()
+		return ledgerError(ErrStorage, "write temp file: %v", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		removeTemp()
+		return ledgerError(ErrStorage, "fsync temp file: %v", err)
+	}
+	if err := tmp.Close(); err != nil {
+		removeTemp()
+		return ledgerError(ErrStorage, "close temp file: %v", err)
+	}
+	if err := os.Chmod(tmpName, 0o600); err != nil {
+		removeTemp()
+		return ledgerError(ErrStorage, "chmod temp file: %v", err)
+	}
+
+	// 原子排他发布：path 上存在任何路径项（含悬空/指向文件或目录的符号链接）
+	// 都返回 EEXIST，绝不替换它，也不跟随它。
+	if err := os.Link(tmpName, path); err != nil {
+		removeTemp()
+		if errors.Is(err, syscall.EEXIST) {
+			return ledgerError(ErrExists, "ledger already exists at %s", path)
+		}
+		return ledgerError(ErrStorage, "create ledger at %s: %v", path, err)
+	}
+	// path 与临时文件现在是同一个 inode；移除临时名字不影响已发布的账本。
+	removeTemp()
 	if d, err := os.Open(dir); err == nil {
 		_ = d.Sync()
 		_ = d.Close()

@@ -392,8 +392,20 @@ func canonicalLedgerPath(abs string) string {
 }
 
 // CreateLedger 在 path 处创建新账本。所有初始数据先校验，
-// 任一不合法则返回 ErrInvalid 且不创建任何文件；
-// 路径上已有账本则返回 ErrExists，绝不覆盖历史。
+// 任一不合法则返回 ErrInvalid 且不创建任何文件。
+//
+// “路径是否占用”与“创建账本”由内核一步原子完成（见 createExclusive）：
+//   - 路径上已有正常账本、损坏或空的普通文件、目录：返回 ErrExists，
+//     原内容逐字节不变；
+//   - 账本文件位置上是符号链接时（无论链接指向文件还是目录、目标是否
+//     存在）：返回 ErrExists，链接本身与其去向都不变，也不会顺着悬空
+//     链接把目标文件创建出来；
+//   - 经指向目录的符号链接访问一个尚未占用的文件位置时创建照常成功。
+//
+// 因此多个进程同时初始化同一尚不存在的账本（包括一方经真实目录、
+// 另一方经指向该目录的符号链接访问同一目标）时，恰好一个成功，
+// 其余返回 ErrExists，磁盘上完整保留胜出方的初始余额，绝不覆盖历史。
+// 已有句柄打开（或有在途操作）的路径同样拒绝初始化。
 func CreateLedger(path string, init []BalanceInit) error {
 	if err := validateInitial(init); err != nil {
 		return err
@@ -402,25 +414,22 @@ func CreateLedger(path string, init []BalanceInit) error {
 	if err != nil {
 		return ledgerError(ErrStorage, "resolve path: %v", err)
 	}
-	abs = canonicalLedgerPath(abs)
 
 	openMu.Lock()
 	defer openMu.Unlock()
 
-	if _, err := os.Stat(abs); err == nil {
-		return ledgerError(ErrExists, "ledger already exists at %s", abs)
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return ledgerError(ErrStorage, "stat %s: %v", abs, err)
-	}
-	// 已有句柄打开（或有在途操作）的路径不能再初始化：即便文件恰好被外部
-	// 删除，也不能用一本新账顶替正在使用的账本。无活动句柄时不做拦截——
-	// 是否已初始化完全由上面的磁盘检查决定。
-	if openRegistry[abs] != nil {
+	// 注册表按规范路径索引（父目录符号链接解析到真实目录），与 Open 一致。
+	// 注意 canonicalLedgerPath 对悬空符号链接只解析到其父目录、basename
+	// 仍是链接名；而下面的发布操作刻意使用字面 abs 而非该解析结果，确保
+	// 账本位置本身是符号链接时由内核原子拒绝，绝不顺着链接创建目标。
+	if openRegistry[canonicalLedgerPath(abs)] != nil {
+		// 已有句柄打开（或有在途操作）的路径不能再初始化：即便文件恰好被
+		// 外部删除，也不能用一本新账顶替正在使用的账本。
 		return ledgerError(ErrExists, "ledger is already initialized in this process")
 	}
 
-	// 文件存在即视为已初始化：CreateLedger 不预登记内存状态，账本是否存在、
-	// 内容是否完好一律以磁盘为准，首次 Open 必须实际读取并校验该文件。
+	// 账本是否存在、内容是否完好一律以磁盘的原子创建结果为准；
+	// CreateLedger 不预登记内存状态，首次 Open 必须实际读取并校验该文件。
 	state := &ledgerState{
 		Version:     ledgerVersion,
 		Initial:     make(map[balanceKey]int64, len(init)),
@@ -433,7 +442,11 @@ func CreateLedger(path string, init []BalanceInit) error {
 		state.Initial[k] = b.Balance
 		state.Balances[k] = b.Balance
 	}
-	if err := atomicWrite(abs, state); err != nil {
+	// 发布使用字面绝对路径：父目录中的符号链接照常解析（允许经目录软链接
+	// 在尚未占用的文件位置创建新账本），账本位置本身的符号链接则被
+	// link(2) 原子拒绝；占用竞争失败返回 ErrExists，写入故障返回
+	// ErrStorage，两种情况下路径上都不会留下半成品。
+	if err := createExclusive(abs, state); err != nil {
 		return err
 	}
 	// 不登记 openRegistry：尚未有任何句柄，首次 Open 必须以磁盘文件为准，
