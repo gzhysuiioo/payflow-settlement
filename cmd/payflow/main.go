@@ -99,14 +99,37 @@ func failWithError(stderr io.Writer, err error) int {
 	return failEnvelope(stderr, payflow.KindOf(err), err.Error())
 }
 
-func writeJSON(w io.Writer, v any) {
+// writeJSON 把 v 以缩进 JSON 加末尾换行写出。任一写入返回错误、或实际写出
+// 字节少于请求字节（短写，即使未同时返回错误），都返回错误；调用方必须据此
+// 判定输出失败，不能再当作成功。
+func writeJSON(w io.Writer, v any) error {
 	data, err := json.MarshalIndent(v, "", "  ")
 	if err != nil {
 		fmt.Fprintf(w, `{"error":{"kind":"storage_error","message":%q}}`+"\n", err.Error())
-		return
+		return err
 	}
-	w.Write(data)
-	w.Write([]byte("\n"))
+	if err := writeFull(w, data); err != nil {
+		return err
+	}
+	return writeFull(w, []byte("\n"))
+}
+
+// writeFull 要求一次写完 data：短写按 io.ErrShortWrite 处理。
+func writeFull(w io.Writer, data []byte) error {
+	n, err := w.Write(data)
+	if err != nil {
+		return err
+	}
+	if n != len(data) {
+		return io.ErrShortWrite
+	}
+	return nil
+}
+
+// failOutput 报告结果输出阶段（写标准输出）的失败：错误信封只写标准错误，
+// 不往可能已留有部分内容的标准输出再补成功响应或混入错误 JSON。
+func failOutput(stderr io.Writer, err error) int {
+	return failEnvelope(stderr, payflow.ErrStorage, "write result to standard output: "+err.Error())
 }
 
 // ledgerFlagSet 构造 -l/--ledger、-f/--file 标志。
@@ -190,19 +213,25 @@ func cmdSubmit(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 
 	// 即使批次内全部项都失败，也是正常的逐项结果，退出码仍为 0。
 	// --dry-run 只预测业务结果：不写入账本，输出带 dry_run:true 标记。
+	// 结果输出阶段失败（写错误或短写，含末尾换行）：退出码 1，错误信封只写
+	// 标准错误；已落账的付款不回滚，预览也保持账本不变。
 	if dryRun {
 		result, err := l.Preview(batch)
 		if err != nil {
 			return failWithError(stderr, err)
 		}
-		writeJSON(stdout, result)
+		if err := writeJSON(stdout, result); err != nil {
+			return failOutput(stderr, err)
+		}
 		return 0
 	}
 	result, err := l.Submit(batch)
 	if err != nil {
 		return failWithError(stderr, err)
 	}
-	writeJSON(stdout, result)
+	if err := writeJSON(stdout, result); err != nil {
+		return failOutput(stderr, err)
+	}
 	return 0
 }
 
