@@ -391,10 +391,37 @@ func canonicalLedgerPath(abs string) string {
 	return abs
 }
 
+// parentCanonicalPath 只解析父目录的符号链接、保留末级文件名本身不解析：
+//   - 经真实目录与指向该目录的软链接访问同一位置时解析出同一个实际路径，
+//     共享进程内注册表检查与互斥；
+//   - 账本文件位置上的符号链接（含悬空链接）不会被悄悄解析成其目标——
+//     那种路径必须原样按占用拒绝，绝不能顺着链接去创建目标。
+//
+// 父目录尚不存在（未初始化的常见情形）导致解析失败时退回词法清理后的
+// 绝对路径，实际创建由后续的 MkdirAll 完成。
+func parentCanonicalPath(abs string) string {
+	if resolved, err := filepath.EvalSymlinks(filepath.Dir(abs)); err == nil {
+		return filepath.Join(resolved, filepath.Base(abs))
+	}
+	return abs
+}
+
 // CreateLedger 在 path 处创建新账本。所有初始数据先校验，
-// 任一不合法则返回 ErrInvalid 且不创建任何文件；
-// 路径上已有账本则返回 ErrExists，绝不覆盖历史。
+// 任一不合法则返回 ErrInvalid 且不创建任何文件。
+//
+// “只许新建、绝不覆盖”由内核的 O_CREATE|O_EXCL（Unix 上另加 O_NOFOLLOW）
+// 保证，而非先 stat 再写：stat 与写入之间存在窗口，两个独立进程可能都看到
+// “不存在”并各自写入，最终只剩一份输入。互斥创建使得同一实际目标上相互
+// 重叠的初始化请求恰好一个成功，其余返回 ErrExists；胜出方写入失败也不会
+// 给落败方留下可乘之机（失败时只删除自己刚创建的文件）。
+//
+// 以下路径一律视为已占用，返回 ErrExists 且原内容、链接去向保持不变：
+// 正常账本、损坏或空的普通文件、目录，以及账本文件位置上的符号链接
+// （即使链接目标不存在：既不替换链接，也不顺着链接创建目标）。
+// 经目录符号链接在尚未占用的文件位置创建新账本仍然允许。
 func CreateLedger(path string, init []BalanceInit) error {
+	// 初始余额校验优先：不合法输入直接返回 invalid_parameter，
+	// 不解析路径、不创建目录或文件。
 	if err := validateInitial(init); err != nil {
 		return err
 	}
@@ -402,25 +429,20 @@ func CreateLedger(path string, init []BalanceInit) error {
 	if err != nil {
 		return ledgerError(ErrStorage, "resolve path: %v", err)
 	}
-	abs = canonicalLedgerPath(abs)
+	abs = parentCanonicalPath(abs)
 
 	openMu.Lock()
 	defer openMu.Unlock()
 
-	if _, err := os.Stat(abs); err == nil {
-		return ledgerError(ErrExists, "ledger already exists at %s", abs)
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return ledgerError(ErrStorage, "stat %s: %v", abs, err)
-	}
 	// 已有句柄打开（或有在途操作）的路径不能再初始化：即便文件恰好被外部
-	// 删除，也不能用一本新账顶替正在使用的账本。无活动句柄时不做拦截——
-	// 是否已初始化完全由上面的磁盘检查决定。
+	// 删除，也不能用一本新账顶替正在使用的账本——胜出方随后产生的付款与
+	// 退款不能被较晚结束的初始化重置。
 	if openRegistry[abs] != nil {
 		return ledgerError(ErrExists, "ledger is already initialized in this process")
 	}
 
-	// 文件存在即视为已初始化：CreateLedger 不预登记内存状态，账本是否存在、
-	// 内容是否完好一律以磁盘为准，首次 Open 必须实际读取并校验该文件。
+	// 是否占用以内核的互斥创建为准：CreateLedger 不预登记内存状态，
+	// 首次 Open 仍必须实际读取并校验该文件。
 	state := &ledgerState{
 		Version:     ledgerVersion,
 		Initial:     make(map[balanceKey]int64, len(init)),
@@ -433,8 +455,12 @@ func CreateLedger(path string, init []BalanceInit) error {
 		state.Initial[k] = b.Balance
 		state.Balances[k] = b.Balance
 	}
-	if err := atomicWrite(abs, state); err != nil {
+	occupied, err := createExclusiveFile(abs, state)
+	if err != nil {
 		return err
+	}
+	if occupied {
+		return ledgerError(ErrExists, "ledger already exists at %s", abs)
 	}
 	// 不登记 openRegistry：尚未有任何句柄，首次 Open 必须以磁盘文件为准，
 	// 这样在初始化与首次打开之间删除、清空或篡改文件都会被如实发现。

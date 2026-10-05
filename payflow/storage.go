@@ -9,7 +9,62 @@ import (
 	"path/filepath"
 )
 
-// atomicWrite 将 v 以 JSON 原子写入 path：
+// encodeLedgerDoc 把账本状态序列化为一个以换行结尾的 JSON 文档。
+func encodeLedgerDoc(v any) ([]byte, error) {
+	data, err := json.Marshal(v)
+	if err != nil {
+		return nil, ledgerError(ErrStorage, "encode ledger: %v", err)
+	}
+	return append(data, '\n'), nil
+}
+
+// stageTempFile 在 dir 中准备一份完整但尚未就位的账本文档：
+//  1. 确保 dir 存在；
+//  2. 写入同目录临时文件并 fsync；
+//  3. chmod 0600。
+//
+// 返回临时文件路径；任一步失败都清理临时文件并返回错误。
+func stageTempFile(dir string, data []byte) (string, error) {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", ledgerError(ErrStorage, "create ledger directory %s: %v", dir, err)
+	}
+	tmp, err := os.CreateTemp(dir, ".ledger-*.tmp")
+	if err != nil {
+		return "", ledgerError(ErrStorage, "create temp file in %s: %v", dir, err)
+	}
+	tmpName := tmp.Name()
+	cleanup := func() { _ = os.Remove(tmpName) }
+
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		cleanup()
+		return "", ledgerError(ErrStorage, "write temp file: %v", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		cleanup()
+		return "", ledgerError(ErrStorage, "fsync temp file: %v", err)
+	}
+	if err := tmp.Close(); err != nil {
+		cleanup()
+		return "", ledgerError(ErrStorage, "close temp file: %v", err)
+	}
+	if err := os.Chmod(tmpName, 0o600); err != nil {
+		cleanup()
+		return "", ledgerError(ErrStorage, "chmod temp file: %v", err)
+	}
+	return tmpName, nil
+}
+
+// fsyncDir 尽力 fsync 目录，帮助新建文件/改名跨掉电容灾。
+func fsyncDir(dir string) {
+	if d, err := os.Open(dir); err == nil {
+		_ = d.Sync()
+		_ = d.Close()
+	}
+}
+
+// atomicWrite 将 v 以 JSON 原子写入已存在账本的 path：
 //  1. 写入同目录临时文件并 fsync；
 //  2. rename 覆盖目标文件（同文件系统内原子）；
 //  3. 尽力 fsync 目录，帮助 rename 跨掉电容灾。
@@ -18,56 +73,86 @@ import (
 // 要么是完整新内容（临时文件先 fsync 后改名，JSON 只写一个文档）。
 // 进程在保存期间崩溃，重开只能看到完整的旧状态或新状态，
 // 不会出现“扣款无记录”或“记录未扣款”。
+//
+// 仅供已存在账本的后续更新（付款/退款）使用；初始化新建账本必须走
+// createExclusiveFile，原子 rename 会覆盖同名文件与符号链接，无法用于
+// “只许新建、绝不覆盖”的初始化。
 func atomicWrite(path string, v any) error {
-	perm := os.FileMode(0o600)
-	data, err := json.Marshal(v)
+	data, err := encodeLedgerDoc(v)
 	if err != nil {
-		return ledgerError(ErrStorage, "encode ledger: %v", err)
+		return err
 	}
-	data = append(data, '\n')
-
 	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return ledgerError(ErrStorage, "create ledger directory %s: %v", dir, err)
-	}
-
-	tmp, err := os.CreateTemp(dir, ".ledger-*.tmp")
+	tmpName, err := stageTempFile(dir, data)
 	if err != nil {
-		return ledgerError(ErrStorage, "create temp file in %s: %v", dir, err)
-	}
-	tmpName := tmp.Name()
-	removeTemp := func() { _ = os.Remove(tmpName) }
-
-	if _, err := tmp.Write(data); err != nil {
-		_ = tmp.Close()
-		removeTemp()
-		return ledgerError(ErrStorage, "write temp file: %v", err)
-	}
-	if err := tmp.Sync(); err != nil {
-		_ = tmp.Close()
-		removeTemp()
-		return ledgerError(ErrStorage, "fsync temp file: %v", err)
-	}
-	if err := tmp.Close(); err != nil {
-		removeTemp()
-		return ledgerError(ErrStorage, "close temp file: %v", err)
-	}
-	if err := os.Chmod(tmpName, perm); err != nil {
-		removeTemp()
-		return ledgerError(ErrStorage, "chmod temp file: %v", err)
+		return err
 	}
 	// rename 之后新文件已完整就位。即便此后目录 fsync 失败，也不能再回滚：
 	// 回滚内存会与磁盘（已是新状态）分叉。目录 fsync 仅影响掉电后目录项的
 	// 持久性，而可能出现的两种结局（旧文件/新文件）都是完整状态。
 	if err := os.Rename(tmpName, path); err != nil {
-		removeTemp()
+		_ = os.Remove(tmpName)
 		return ledgerError(ErrStorage, "rename into place: %v", err)
 	}
-	if d, err := os.Open(dir); err == nil {
-		_ = d.Sync()
-		_ = d.Close()
-	}
+	fsyncDir(dir)
 	return nil
+}
+
+// createExclusiveFile 以“只许新建、绝不覆盖”的方式在 path 处写入一份完整
+// 账本文档，供 CreateLedger 初始化使用：
+//   - 用 O_CREATE|O_EXCL（Unix 上另加 O_NOFOLLOW）直接在 path 上创建目标
+//     文件（权限 0600），随后把完整文档写入该文件并 fsync；
+//   - 占用判定全部交给内核：path 上已有普通文件（正常、损坏、空）、目录、
+//     符号链接（含目标不存在的悬空链接），或另一进程/线程已抢先创建，
+//     打开都以“已占用”失败，返回 occupied=true，已有内容与符号链接本身
+//     原样保留；
+//   - 目标文件由本次调用独占创建：写入或 fsync 失败时删除的一定是自己刚
+//     创建的半成品，绝不会碰到胜出方的账本，磁盘上也不会留下能被查询当成
+//     新账本的空壳/残片。
+//
+// 路径中间的目录符号链接照常跟随，因此经真实目录与指向该目录的软链接
+// 访问同一实际目标时，内核的互斥同样生效。返回的 err 非 nil 时为存储错误。
+func createExclusiveFile(path string, v any) (occupied bool, err error) {
+	data, err := encodeLedgerDoc(v)
+	if err != nil {
+		return false, err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return false, ledgerError(ErrStorage, "create ledger directory %s: %v", filepath.Dir(path), err)
+	}
+
+	// O_EXCL 互斥、O_NOFOLLOW 拒绝文件位置符号链接：先占住名字再写内容，
+	// 其他重叠的初始化此刻即拿到“已占用”，不会有两份文档相互覆盖。
+	f, err := openExclusiveCreate(path)
+	if err != nil {
+		if isOccupiedCreateErr(err) {
+			return true, nil
+		}
+		return false, ledgerError(ErrStorage, "create ledger %s: %v", path, err)
+	}
+
+	fail := func(format string, args ...any) error {
+		_ = f.Close()
+		_ = os.Remove(path) // 只可能删到本次独占创建的文件
+		return ledgerError(ErrStorage, format, args...)
+	}
+	// 仅测试注入：模拟“名字已独占占住、内容写入失败”的存储故障，
+	// 验证半成品会被删除、路径重新可被初始化。
+	if failCreateWriteHook != nil && failCreateWriteHook() {
+		return false, fail("injected write failure while initializing %s", path)
+	}
+	if _, werr := f.Write(data); werr != nil {
+		return false, fail("write ledger %s: %v", path, werr)
+	}
+	if serr := f.Sync(); serr != nil {
+		return false, fail("fsync ledger %s: %v", path, serr)
+	}
+	if cerr := f.Close(); cerr != nil {
+		_ = os.Remove(path)
+		return false, ledgerError(ErrStorage, "close ledger %s: %v", path, cerr)
+	}
+	fsyncDir(filepath.Dir(path))
+	return false, nil
 }
 
 // validateAndReplay 校验全部成功记录并从冻结的初始余额重放结算与退款：
@@ -227,3 +312,7 @@ func checksumHex(data []byte) string {
 	sum := sha256.Sum256(data)
 	return hex.EncodeToString(sum[:])
 }
+
+// failCreateWriteHook 仅供测试注入：非 nil 且返回 true 时，让初始化在
+// 独占创建账本文件之后、写入内容之前失败，以验证半成品清理。
+var failCreateWriteHook func() bool
