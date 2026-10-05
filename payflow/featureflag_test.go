@@ -230,6 +230,349 @@ func TestInSemantics(t *testing.T) {
 	}
 }
 
+// --- in 条件：解码后字符串精确相等的回归保障 -----------------------------------
+//
+// 这组测试保护 in 列表的既有行为：上下文值按 JSON 解码后的字符串与每个候选值
+// 逐项精确比较，只有完全相等才算属于列表。直接写出的字符与合法的 Unicode
+// 转义（含必须成对的代理项转义）表达同一文字时等价；大小写、首尾空白、
+// 预组合字符与“字母+组合附加符号”序列仍按不同字符串处理。
+//
+// 下列常量用拼接方式写出 JSON 转义文本（与本文件既有写法一致），避免在源码
+// 层面把转义写法与直接字符混为一谈。
+const (
+	// inEscEAcute 是 é（U+00E9）的转义写法。
+	inEscEAcute = `\u` + `00E9`
+	// inEscCombine 是 "e" 后接组合附加符号 U+0301 的转义写法（与预组合 é 不同）。
+	inEscCombine = `e\u` + `0301`
+	// inEscGrin 是 😀（U+1F600）的一对代理项转义写法。
+	inEscGrin = (`\u` + `D83D`) + (`\u` + `DE00`)
+	// inEscReplace 是 U+FFFD 的转义写法。
+	inEscReplace = `\u` + `FFFD`
+	// inEscTier 是属性名 tier 四个字母各自转义后的写法。
+	inEscTier = (`\u` + `0074`) + (`\u` + `0069`) + (`\u` + `0065`) + (`\u` + `0072`)
+)
+
+// inCfg 拼出只有一个启用开关、一条 in 规则（id=r1、value=true、default=false）
+// 的配置；attrJSON 是属性名的 JSON 字符串内容，listJSON 是完整的候选值数组。
+func inCfg(attrJSON, listJSON string) string {
+	return `{"flags":[{"key":"f","enabled":true,"default":false,"rules":[` +
+		`{"id":"r1","value":true,"conditions":[` +
+		`{"attribute":"` + attrJSON + `","op":"in","value":` + listJSON + `}]}]}]}`
+}
+
+// TestInDecodedSpellingEquivalence 验证同一属性名、列表候选值或上下文值，无论
+// 用直接字符还是合法 JSON Unicode 转义书写（包括需要一对代理项转义的字符），
+// 解码后都命中同一条规则，得到完全一致的 key、value、reason 与 ruleId；配置
+// 与上下文可以分别使用不同写法。
+func TestInDecodedSpellingEquivalence(t *testing.T) {
+	configs := []namedConfig{
+		{"direct candidates", inCfg(`tier`, `["é","😀","other"]`)},
+		{"escaped candidates", inCfg(`tier`, `["`+inEscEAcute+`","`+inEscGrin+`","other"]`)},
+		{"mixed candidates", inCfg(`tier`, `["é","`+inEscGrin+`","other"]`)},
+		{"escaped attribute", inCfg(inEscTier, `["é","😀","other"]`)},
+	}
+	contexts := []struct {
+		name string
+		raw  string
+	}{
+		{"e-acute direct", `{"tier":"é"}`},
+		{"e-acute escaped", `{"tier":"` + inEscEAcute + `"}`},
+		{"emoji direct", `{"tier":"😀"}`},
+		{"emoji surrogate pair", `{"tier":"` + inEscGrin + `"}`},
+		{"plain ascii", `{"tier":"other"}`},
+		{"escaped attr, direct value", `{"` + inEscTier + `":"é"}`},
+		{"escaped attr, escaped value", `{"` + inEscTier + `":"` + inEscGrin + `"}`},
+	}
+	id := "r1"
+	want := EvalResult{Key: "f", Value: true, Reason: EvalRule, RuleID: &id}
+	var reference EvalResult
+	for ci, cfg := range configs {
+		for _, cx := range contexts {
+			t.Run(cfg.name+"/"+cx.name, func(t *testing.T) {
+				got := eval(t, cfg.raw, "f", cx.raw)
+				if !got.Equals(want) {
+					t.Fatalf("decoded spellings must hit the same rule: got %+v, want %+v", got, want)
+				}
+				if ci == 0 && cx.name == "e-acute direct" {
+					reference = got
+				} else if !got.Equals(reference) {
+					t.Fatalf("result drifted across spellings: got %+v, want %+v", got, reference)
+				}
+			})
+		}
+	}
+}
+
+// TestInExactStringBoundaries 验证外形相近但解码后不相等的字符串不得归入列表：
+// 大小写、首尾空白、预组合 é（U+00E9）与 "e 加 U+0301" 的序列、邻近码位的
+// 表情符号都按原样区分。列表明确包含组合序列时，才匹配该序列。
+func TestInExactStringBoundaries(t *testing.T) {
+	cfg := inCfg(`tier`, `["é","😀","AbC"]`)
+	misses := []struct {
+		name string
+		raw  string
+	}{
+		{"uppercase precomposed", `{"tier":"É"}`},
+		{"lowercase ascii", `{"tier":"abc"}`},
+		{"leading space", `{"tier":" é"}`},
+		{"trailing space", `{"tier":"é "}`},
+		{"combining sequence vs precomposed", `{"tier":"` + inEscCombine + `"}`},
+		{"replacement char", `{"tier":"` + inEscReplace + `"}`},
+		{"neighboring emoji code point", `{"tier":"😃"}`},
+		{"missing attribute", `{"other":"é"}`},
+	}
+	for _, tc := range misses {
+		t.Run(tc.name, func(t *testing.T) {
+			got := eval(t, cfg, "f", tc.raw)
+			if got.Reason != EvalDefault || got.RuleID != nil || got.Value {
+				t.Fatalf("lookalike must not belong to the list: got %+v", got)
+			}
+		})
+	}
+
+	// 列表明确包含 e + U+0301：组合序列命中，预组合 é 反而不命中。
+	cfgCombining := inCfg(`tier`, `["`+inEscCombine+`"]`)
+	if got := eval(t, cfgCombining, "f", `{"tier":"`+inEscCombine+`"}`); got.Reason != EvalRule || !got.Value {
+		t.Fatalf("explicit combining sequence must match itself: %+v", got)
+	}
+	if got := eval(t, cfgCombining, "f", `{"tier":"é"}`); got.Reason != EvalDefault {
+		t.Fatalf("precomposed é must not match an e+U+0301 list: %+v", got)
+	}
+}
+
+// TestInEscapedBackslashIsLiteralText 保护“转义只发生一次”：JSON 中的
+// "\\u00E9" 解码为反斜杠加 u00E9 的普通文本，其后即使跟着 u 和十六进制数字也
+// 不会再次解码；它只与相同的字面文本相等，与真正解码出的 é 互不命中。
+func TestInEscapedBackslashIsLiteralText(t *testing.T) {
+	cfg := inCfg(`tier`, `["\\u00E9","\\uD83D\\uDE00"]`)
+	// 上下文给出相同的字面文本：命中。
+	if got := eval(t, cfg, "f", `{"tier":"\\u00E9"}`); got.Reason != EvalRule || !got.Value {
+		t.Fatalf("escaped-backslash text must equal the same literal text: %+v", got)
+	}
+	if got := eval(t, cfg, "f", `{"tier":"\\uD83D\\uDE00"}`); got.Reason != EvalRule || !got.Value {
+		t.Fatalf("surrogate-shaped literal text must equal itself: %+v", got)
+	}
+	// 真正解码出的字符（直接写出或用合法 Unicode 转义）与该字面文本不同。
+	for _, ctxRaw := range []string{`{"tier":"é"}`, `{"tier":"` + inEscEAcute + `"}`} {
+		if got := eval(t, cfg, "f", ctxRaw); got.Reason != EvalDefault {
+			t.Fatalf("decoded é must not equal backslash literal text (%s): %+v", ctxRaw, got)
+		}
+	}
+	if got := eval(t, cfg, "f", `{"tier":"😀"}`); got.Reason != EvalDefault {
+		t.Fatalf("decoded emoji must not equal surrogate-shaped literal text: %+v", got)
+	}
+	// 反向：列表只有解码后的 é 时，反斜杠字面文本不属于列表。
+	cfgDecoded := inCfg(`tier`, `["é"]`)
+	if got := eval(t, cfgDecoded, "f", `{"tier":"\\u00E9"}`); got.Reason != EvalDefault {
+		t.Fatalf("literal backslash text must not match a decoded-only list: %+v", got)
+	}
+	// 多一层转义（解码为两个反斜杠加 u00E9）又是另一个字符串。
+	if got := eval(t, cfg, "f", `{"tier":"\\\\u00E9"}`); got.Reason != EvalDefault {
+		t.Fatalf("double-escaped backslash is yet another literal string: %+v", got)
+	}
+}
+
+// TestInAttributeNameExactLookup 验证 in 条件的属性名按解码后的文字精确查找：
+// 大小写、首尾空白、预组合字符与组合序列外形接近的另一个属性不能被读到；
+// 合法 Unicode 转义书写的属性名与直接字符同名，可以跨写法命中。
+func TestInAttributeNameExactLookup(t *testing.T) {
+	cfg := inCfg(`tier`, `["a"]`)
+	// 外形接近的属性名下即使放着列表内的值，也不能让条件成立。
+	for _, tc := range []struct {
+		name string
+		ctx  string
+	}{
+		{"capitalized", `{"Tier":"a"}`},
+		{"upper", `{"TIER":"a"}`},
+		{"leading space", `{" tier":"a"}`},
+		{"trailing space", `{"tier ":"a"}`},
+		{"emoji attribute", `{"😀":"a"}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := eval(t, cfg, "f", tc.ctx); got.Reason != EvalDefault {
+				t.Fatalf("lookalike attribute must not satisfy an in condition: %+v", got)
+			}
+		})
+	}
+	// 同名属性放着非成员值、近名属性放着成员值：必须读精确同名属性而不命中。
+	if got := eval(t, cfg, "f", `{"tier":"z","Tier":"a"}`); got.Reason != EvalDefault {
+		t.Fatalf("exact attribute lookup must ignore similarly named siblings: %+v", got)
+	}
+	// 精确同名属性存在且值为成员：命中。
+	if got := eval(t, cfg, "f", `{"Tier":"z","tier":"a"}`); got.Reason != EvalRule {
+		t.Fatalf("exact attribute name must be found: %+v", got)
+	}
+	// 转义书写的属性名与直接字符同名：跨写法命中。
+	if got := eval(t, cfg, "f", `{"`+inEscTier+`":"a"}`); got.Reason != EvalRule {
+		t.Fatalf("escaped attribute spelling must find the same attribute: %+v", got)
+	}
+
+	// 属性名本身区分预组合 "café" 与 "cafe"+U+0301，且转义写法与直接字符同义。
+	cfgAccent := inCfg(`café`, `["a"]`)
+	if got := eval(t, cfgAccent, "f", `{"café":"a"}`); got.Reason != EvalRule {
+		t.Fatalf("precomposed attribute name must be found exactly: %+v", got)
+	}
+	if got := eval(t, cfgAccent, "f", `{"caf`+inEscCombine+`":"a"}`); got.Reason != EvalDefault {
+		t.Fatalf("combining-sequence attribute name must not satisfy a precomposed lookup: %+v", got)
+	}
+	cfgAccentEsc := inCfg(`caf`+inEscEAcute, `["a"]`)
+	if got := eval(t, cfgAccentEsc, "f", `{"café":"a"}`); got.Reason != EvalRule {
+		t.Fatalf("escaped attribute spelling must find the literal-named attribute: %+v", got)
+	}
+
+	// 需要代理项对的属性名同样按解码文字精确查找。
+	cfgEmoji := inCfg(`😀`, `["a"]`)
+	if got := eval(t, cfgEmoji, "f", `{"`+inEscGrin+`":"a"}`); got.Reason != EvalRule {
+		t.Fatalf("surrogate-pair attribute spelling must equal the literal name: %+v", got)
+	}
+	if got := eval(t, cfgEmoji, "f", `{"😃":"a"}`); got.Reason != EvalDefault {
+		t.Fatalf("a neighboring emoji must be a different attribute: %+v", got)
+	}
+}
+
+// TestInListOrderAndDuplicates 验证列表顺序变化或加入已有候选值不改变成员判断；
+// 重复候选是合法配置，不被误报为重复字段或重复配置。
+func TestInListOrderAndDuplicates(t *testing.T) {
+	configs := []namedConfig{
+		{"base", inCfg(`tier`, `["a","b","é"]`)},
+		{"reordered", inCfg(`tier`, `["é","a","b"]`)},
+		{"escaped spelling", inCfg(`tier`, `["`+inEscEAcute+`","a","b"]`)},
+		{"with duplicates", inCfg(`tier`, `["a","b","a","é","b","é"]`)},
+	}
+	contexts := []struct {
+		raw       string
+		wantMatch bool
+	}{
+		{`{"tier":"a"}`, true},
+		{`{"tier":"b"}`, true},
+		{`{"tier":"é"}`, true},
+		{`{"tier":"` + inEscEAcute + `"}`, true},
+		{`{"tier":"c"}`, false},
+		{`{"tier":" a"}`, false},
+		{`{"tier":""}`, false},
+		{`{}`, false},
+	}
+	for _, cfg := range configs {
+		// 含重复候选的配置本身必须被接受（数组中的重复元素不是重复字段）。
+		mustParseConfig(t, cfg.raw)
+		for _, cx := range contexts {
+			t.Run(cfg.name+"/"+cx.raw, func(t *testing.T) {
+				got := eval(t, cfg.raw, "f", cx.raw)
+				if cx.wantMatch {
+					if got.Reason != EvalRule || got.RuleID == nil || *got.RuleID != "r1" || !got.Value {
+						t.Fatalf("member judgment changed: got %+v", got)
+					}
+				} else if got.Reason != EvalDefault || got.RuleID != nil {
+					t.Fatalf("non-member judgment changed: got %+v", got)
+				}
+			})
+		}
+	}
+}
+
+// TestInEarlierFalseVsLaterTrueRule 验证 in 的精确成员判断与规则定案顺序的配合：
+// 前面的 in 规则返回 false、后面的规则返回 true 且上下文可同时满足两者时，
+// 只有列表精确命中（含直接字符与转义两种写法）才由前一条以 reason=rule、
+// ruleId 指向前一条定案 false；外形相近的“伪命中”必须继续采用后面的规则；
+// 没有任何规则成立时仍采用 default、ruleId 为 null。
+func TestInEarlierFalseVsLaterTrueRule(t *testing.T) {
+	cfg := `{"flags":[{"key":"f","enabled":true,"default":true,"rules":[
+		{"id":"r-deny","value":false,"conditions":[
+			{"attribute":"plan","op":"eq","value":"pro"},
+			{"attribute":"tier","op":"in","value":["é","a"]}]},
+		{"id":"r-allow","value":true,"conditions":[
+			{"attribute":"region","op":"eq","value":"cn"}]}]}]}`
+	denyID, allowID := "r-deny", "r-allow"
+
+	// 精确命中：前一条立即定案 false，后一条同时成立也不能翻转。
+	for _, ctxRaw := range []string{
+		`{"plan":"pro","tier":"é","region":"cn"}`,
+		`{"plan":"pro","tier":"` + inEscEAcute + `","region":"cn"}`,
+		`{"plan":"pro","tier":"a","region":"cn"}`,
+	} {
+		got := eval(t, cfg, "f", ctxRaw)
+		want := EvalResult{Key: "f", Value: false, Reason: EvalRule, RuleID: &denyID}
+		if !got.Equals(want) {
+			t.Fatalf("exact in-match must lock the earlier false rule (%s): got %+v", ctxRaw, got)
+		}
+	}
+
+	// 外形相近但解码后不相等，或属性缺失：前一条不成立，后一条 r-allow 获胜。
+	for _, tc := range []struct {
+		name string
+		ctx  string
+	}{
+		{"combining sequence", `{"plan":"pro","tier":"` + inEscCombine + `","region":"cn"}`},
+		{"uppercase member", `{"plan":"pro","tier":"A","region":"cn"}`},
+		{"surrounding whitespace", `{"plan":"pro","tier":" a","region":"cn"}`},
+		{"replacement char", `{"plan":"pro","tier":"` + inEscReplace + `","region":"cn"}`},
+		{"missing tier", `{"plan":"pro","region":"cn"}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := eval(t, cfg, "f", tc.ctx)
+			want := EvalResult{Key: "f", Value: true, Reason: EvalRule, RuleID: &allowID}
+			if !got.Equals(want) {
+				t.Fatalf("lookalike miss must continue to the later rule: got %+v, want %+v", got, want)
+			}
+		})
+	}
+
+	// 两条规则都不成立：采用 default=true、ruleId=null。
+	got := eval(t, cfg, "f", `{"plan":"free","tier":"é","region":"eu"}`)
+	want := EvalResult{Key: "f", Value: true, Reason: EvalDefault, RuleID: nil}
+	if !got.Equals(want) {
+		t.Fatalf("no rule holds must use default: got %+v, want %+v", got, want)
+	}
+}
+
+// TestInEmptyStringMemberVsMissing 验证空字符串作为列表成员时，属性显式给出
+// 空字符串才算命中；属性缺失（或值为空白）不成立，并继续检查后面的规则。
+func TestInEmptyStringMemberVsMissing(t *testing.T) {
+	cfg := `{"flags":[{"key":"f","enabled":true,"default":true,"rules":[
+		{"id":"r-empty","value":false,"conditions":[
+			{"attribute":"plan","op":"eq","value":"pro"},
+			{"attribute":"note","op":"in","value":["","a"]}]},
+		{"id":"r-allow","value":true,"conditions":[
+			{"attribute":"region","op":"eq","value":"cn"}]}]}]}`
+	emptyID, allowID := "r-empty", "r-allow"
+
+	// note 显式为空字符串（或成员 "a"）且另一条件成立：前一条定案 false。
+	for _, ctxRaw := range []string{
+		`{"plan":"pro","note":"","region":"cn"}`,
+		`{"plan":"pro","note":"a","region":"cn"}`,
+	} {
+		got := eval(t, cfg, "f", ctxRaw)
+		want := EvalResult{Key: "f", Value: false, Reason: EvalRule, RuleID: &emptyID}
+		if !got.Equals(want) {
+			t.Fatalf("explicit empty-string member must win the earlier rule (%s): got %+v", ctxRaw, got)
+		}
+	}
+	// 属性缺失或值不在列表：前一条不成立，继续到 r-allow。
+	for _, ctxRaw := range []string{
+		`{"plan":"pro","region":"cn"}`,
+		`{"plan":"pro","note":"b","region":"cn"}`,
+		`{"plan":"pro","note":" ","region":"cn"}`,
+	} {
+		got := eval(t, cfg, "f", ctxRaw)
+		want := EvalResult{Key: "f", Value: true, Reason: EvalRule, RuleID: &allowID}
+		if !got.Equals(want) {
+			t.Fatalf("missing/non-member note must continue to the later rule (%s): got %+v", ctxRaw, got)
+		}
+	}
+
+	// 只有一个空串候选的列表：空串命中；空白与属性缺失都不命中。
+	cfgOnlyEmpty := inCfg(`note`, `[""]`)
+	if got := eval(t, cfgOnlyEmpty, "f", `{"note":""}`); got.Reason != EvalRule {
+		t.Fatalf("empty-only list matches explicit empty string: %+v", got)
+	}
+	if got := eval(t, cfgOnlyEmpty, "f", `{"note":" "}`); got.Reason != EvalDefault {
+		t.Fatalf("whitespace is not the empty-string member: %+v", got)
+	}
+	if got := eval(t, cfgOnlyEmpty, "f", `{}`); got.Reason != EvalDefault {
+		t.Fatalf("missing attribute does not satisfy empty-string membership: %+v", got)
+	}
+}
+
 func TestConditionsAreAND(t *testing.T) {
 	cfg := `{"flags":[{"key":"f","enabled":true,"default":false,"rules":[
 		{"id":"r1","value":true,"conditions":[

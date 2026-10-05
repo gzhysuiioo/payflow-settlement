@@ -1125,3 +1125,306 @@ func TestCLIEvaluateNameErrorPrecedencePreserved(t *testing.T) {
 		})
 	}
 }
+
+// --- evaluate 对 in 条件精确成员判断的端到端回归保障 ---------------------------
+//
+// 下列常量用 Go 原始字符串拼接出 JSON 转义文本（与本文件既有写法一致），确保
+// “转义写法”和“直接字符”在源码层面就是两个不同的输入。
+const (
+	// cliEscEA 是 U+00E9 的 JSON 转义写法；cliEscCB 是 e 加组合附加符号 U+0301
+	// 的转义写法（与预组合字符不同）；cliEscGR 是 U+1F600 的一对代理项转义；
+	// cliEscTier 是属性名 tier 四个字母各自转义后的写法。
+	cliEscEA   = (`\u` + `00E9`)
+	cliEscCB   = (`e\u` + `0301`)
+	cliEscGR   = (`\u` + `D83D`) + (`\u` + `DE00`)
+	cliEscTier = (`\u` + `0074`) + (`\u` + `0069`) + (`\u` + `0065`) + (`\u` + `0072`)
+	// cliLitEA 是 JSON 里“已转义的反斜杠后接 u00E9”的普通文本（两个反斜杠
+	// 后接 u00E9），解码后只是六个字面字符，不再是 Unicode 转义。
+	cliLitEA = (`\` + `\` + `u00E9`)
+)
+
+// cliInListConfig 拼出只有一个启用开关、一条 in 规则（id=r1、value=true、
+// default=false）的配置；listJSON 是完整的候选值数组文本。
+func cliInListConfig(listJSON string) string {
+	return `{"flags":[{"key":"f","enabled":true,"default":false,"rules":[` +
+		`{"id":"r1","value":true,"conditions":[` +
+		`{"attribute":"tier","op":"in","value":` + listJSON + `}]}]}]}`
+}
+
+// TestCLIEvaluateInDecodedSpellingEquivalence 端到端验证：同一属性名、列表
+// 候选值或上下文值，无论用直接字符还是合法 Unicode 转义（含代理项对）书写，
+// evaluate 都输出逐字节一致的单个 JSON 对象（key、value、reason、ruleId
+// 完全一致）；配置与上下文可分别使用不同写法。
+func TestCLIEvaluateInDecodedSpellingEquivalence(t *testing.T) {
+	configs := []struct {
+		name string
+		raw  string
+	}{
+		{"direct", cliInListConfig(`["é","😀","other"]`)},
+		{"escaped", cliInListConfig(`["` + cliEscEA + `","` + cliEscGR + `","other"]`)},
+		{"mixed", cliInListConfig(`["é","` + cliEscGR + `","other"]`)},
+	}
+	contexts := []struct {
+		name string
+		raw  string
+	}{
+		{"e-acute direct", `{"tier":"é"}`},
+		{"e-acute escaped", `{"tier":"` + cliEscEA + `"}`},
+		{"emoji direct", `{"tier":"😀"}`},
+		{"emoji surrogate pair", `{"tier":"` + cliEscGR + `"}`},
+		{"plain ascii", `{"tier":"other"}`},
+	}
+	var reference string
+	for ci, cfg := range configs {
+		for _, cx := range contexts {
+			t.Run(cfg.name+"/"+cx.name, func(t *testing.T) {
+				h := newHarness(t, cfg.raw, cx.raw)
+				got, raw := evalSuccess(t, h, "f")
+				if got["key"] != "f" || got["value"] != true ||
+					got["reason"] != "rule" || got["ruleId"] != "r1" {
+					t.Fatalf("unexpected payload: %v", got)
+				}
+				if ci == 0 && cx.name == "e-acute direct" {
+					reference = raw
+				} else if raw != reference {
+					t.Fatalf("spelling changed output:\n%s\n!= reference:\n%s", raw, reference)
+				}
+			})
+		}
+	}
+}
+
+// TestCLIEvaluateInLookalikesStayDistinct 端到端验证外形相近但解码后不相等的
+// 值不属于 in 列表：大小写、首尾空白、预组合字符与 e+U+0301 序列都按原样
+// 区分；已转义的反斜杠后即使跟 u 和十六进制数字也只是普通文本，不再解码。
+func TestCLIEvaluateInLookalikesStayDistinct(t *testing.T) {
+	config := cliInListConfig(`["é","AbC"]`)
+	misses := []struct {
+		name string
+		ctx  string
+	}{
+		{"uppercase", `{"tier":"É"}`},
+		{"lowercase", `{"tier":"abc"}`},
+		{"leading space", `{"tier":" é"}`},
+		{"trailing space", `{"tier":"é "}`},
+		{"combining sequence", `{"tier":"` + cliEscCB + `"}`},
+	}
+	for _, tc := range misses {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t, config, tc.ctx)
+			got, _ := evalSuccess(t, h, "f")
+			// 未命中任何规则：采用 default=false，ruleId 为 null。
+			if got["reason"] != "default" || got["value"] != false || got["ruleId"] != nil {
+				t.Fatalf("lookalike must not belong to the list: %v", got)
+			}
+		})
+	}
+
+	// 列表候选是反斜杠普通文本：相同字面文本命中；解码出的字符（直接写出或
+	// 用合法 Unicode 转义）与该字面文本不同，不命中。
+	literalConfig := `{"flags":[{"key":"g","enabled":true,"default":false,"rules":[
+		{"id":"r1","value":true,"conditions":[
+			{"attribute":"tier","op":"in","value":["` + cliLitEA + `"]}]}]}]}`
+	h := newHarness(t, literalConfig, `{"tier":"`+cliLitEA+`"}`)
+	if got, _ := evalSuccess(t, h, "g"); got["reason"] != "rule" {
+		t.Fatalf("backslash literal text must equal the same literal text: %v", got)
+	}
+	for _, tc := range []struct {
+		name string
+		ctx  string
+	}{
+		{"decoded direct", `{"tier":"é"}`},
+		{"decoded via escape", `{"tier":"` + cliEscEA + `"}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t, literalConfig, tc.ctx)
+			got, _ := evalSuccess(t, h, "g")
+			if got["reason"] != "default" || got["ruleId"] != nil {
+				t.Fatalf("decoded value must not match backslash literal text: %v", got)
+			}
+		})
+	}
+}
+
+// TestCLIEvaluateInExactAttributeLookup 端到端验证 in 条件的属性名精确查找：
+// 转义写法与直接字符读同一属性；外形接近的另一个属性即使持有列表内的值也不
+// 参与判断。
+func TestCLIEvaluateInExactAttributeLookup(t *testing.T) {
+	config := cliInListConfig(`["a"]`)
+	for i, ctx := range []string{
+		`{"tier":"a"}`,
+		`{"` + cliEscTier + `":"a"}`, // tier 四个字母分别用 Unicode 转义书写
+	} {
+		h := newHarness(t, config, ctx)
+		got, _ := evalSuccess(t, h, "f")
+		if got["reason"] != "rule" || got["ruleId"] != "r1" {
+			t.Fatalf("hit case %d: unexpected payload: %v", i, got)
+		}
+	}
+	for _, tc := range []struct {
+		name string
+		ctx  string
+	}{
+		{"capitalized attr holds member", `{"Tier":"a"}`},
+		{"exact attr holds non-member", `{"tier":"z","Tier":"a"}`},
+		{"spaced attr holds member", `{" tier":"a"}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t, config, tc.ctx)
+			got, _ := evalSuccess(t, h, "f")
+			if got["reason"] != "default" || got["ruleId"] != nil {
+				t.Fatalf("lookalike attribute must not satisfy an in condition: %v", got)
+			}
+		})
+	}
+
+	// 属性名区分预组合字符与 e+U+0301 序列；转义写法与直接字符同名。
+	accentConfig := `{"flags":[{"key":"f","enabled":true,"default":false,"rules":[
+		{"id":"r1","value":true,"conditions":[
+			{"attribute":"café","op":"in","value":["a"]}]}]}]}`
+	h := newHarness(t, accentConfig, `{"café":"a"}`)
+	if got, _ := evalSuccess(t, h, "f"); got["reason"] != "rule" {
+		t.Fatalf("precomposed attribute must be found: %v", got)
+	}
+	h = newHarness(t, accentConfig, `{"caf`+cliEscCB+`":"a"}`)
+	if got, _ := evalSuccess(t, h, "f"); got["reason"] != "default" {
+		t.Fatalf("combining-sequence attribute must not satisfy a precomposed lookup: %v", got)
+	}
+}
+
+// TestCLIEvaluateInRuleDecisionAndEmptyMember 端到端验证 in 条件与规则定案
+// 顺序的配合，以及空字符串成员与属性缺失的区分。
+func TestCLIEvaluateInRuleDecisionAndEmptyMember(t *testing.T) {
+	// 前一条 in 规则返回 false，后一条 eq 规则返回 true，二者可同时成立。
+	priorityConfig := `{"flags":[{"key":"f","enabled":true,"default":true,"rules":[
+		{"id":"r-deny","value":false,"conditions":[
+			{"attribute":"plan","op":"eq","value":"pro"},
+			{"attribute":"tier","op":"in","value":["é","a"]}]},
+		{"id":"r-allow","value":true,"conditions":[
+			{"attribute":"region","op":"eq","value":"cn"}]}]}]}`
+	for _, tc := range []struct {
+		name   string
+		ctx    string
+		ruleID string
+		value  bool
+	}{
+		{"exact member direct", `{"plan":"pro","tier":"é","region":"cn"}`, "r-deny", false},
+		{"exact member escaped", `{"plan":"pro","tier":"` + cliEscEA + `","region":"cn"}`, "r-deny", false},
+		{"lookalike falls through", `{"plan":"pro","tier":"` + cliEscCB + `","region":"cn"}`, "r-allow", true},
+		{"uppercase falls through", `{"plan":"pro","tier":"A","region":"cn"}`, "r-allow", true},
+		{"missing attr falls through", `{"plan":"pro","region":"cn"}`, "r-allow", true},
+		{"no rule holds uses default", `{"plan":"free","region":"eu"}`, "", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t, priorityConfig, tc.ctx)
+			got, _ := evalSuccess(t, h, "f")
+			if tc.ruleID == "" {
+				if got["reason"] != "default" || got["ruleId"] != nil || got["value"] != tc.value {
+					t.Fatalf("unexpected payload: %v", got)
+				}
+			} else if got["reason"] != "rule" || got["ruleId"] != tc.ruleID || got["value"] != tc.value {
+				t.Fatalf("unexpected payload: %v", got)
+			}
+		})
+	}
+
+	// 空字符串是合法列表成员：显式给出空串命中；空白与属性缺失都不成立。
+	emptyConfig := `{"flags":[{"key":"g","enabled":true,"default":false,"rules":[
+		{"id":"r1","value":true,"conditions":[
+			{"attribute":"note","op":"in","value":[""]}]}]}]}`
+	h := newHarness(t, emptyConfig, `{"note":""}`)
+	if got, _ := evalSuccess(t, h, "g"); got["reason"] != "rule" || got["ruleId"] != "r1" {
+		t.Fatalf("explicit empty string must hit the in-list: %v", got)
+	}
+	h = newHarness(t, emptyConfig, `{"note":" "}`)
+	if got, _ := evalSuccess(t, h, "g"); got["reason"] != "default" {
+		t.Fatalf("whitespace is not the empty-string member: %v", got)
+	}
+	h = newHarness(t, emptyConfig, `{}`)
+	if got, _ := evalSuccess(t, h, "g"); got["reason"] != "default" || got["ruleId"] != nil {
+		t.Fatalf("missing attribute must not satisfy empty-string membership: %v", got)
+	}
+}
+
+// TestCLIEvaluateInvalidInListsRejected 端到端验证空列表与含非字符串项的列表
+// 仍是配置错误：错误指出相应位置；通过 evaluate 使用这些无效配置时非零退出、
+// stdout 为空。未被选中与已关闭开关中的同类错误同样让整份配置失败。
+func TestCLIEvaluateInvalidInListsRejected(t *testing.T) {
+	const cond0 = `config.flags[0].rules[0].conditions[0].value`
+	cases := []struct {
+		name    string
+		config  string
+		key     string
+		wantSub []string
+	}{
+		{
+			"empty in-list",
+			`{"flags":[{"key":"f","enabled":true,"default":false,"rules":[
+				{"id":"r","value":true,"conditions":[
+					{"attribute":"a","op":"in","value":[]}]}]}]}`,
+			"f",
+			[]string{cond0, "in-list must contain at least one item"},
+		},
+		{
+			"non-string first item",
+			`{"flags":[{"key":"f","enabled":true,"default":false,"rules":[
+				{"id":"r","value":true,"conditions":[
+					{"attribute":"a","op":"in","value":[1]}]}]}]}`,
+			"f",
+			[]string{cond0 + `[0]`, "must be a string"},
+		},
+		{
+			"non-string later item keeps its index",
+			`{"flags":[{"key":"f","enabled":true,"default":false,"rules":[
+				{"id":"r","value":true,"conditions":[
+					{"attribute":"a","op":"in","value":["x",true,null]}]}]}]}`,
+			"f",
+			[]string{cond0 + `[1]`, "must be a string"},
+		},
+		{
+			"nested array item",
+			`{"flags":[{"key":"f","enabled":true,"default":false,"rules":[
+				{"id":"r","value":true,"conditions":[
+					{"attribute":"a","op":"in","value":["x",["y"]]}]}]}]}`,
+			"f",
+			[]string{cond0 + `[1]`, "must be a string"},
+		},
+		{
+			"object item",
+			`{"flags":[{"key":"f","enabled":true,"default":false,"rules":[
+				{"id":"r","value":true,"conditions":[
+					{"attribute":"a","op":"in","value":[{"v":"x"}]}]}]}]}`,
+			"f",
+			[]string{cond0 + `[0]`, "must be a string"},
+		},
+		{
+			"invalid list in an unselected flag still fails whole config",
+			`{"flags":[
+				{"key":"good","enabled":true,"default":true,"rules":[]},
+				{"key":"bad","enabled":true,"default":false,"rules":[
+					{"id":"r","value":true,"conditions":[
+						{"attribute":"a","op":"in","value":["x",2]}]}]}]}`,
+			"good",
+			[]string{`config.flags[1].rules[0].conditions[0].value[1]`, "must be a string"},
+		},
+		{
+			"invalid list in a disabled flag still fails whole config",
+			`{"flags":[{"key":"off","enabled":false,"default":true,"rules":[
+				{"id":"r","value":true,"conditions":[
+					{"attribute":"a","op":"in","value":[]}]}]}]}`,
+			"off",
+			[]string{`config.flags[0].rules[0].conditions[0].value`, "in-list must contain at least one item"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t, tc.config, `{}`)
+			msg := evalFailure(t, h, tc.key)
+			for _, want := range tc.wantSub {
+				if !strings.Contains(msg, want) {
+					t.Fatalf("stderr=%q, want substring %q", msg, want)
+				}
+			}
+		})
+	}
+}
