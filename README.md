@@ -10,6 +10,7 @@
 go run ./cmd/payflow demo
 go run ./cmd/payflow version
 go run ./cmd/payflow evaluate config.json <flag-key> context.json
+go run ./cmd/payflow evaluate config.json <flag-key> context.json --explain
 go test ./...
 ```
 
@@ -186,6 +187,62 @@ config.flags[1].default: field is required
 （用 `go run` 运行时它会在标准错误追加自己的一行 `exit status 1`；程序本身只输出上面那一行。）
 
 把请求的开关键换成合法但已关闭的开关也不会绕过这一步：只要配置中任何开关校验失败，整个命令同样非零退出。只有整份配置通过校验后，关闭的开关才按上一条所述固定返回 `false`。
+
+### 解释模式：看清采用某条规则或默认值的原因
+
+在配置、开关键、上下文三个参数之后加 `--explain`，成功时仍只输出一个 JSON 对象：保留 `key`/`value`/`reason`/`ruleId` 四个字段，并增加一个 `explanation`。不带该选项时输出与之前完全相同的四字段对象。
+
+```bash
+go run ./cmd/payflow evaluate config.json new-checkout context.json --explain
+```
+
+沿用上文“完整示例”的配置与上下文（`region=cn`、`platform=ios`、`plan=pro`，两条规则都成立，第一条 `r-block-cn-mobile` 返回 `false`）：
+
+```json
+{"key":"new-checkout","value":false,"reason":"rule","ruleId":"r-block-cn-mobile","explanation":{"rules":[{"ruleId":"r-block-cn-mobile","matched":true,"conditions":[{"attribute":"region","op":"eq","expected":"cn","actual":"cn","matched":true},{"attribute":"platform","op":"in","expected":["ios","android"],"actual":"ios","matched":true}]}]}}
+```
+
+- `explanation.rules` 按配置数组次序给出实际考虑过的规则；每条记录含规则编号 `ruleId`、该规则是否全部条件成立 `matched`，以及 `conditions` 中每个条件各自的判断结果。
+- 每个条件给出属性名 `attribute`、比较方式 `op`、配置中的比较值 `expected`（`eq` 是字符串，`in` 是字符串数组）、上下文实际值 `actual` 和是否成立 `matched`。
+- 解释与最终结果严格对应：第一条全部条件成立的规则决定结果——即使它返回 `false` 也立即定案并停止，其后的规则不出现在记录里；它之前未命中的规则仍保留。上例中 `r-pro` 同样成立，但不会出现。
+
+#### 区分属性缺失、值不相等与不在候选列表
+
+`actual` 为 `null` 表示上下文里没有这个属性（缺失）；属性显式给出空字符串时 `actual` 是 `""`。二者明确区分，缺失不会被当成空串。例如上下文缺少 `region`（但 `platform`/`plan` 都满足）时，第一条规则的 `region` 条件显示为缺失且不成立、`platform` 条件仍成立，第一条规则整体不命中，求值继续到 `r-pro` 并由它定案：
+
+```json
+{"key":"new-checkout","value":true,"reason":"rule","ruleId":"r-pro","explanation":{"rules":[{"ruleId":"r-block-cn-mobile","matched":false,"conditions":[{"attribute":"region","op":"eq","expected":"cn","actual":null,"matched":false},{"attribute":"platform","op":"in","expected":["ios","android"],"actual":"ios","matched":true}]},{"ruleId":"r-pro","matched":true,"conditions":[{"attribute":"plan","op":"eq","expected":"pro","actual":"pro","matched":true}]}]}}
+```
+
+三种不成立因此能直接分辨：`actual:null` 是属性缺失；`eq` 时 `actual` 有值但与 `expected` 不等（如 `"CN"`、`"cn "` 都不等于 `"cn"`，区分大小写、不裁剪空白）；`in` 时 `actual` 有值但不在 `expected` 列表中。所有字符串都按 JSON 解码后的内容展示；`in` 的比较列表原样保留其中的空字符串、重复成员与数组次序，不裁剪空白、不合并大小写，例如 `"expected":["b","","a","b"," A"]`。
+
+#### 全部未命中、关闭开关与空规则列表
+
+没有任何规则命中时，`explanation.rules` 列出这些规则的判断（每条 `matched` 均为 `false`），四字段说明采用默认值（`reason:"default"`、`ruleId:null`、`value` 为开关的 `default`）。用上文 `{"region":"us","platform":"web","plan":"free"}` 的上下文：
+
+```json
+{"key":"new-checkout","value":true,"reason":"default","ruleId":null,"explanation":{"rules":[{"ruleId":"r-block-cn-mobile","matched":false,"conditions":[…]},{"ruleId":"r-pro","matched":false,"conditions":[…]}]}
+```
+
+开关关闭时固定返回 `false`（`reason:"disabled"`），解释说明这是关闭所致：`explanation.rules` 为空数组 `[]`。即使它的规则本会命中、`default` 为 `true`，也不会把默认值或任何规则写成结果依据：
+
+```json
+{"key":"legacy-report","value":false,"reason":"disabled","ruleId":null,"explanation":{"rules":[]}}
+```
+
+开关的 `rules` 为空列表时，同样返回默认结果与空解释（`"rules":[]`）。
+
+#### 参数边界与校验
+
+`--explain` 只在第四个参数位置被识别：
+
+```bash
+go run ./cmd/payflow evaluate <config.json> <flag-key> <context.json> --explain
+```
+
+- 第四个参数不是 `--explain`（如 `--verbose`、`explain`），或在它之后还有更多参数，都作为参数错误拒绝，非零退出、标准输出为空、原因写入标准错误。
+- 前三个位置出现字面文本 `--explain` 时不会被当作选项：在配置路径位置就按文件路径处理（读不到则报无法读取配置），在开关键位置就按开关键精确查找（查不到则报未找到），在上下文路径位置就按文件路径处理。
+- 解释模式与普通模式共用同一套完整校验：整份配置和上下文先完整校验，未被选中或已关闭开关中的非法内容同样让命令失败；参数、文件或校验失败时非零退出、标准输出为空、原因写入标准错误，不会输出半份解释。
 
 ### 开关键的写法与精确查找
 
@@ -430,7 +487,7 @@ evaluate: flag key "café🎉x" not found in config "config-similar.json"
 - 附加字段可以放在四个位置：配置顶层对象、开关对象、规则对象、条件对象。
 - 字段值可以是任意合法 JSON 值：字符串、数字、布尔值、`null`、数组或对象；数组与对象内部还能继续嵌套任意深度。
 - 只要 JSON 语法合法，大数字也算可接受的附加信息——例如 `1e400`（超出浮点表示范围）不会被拒绝，它只是一个不参与求值的数字。
-- 附加字段**不是**上下文属性：求值时既不会把它们并入上下文，也不会影响规则选择、布尔结果、命中原因（`reason`）或命中规则编号（`ruleId`）；成功输出只有 `key`/`value`/`reason`/`ruleId` 四个字段，任何附加信息都不会被带回。
+- 附加字段**不是**上下文属性：求值时既不会把它们并入上下文，也不会影响规则选择、布尔结果、命中原因（`reason`）或命中规则编号（`ruleId`）；普通模式成功输出只有 `key`/`value`/`reason`/`ruleId` 四个字段，`--explain` 模式也只额外携带求值过程的 `explanation`，任何附加信息（负责人、备注、标签等）都不会被带回。
 
 把下面这份配置保存为 `config-meta.json`——它在顶层、开关、规则和条件上分别放了附加字段，规则的 `review` 是一个嵌套对象（内部还有 `approvers` 数组），开关上的 `rolloutWeight` 是 `1e400`：
 
