@@ -1,6 +1,7 @@
 package payflow
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -227,6 +228,419 @@ func TestInSemantics(t *testing.T) {
 	missing := eval(t, cfg, "f", `{"other":"a"}`)
 	if missing.Reason != EvalDefault {
 		t.Fatalf("in missing attr: got %+v", missing)
+	}
+}
+
+// --- in 条件：解码后精确相等的回归保障 ----------------------------------------
+//
+// 下列测试固定 in 运算符的成员判断边界：配置列表中的候选值与上下文中的属性值
+// 都先按 JSON 解码成真实文字，成员关系只承认解码后的字符串逐码点精确相等。
+// 直接字符与合法 Unicode 转义（含代理项对）是同一文字的不同写法；大小写、
+// 首尾空白、预组合字符与“基字符＋组合附加符号”的序列不做任何归一化。
+//
+// 为避免测试源码本身的转义写法在阅读时与“JSON 文本中的转义”混淆，所有转义
+// 外形都在运行时由 uesc 与反斜杠字面量拼出，直接字符则照常以 UTF-8 写出。
+
+// uesc 把若干码点渲染成 JSON 的 \uxxxx 转义外形（BMP 之外的码点输出一对
+// 高/低代理项转义）。返回的是供 JSON 解析器消费的原文片段，如
+// uesc('é') 的 6 个字符解码后是 é，uesc('😀') 的 12 个字符解码后是 😀。
+func uesc(rs ...rune) string {
+	var b strings.Builder
+	for _, r := range rs {
+		if r > 0xFFFF {
+			lo := int(r) - 0x10000
+			hi := 0xD800 + (lo >> 10)
+			low := 0xDC00 + (lo & 0x3FF)
+			fmt.Fprintf(&b, "\\u%04x\\u%04x", hi, low)
+		} else {
+			fmt.Fprintf(&b, "\\u%04x", r)
+		}
+	}
+	return b.String()
+}
+
+// inRuleConfig 拼出一份单开关、单 in 规则的配置：开关 f 启用、default=false，
+// 规则 id 固定 r-in、value=true。attrJSON 是 attribute 的 JSON 字符串内容
+// （不含外层引号），listJSON 是完整的候选数组 JSON 文本。
+func inRuleConfig(attrJSON, listJSON string) string {
+	return `{"flags":[{"key":"f","enabled":true,"default":false,"rules":[` +
+		`{"id":"r-in","value":true,"conditions":[` +
+		`{"attribute":"` + attrJSON + `","op":"in","value":` + listJSON + `}]}]}]}`
+}
+
+// inContext 拼出只有一个字符串属性的上下文；keyJSON、valueJSON 都是 JSON 字符串
+// 内容（不含外层引号），可直接写字符，也可传 uesc 生成的转义外形。
+func inContext(keyJSON, valueJSON string) string {
+	return `{"` + keyJSON + `":"` + valueJSON + `"}`
+}
+
+// assertInMembership 断言单 in 规则配置对上下文的求值结果：wantMatch=true 时
+// 必须命中 r-in（value=true），否则必须落到 default（ruleId 为 null）。
+func assertInMembership(t *testing.T, cfgRaw, ctxRaw string, wantMatch bool) {
+	t.Helper()
+	got := eval(t, cfgRaw, "f", ctxRaw)
+	if wantMatch {
+		if got.Reason != EvalRule || !got.Value {
+			t.Fatalf("ctx %s: expected exact in-match, got %+v", ctxRaw, got)
+		}
+		return
+	}
+	if got.Reason != EvalDefault || got.Value || got.RuleID != nil {
+		t.Fatalf("ctx %s: lookalike must not be a member, got %+v", ctxRaw, got)
+	}
+}
+
+// TestInDecodedSpellingsEquivalent 保护“解码后的字符串精确相等才算属于列表”：
+// 属性名、列表候选值、上下文属性名与值分别用直接字符或合法 Unicode 转义书写
+// （含 BMP 之外字符所需的代理项对）时，配置与上下文的写法可以任意组合，命中
+// 的都是同一条规则，key、value、reason、ruleId 及序列化后的输出逐字节一致。
+func TestInDecodedSpellingsEquivalent(t *testing.T) {
+	id := "r-in"
+	want := EvalResult{Key: "f", Value: true, Reason: EvalRule, RuleID: &id}
+	wantOut := `{"key":"f","value":true,"reason":"rule","ruleId":"r-in"}`
+
+	const (
+		eacute = 'é' // U+00E9
+		emoji  = '😀' // U+1F600，JSON 转义外形需要一对代理项
+	)
+	nfdEacute := "e" + string(rune(0x0301)) // e ＋ 组合用锐音符，与 é 外形几乎相同
+
+	// 候选列表的三种 JSON 写法：全直接、全转义、混合；解码后都是
+	// ["pro","é","😀"]。
+	listVariants := []struct {
+		name string
+		json string
+	}{
+		{"direct", `["pro","é","😀"]`},
+		{"escaped", `["` + uesc('p') + `ro","` + uesc(eacute) + `","` + uesc(emoji) + `"]`},
+		{"mixed", `["pro","` + uesc(eacute) + `","😀"]`},
+	}
+	// 属性名 tier 的两种写法。
+	attrVariants := []struct {
+		name string
+		json string
+	}{
+		{"direct", `tier`},
+		{"escaped", uesc('t') + "ier"},
+	}
+	keyVariants := attrVariants
+	valueVariants := []struct {
+		name string
+		json string
+	}{
+		{"ascii-direct", `pro`},
+		{"ascii-escaped", uesc('p') + "ro"},
+		{"eacute-direct", `é`},
+		{"eacute-escaped", uesc(eacute)},
+		{"emoji-direct", `😀`},
+		{"emoji-surrogate-pair", uesc(emoji)},
+	}
+	for _, lv := range listVariants {
+		for _, av := range attrVariants {
+			cfgRaw := inRuleConfig(av.json, lv.json)
+			for _, kv := range keyVariants {
+				for _, vv := range valueVariants {
+					t.Run(lv.name+"/"+av.name+"/"+kv.name+"/"+vv.name, func(t *testing.T) {
+						got := eval(t, cfgRaw, "f", inContext(kv.json, vv.json))
+						if !got.Equals(want) {
+							t.Fatalf("got %+v, want %+v", got, want)
+						}
+						out, err := MarshalResult(got)
+						if err != nil {
+							t.Fatal(err)
+						}
+						if string(out) != wantOut {
+							t.Fatalf("marshaled output %q, want %q", out, wantOut)
+						}
+					})
+				}
+			}
+			// 等价只限于“同一文字的不同 JSON 写法”：外形相近但码点不同的值，
+			// 在任何一种列表写法下都不能混进列表。
+			lookalikes := []struct {
+				name string
+				json string
+			}{
+				{"uppercase", `Pro`},
+				{"leading space", ` pro`},
+				{"trailing space", `pro `},
+				{"nfd eacute", nfdEacute},
+				{"nfd eacute escaped combining mark", "e" + uesc(rune(0x0301))},
+				{"absent value", `web`},
+				{"empty string", ``},
+				{"candidate prefix", `éx`},
+				{"other emoji", `😃`},
+			}
+			for _, ll := range lookalikes {
+				t.Run(lv.name+"/miss/"+ll.name, func(t *testing.T) {
+					assertInMembership(t, cfgRaw, inContext("tier", ll.json), false)
+				})
+			}
+		}
+	}
+}
+
+// TestInEscapedBackslashTextNotReDecoded 保护转义边界：JSON 中已转义的反斜杠
+// 之后即使跟着 u 与十六进制数字，解码后也只是一段普通文本，不会再被当作 Unicode
+// 转义解码一次；它只与相同的字面文本相等，与“真正解码出的字符”互不相识。
+// 属性名同样遵守这条边界。
+func TestInEscapedBackslashTextNotReDecoded(t *testing.T) {
+	bs := string(rune(0x5C))
+	// fragEacute 是 JSON 文本片段 \\uxxxx（双反斜杠外形），解码后为 6 个
+	// 普通字符：一个真实反斜杠后接 u00e9。
+	fragEacute := bs + bs + "u00e9"
+	// 同一字面文本的另一种 JSON 写法：第一个反斜杠用 u005c 转义写出。
+	fragEacuteAlt := uesc(rune(0x5C)) + "u00e9"
+
+	// 列表唯一候选就是这段字面文本。
+	cfgLiteral := inRuleConfig("tier", `["`+fragEacute+`"]`)
+	// 两种 JSON 写法在上下文一侧解码为同一字面文本，精确命中。
+	assertInMembership(t, cfgLiteral, inContext("tier", fragEacute), true)
+	assertInMembership(t, cfgLiteral, inContext("tier", fragEacuteAlt), true)
+	// 真正的 é——无论直接写出还是用 Unicode 转义——都不是这个文本。
+	assertInMembership(t, cfgLiteral, inContext("tier", `é`), false)
+	assertInMembership(t, cfgLiteral, inContext("tier", uesc('é')), false)
+	// 十六进制位的大小写差异也是不同的字面文本。
+	assertInMembership(t, cfgLiteral, inContext("tier", bs+bs+"u00C9"), false)
+
+	// 反向：列表里只有真正的 é 时，反斜杠字面文本不能命中，转义外形可以。
+	cfgReal := inRuleConfig("tier", `["é"]`)
+	assertInMembership(t, cfgReal, inContext("tier", fragEacute), false)
+	assertInMembership(t, cfgReal, inContext("tier", `é`), true)
+	assertInMembership(t, cfgReal, inContext("tier", uesc('é')), true)
+
+	// 属性名同理：fragAttr 在 JSON 中写成双反斜杠外形，解码后是 8 个普通字符
+	// 的属性名（反斜杠后接 u0074ier），与属性 tier 无关。
+	fragAttr := bs + bs + "u0074ier"
+	fragAttrAlt := uesc(rune(0x5C)) + "u0074ier" // 同名字面文本的另一种写法
+	cfgAttr := inRuleConfig(fragAttr, `["pro"]`)
+	assertInMembership(t, cfgAttr, inContext(fragAttr, "pro"), true)
+	assertInMembership(t, cfgAttr, inContext(fragAttrAlt, "pro"), true)
+	assertInMembership(t, cfgAttr, inContext("tier", "pro"), false)
+	// 注意：u0074 的 Unicode 转义解码后就是普通属性名 tier，仍不与字面
+	// 反斜杠文本同名，不能读到另一个属性。
+	assertInMembership(t, cfgAttr, inContext(uesc('t')+"ier", "pro"), false)
+}
+
+// TestInComposedVsDecomposedCandidatesStayDistinct 保护 Unicode 归一化边界：
+// 列表只有预组合字符时，“基字符＋组合附加符号”的上下文值不能命中；列表明确
+// 包含组合序列时只有该序列可匹配。两种序列是不同的字符串，共存不构成重复配置。
+func TestInComposedVsDecomposedCandidatesStayDistinct(t *testing.T) {
+	nfdEacute := "e" + string(rune(0x0301))
+	nfdEacuteEsc := "e" + uesc(rune(0x0301))
+
+	// 列表只有预组合的 é（U+00E9）：é 的两种 JSON 写法都命中，NFD 序列不行。
+	cfgComposed := inRuleConfig("tier", `["é"]`)
+	cfgComposedEsc := inRuleConfig("tier", `["`+uesc('é')+`"]`)
+	for _, cfgRaw := range []string{cfgComposed, cfgComposedEsc} {
+		assertInMembership(t, cfgRaw, inContext("tier", `é`), true)
+		assertInMembership(t, cfgRaw, inContext("tier", uesc('é')), true)
+		assertInMembership(t, cfgRaw, inContext("tier", nfdEacute), false)
+		assertInMembership(t, cfgRaw, inContext("tier", nfdEacuteEsc), false)
+		assertInMembership(t, cfgRaw, inContext("tier", `É`), false) // 大小写不折叠
+		assertInMembership(t, cfgRaw, inContext("tier", ` é`), false)
+		assertInMembership(t, cfgRaw, inContext("tier", `é `), false)
+	}
+
+	// 列表明确只含 NFD 序列：该序列（两种 JSON 写法等价）命中，预组合字符不行。
+	cfgDecomposed := inRuleConfig("tier", `["`+nfdEacute+`"]`)
+	cfgDecomposedEsc := inRuleConfig("tier", `["`+nfdEacuteEsc+`"]`)
+	for _, cfgRaw := range []string{cfgDecomposed, cfgDecomposedEsc} {
+		assertInMembership(t, cfgRaw, inContext("tier", nfdEacute), true)
+		assertInMembership(t, cfgRaw, inContext("tier", nfdEacuteEsc), true)
+		assertInMembership(t, cfgRaw, inContext("tier", `é`), false)
+	}
+
+	// 同一列表同时收纳两个不同序列是合法的（不是重复配置），且各自精确命中。
+	both := inRuleConfig("tier", `["é","`+nfdEacute+`"]`)
+	mustParseConfig(t, both)
+	assertInMembership(t, both, inContext("tier", `é`), true)
+	assertInMembership(t, both, inContext("tier", nfdEacute), true)
+
+	// 同形异码：西里尔 а（U+0430）与拉丁 a 是不同的码点，不互相归并。
+	cyrA := string(rune(0x0430))
+	cfgCyrillic := inRuleConfig("tier", `["p`+cyrA+`y"]`)
+	assertInMembership(t, cfgCyrillic, inContext("tier", `p`+cyrA+`y`), true)
+	assertInMembership(t, cfgCyrillic, inContext("tier", `pay`), false)
+}
+
+// TestInAttributeNameExactLookup 保护属性名一侧的精确查找：条件按解码后的属性
+// 名读取上下文，名称外形接近的另一个属性即使携带列表中的值，也不能让条件成立。
+func TestInAttributeNameExactLookup(t *testing.T) {
+	nfdEacute := "e" + string(rune(0x0301))
+	// 属性 région 的两种 JSON 写法（预组合 é 直接写出或用 Unicode 转义）。
+	for _, attrJSON := range []string{
+		`région`,
+		"r" + uesc('é') + "gion",
+	} {
+		cfg := inRuleConfig(attrJSON, `["cn"]`)
+		// 解码后同名即同一属性：直接字符与 Unicode 转义等价。
+		assertInMembership(t, cfg, inContext(`région`, `cn`), true)
+		assertInMembership(t, cfg, inContext("r"+uesc('é')+"gion", `cn`), true)
+		// 外形接近的属性名一律按“属性缺失”处理，即使值正好在列表中。
+		for _, keyJSON := range []string{
+			`Région`,                 // 大小写不同
+			`région `,                // 尾随空白
+			` région`,                // 前导空白
+			"r" + nfdEacute + "gion", // NFD 名称
+		} {
+			assertInMembership(t, cfg, inContext(keyJSON, `cn`), false)
+		}
+		// 属性缺失，或命中的是其他属性，条件都不成立。
+		assertInMembership(t, cfg, `{}`, false)
+		assertInMembership(t, cfg, `{"other":"cn"}`, false)
+		assertInMembership(t, cfg, `{"other":"cn","région":"us"}`, false)
+	}
+}
+
+// TestInListOrderAndDuplicateCandidatesDoNotMatter 保护成员判断对列表写法的
+// 稳定性：调整候选顺序或重复列入已有候选值，既不改变任何值的成员判断，也不会
+// 被误报为重复配置（数组元素重复与对象字段重复是两回事）。
+func TestInListOrderAndDuplicateCandidatesDoNotMatter(t *testing.T) {
+	variants := []string{
+		`["a","b","c"]`,
+		`["c","a","b"]`,
+		`["a","b","c","c","a","b"]`,
+		`["b","a","c"]`,
+	}
+	probe := []struct {
+		name   string
+		value  string
+		member bool
+	}{
+		{"a", "a", true},
+		{"b", "b", true},
+		{"c direct", "c", true},
+		{"c escaped spelling", uesc('c'), true}, // 转义写法跨写法成员判断一致
+		{"uppercase", "A", false},               // 大小写不折叠
+		{"leading space", " a", false},          // 空白不裁剪
+		{"absent", "d", false},
+		{"empty not listed", "", false}, // 列表不含空字符串
+	}
+	for _, listJSON := range variants {
+		cfgRaw := inRuleConfig("tier", listJSON)
+		mustParseConfig(t, cfgRaw) // 重复候选不得构成配置错误
+		for _, p := range probe {
+			assertInMembership(t, cfgRaw, inContext("tier", p.value), p.member)
+		}
+	}
+}
+
+// TestInEarlierFalseRuleDecidesOnlyOnExactMembership 保护命中/未命中与规则优先级
+// 的配合：前一条只含 in 条件的规则返回 false、后一条规则返回 true 时，上下文值
+// 只有与列表精确相等，前面的规则才以 reason=rule、ruleId 指向前一条立即定案为
+// false；任何外形相近的值都属于不匹配，求值继续采用后面的规则。两条规则都不
+// 成立时仍采用 default，ruleId 为 null。
+func TestInEarlierFalseRuleDecidesOnlyOnExactMembership(t *testing.T) {
+	bs := string(rune(0x5C))
+	litFrag := bs + bs + "u00e9" // JSON 中解码为反斜杠＋u00e9 的普通文本
+	nfdEacute := "e" + string(rune(0x0301))
+	// 列表 ["é","ios"]，é 用 Unicode 转义外形写出，确保读取侧先解码。
+	cfg := `{"flags":[{"key":"f","enabled":true,"default":true,"rules":[
+		{"id":"r-deny","value":false,"conditions":[
+			{"attribute":"tier","op":"in","value":["` + uesc('é') + `","ios"]}]},
+		{"id":"r-allow","value":true,"conditions":[
+			{"attribute":"plan","op":"eq","value":"pro"}]}]}]}`
+	const noRule = ""
+	cases := []struct {
+		name   string
+		ctx    string
+		value  bool
+		reason EvalReason
+		ruleID string // 空串表示 ruleId 必须为 null
+	}{
+		{"exact member satisfies both rules", `{"tier":"é","plan":"pro"}`, false, EvalRule, "r-deny"},
+		{"escaped spelling is the same exact member", `{"tier":"` + uesc('é') + `","plan":"pro"}`, false, EvalRule, "r-deny"},
+		{"other exact candidate decides false", `{"tier":"ios","plan":"pro"}`, false, EvalRule, "r-deny"},
+		{"nfd lookalike is not a member and falls through", `{"tier":"` + nfdEacute + `","plan":"pro"}`, true, EvalRule, "r-allow"},
+		{"nfd escaped combining mark falls through", `{"tier":"e` + uesc(rune(0x0301)) + `","plan":"pro"}`, true, EvalRule, "r-allow"},
+		{"uppercase lookalike falls through", `{"tier":"IOS","plan":"pro"}`, true, EvalRule, "r-allow"},
+		{"whitespace lookalike falls through", `{"tier":" ios","plan":"pro"}`, true, EvalRule, "r-allow"},
+		{"literal escape text falls through", `{"tier":"` + litFrag + `","plan":"pro"}`, true, EvalRule, "r-allow"},
+		{"missing attribute falls through", `{"plan":"pro"}`, true, EvalRule, "r-allow"},
+		{"exact member decides false even when later rule misses", `{"tier":"ios"}`, false, EvalRule, "r-deny"},
+		{"non-member and later rule misses uses default", `{"tier":"web","plan":"free"}`, true, EvalDefault, noRule},
+		{"nothing present uses default", `{}`, true, EvalDefault, noRule},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := eval(t, cfg, "f", tc.ctx)
+			if got.Value != tc.value || got.Reason != tc.reason {
+				t.Fatalf("got %+v, want value=%v reason=%s", got, tc.value, tc.reason)
+			}
+			switch {
+			case tc.ruleID == noRule && got.RuleID != nil:
+				t.Fatalf("ruleId must be null, got %q", *got.RuleID)
+			case tc.ruleID != noRule && (got.RuleID == nil || *got.RuleID != tc.ruleID):
+				gotID := "<nil>"
+				if got.RuleID != nil {
+					gotID = *got.RuleID
+				}
+				t.Fatalf("ruleId=%q, want %q", gotID, tc.ruleID)
+			}
+		})
+	}
+}
+
+// TestInEmptyStringCandidateVsMissingAttribute 保护空字符串候选：列表显式包含
+// 空字符串时，属性明确给出空字符串才算成员；属性缺失（即使其他属性为空）条件
+// 不成立。在前 false/后 true 的规则次序中，两种情形也要分别定案与放行。
+func TestInEmptyStringCandidateVsMissingAttribute(t *testing.T) {
+	cfg := inRuleConfig("tier", `["","x"]`)
+	assertInMembership(t, cfg, `{"tier":""}`, true)
+	assertInMembership(t, cfg, `{}`, false)
+	assertInMembership(t, cfg, `{"other":""}`, false)
+
+	cfgTwo := `{"flags":[{"key":"f","enabled":true,"default":true,"rules":[
+		{"id":"r-empty","value":false,"conditions":[
+			{"attribute":"tier","op":"in","value":[""]}]},
+		{"id":"r-allow","value":true,"conditions":[
+			{"attribute":"plan","op":"eq","value":"pro"}]}]}]}`
+	emptyID, allowID := "r-empty", "r-allow"
+	// 显式空字符串：前一条精确命中并定案 false，即使后一条同时成立。
+	got := eval(t, cfgTwo, "f", `{"tier":"","plan":"pro"}`)
+	if !got.Equals(EvalResult{Key: "f", Value: false, Reason: EvalRule, RuleID: &emptyID}) {
+		t.Fatalf("explicit empty string must decide false: got %+v", got)
+	}
+	// 属性缺失：前一条不成立，继续采用后一条。
+	got = eval(t, cfgTwo, "f", `{"plan":"pro"}`)
+	if !got.Equals(EvalResult{Key: "f", Value: true, Reason: EvalRule, RuleID: &allowID}) {
+		t.Fatalf("missing attribute must fall through: got %+v", got)
+	}
+	// 显式空字符串但后一条不成立：仍是前一条精确命中并定案 false。
+	got = eval(t, cfgTwo, "f", `{"tier":""}`)
+	if !got.Equals(EvalResult{Key: "f", Value: false, Reason: EvalRule, RuleID: &emptyID}) {
+		t.Fatalf("empty string alone must decide false: got %+v", got)
+	}
+}
+
+// TestInInvalidListPointsAtPosition 保护配置接受范围：空列表与含非字符串项的
+// 列表仍是配置错误，错误要指出具体条件值或元素下标。
+func TestInInvalidListPointsAtPosition(t *testing.T) {
+	cases := []struct {
+		name     string
+		listJSON string
+		want     string
+	}{
+		{"empty array", `[]`, "in-list must contain at least one item"},
+		{"null only", `[null]`, `conditions[0].value[0]: must be a string`},
+		{"bool first item", `[true]`, `conditions[0].value[0]: must be a string`},
+		{"number first item", `[1]`, `conditions[0].value[0]: must be a string`},
+		{"number after valid item", `["ok",1]`, `conditions[0].value[1]: must be a string`},
+		{"nested array item", `["ok",["nested"]]`, `conditions[0].value[1]: must be a string`},
+		{"object item", `["ok",{}]`, `conditions[0].value[1]: must be a string`},
+		{"not an array", `"x"`, `conditions[0].value: must be an array when op is "in"`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := ParseConfig([]byte(inRuleConfig("tier", tc.listJSON)))
+			if err == nil {
+				t.Fatalf("list %s: expected config error", tc.listJSON)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("err=%q, want substring %q", err.Error(), tc.want)
+			}
+		})
 	}
 }
 

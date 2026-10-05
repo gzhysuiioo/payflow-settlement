@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -1123,5 +1124,341 @@ func TestCLIEvaluateNameErrorPrecedencePreserved(t *testing.T) {
 				t.Fatalf("stderr=%q, must not contain %q", msg, tc.notSub)
 			}
 		})
+	}
+}
+
+// --- in 条件回归：跨文件写法等价、精确区分与无效配置的端到端保障 ----------------
+
+// cliUesc 把若干码点渲染成 JSON 的 uxxxx 转义外形（BMP 之外的码点输出代理项
+// 对），用途与 payflow 包测试中的同名助手一致：在运行时拼出转义写法，避免
+// 测试源码的字面转义与 JSON 文本层混淆。
+func cliUesc(rs ...rune) string {
+	var b strings.Builder
+	for _, r := range rs {
+		if r > 0xFFFF {
+			lo := int(r) - 0x10000
+			hi := 0xD800 + (lo >> 10)
+			low := 0xDC00 + (lo & 0x3FF)
+			fmt.Fprintf(&b, "\\u%04x\\u%04x", hi, low)
+		} else {
+			fmt.Fprintf(&b, "\\u%04x", r)
+		}
+	}
+	return b.String()
+}
+
+// inCLIConfig 拼出含一个启用开关 f 的配置：规则 r-in 为单个 in 条件（value=true），
+// 其后是规则 r-allow（plan eq pro，value=true）；default=true。attrJSON 为
+// attribute 的 JSON 字符串内容，listJSON 为完整候选数组。这样同时覆盖
+// “前面 in 规则 false/true 定案”与“不匹配继续向后”。
+func inCLIConfig(attrJSON, listJSON string) string {
+	return `{"flags":[{"key":"f","enabled":true,"default":true,"rules":[` +
+		`{"id":"r-in","value":true,"conditions":[` +
+		`{"attribute":"` + attrJSON + `","op":"in","value":` + listJSON + `}]},` +
+		`{"id":"r-allow","value":true,"conditions":[` +
+		`{"attribute":"plan","op":"eq","value":"pro"}]}]}]}`
+}
+
+// TestCLIEvaluateInSpellingsEquivalent 端到端保护：同一属性名、候选值或上下文
+// 值的直接字符写法与合法 Unicode 转义写法（含代理项对）在配置与上下文任意组合
+// 下命中同一条规则，stdout 逐字节一致；命令、结果格式与配置接受范围不变。
+func TestCLIEvaluateInSpellingsEquivalent(t *testing.T) {
+	const (
+		eacute = 'é' // U+00E9
+		emoji  = '😀' // U+1F600
+	)
+	lists := []struct {
+		name string
+		json string
+	}{
+		{"direct", `["pro","é","😀"]`},
+		{"escaped", `["` + cliUesc('p', 'r', 'o') + `","` + cliUesc(eacute) + `","` + cliUesc(emoji) + `"]`},
+		{"mixed", `["pro","` + cliUesc(eacute) + `","😀"]`},
+	}
+	attrs := []struct {
+		name string
+		json string
+	}{
+		{"direct", `tier`},
+		{"escaped", cliUesc('t') + "ier"},
+	}
+	values := []struct {
+		name string
+		json string
+	}{
+		{"ascii-direct", `pro`},
+		{"ascii-escaped", cliUesc('p') + "ro"},
+		{"eacute-direct", `é`},
+		{"eacute-escaped", cliUesc(eacute)},
+		{"emoji-direct", `😀`},
+		{"emoji-pair", cliUesc(emoji)},
+	}
+	var reference string
+	refs := 0
+	for _, lv := range lists {
+		for _, av := range attrs {
+			cfg := inCLIConfig(av.json, lv.json)
+			for _, kv := range attrs { // 上下文属性名写法也独立组合
+				for _, vv := range values {
+					ctx := `{"` + kv.json + `":"` + vv.json + `"}`
+					h := newHarness(t, cfg, ctx)
+					got, raw := evalSuccess(t, h, "f")
+					if got["key"] != "f" || got["value"] != true ||
+						got["reason"] != "rule" || got["ruleId"] != "r-in" {
+						t.Fatalf("%s/%s/%s/%s: unexpected payload: %v", lv.name, av.name, kv.name, vv.name, got)
+					}
+					refs++
+					if refs == 1 {
+						reference = raw
+					} else if raw != reference {
+						t.Fatalf("%s/%s/%s/%s: output changed by spelling:\n%s\n!= %s",
+							lv.name, av.name, kv.name, vv.name, raw, reference)
+					}
+				}
+			}
+		}
+	}
+
+	// 外形相近但码点不同的上下文值不能命中 in 规则；由于后一条 plan=pro
+	// 规则成立，结果应落到 r-allow 而不是误判前面的列表命中。
+	nfdEacute := "e" + string(rune(0x0301))
+	misses := []struct {
+		name string
+		ctx  string
+	}{
+		{"uppercase", `{"tier":"PRO","plan":"pro"}`},
+		{"leading space", `{"tier":" pro","plan":"pro"}`},
+		{"trailing space", `{"tier":"pro ","plan":"pro"}`},
+		{"nfd eacute", `{"tier":"` + nfdEacute + `","plan":"pro"}`},
+		{"nfd escaped mark", `{"tier":"e` + cliUesc(rune(0x0301)) + `","plan":"pro"}`},
+		{"candidate prefix", `{"tier":"éx","plan":"pro"}`},
+		{"wrong attribute name", `{"Tier":"pro","plan":"pro"}`},
+		{"missing attribute", `{"plan":"pro"}`},
+	}
+	cfg := inCLIConfig("tier", lists[0].json)
+	for _, mc := range misses {
+		t.Run("miss/"+mc.name, func(t *testing.T) {
+			h := newHarness(t, cfg, mc.ctx)
+			got, _ := evalSuccess(t, h, "f")
+			if got["reason"] != "rule" || got["ruleId"] != "r-allow" || got["value"] != true {
+				t.Fatalf("%s: in lookalike must not match, got %v", mc.name, got)
+			}
+		})
+	}
+}
+
+// TestCLIEvaluateInLiteralBackslashText 端到端保护已转义反斜杠的边界：配置候选
+// 写成双反斜杠外形时，解码得到的是“反斜杠＋u00e9”的普通文本，只与相同字面
+// 文本相等；真正的 é（直接字符或 Unicode 转义）不能命中，反之亦然。
+func TestCLIEvaluateInLiteralBackslashText(t *testing.T) {
+	bs := string(rune(0x5C))
+	lit := bs + bs + "u00e9"                // JSON 文本：\\u00e9 —— 解码为普通文本
+	litAlt := cliUesc(rune(0x5C)) + "u00e9" // 同一字面文本的另一种 JSON 写法
+
+	// 列表只含字面文本。
+	cfgLiteral := inCLIConfig("tier", `["`+lit+`"]`)
+	h := newHarness(t, cfgLiteral, `{"tier":"`+lit+`","plan":"free"}`)
+	got, raw := evalSuccess(t, h, "f")
+	if got["key"] != "f" || got["value"] != true || got["reason"] != "rule" || got["ruleId"] != "r-in" {
+		t.Fatalf("literal text must match itself: %v", got)
+	}
+	// 同一字面文本换一种 JSON 写法，输出逐字节一致。
+	h2 := newHarness(t, cfgLiteral, `{"tier":"`+litAlt+`","plan":"free"}`)
+	got2, raw2 := evalSuccess(t, h2, "f")
+	if raw2 != raw {
+		t.Fatalf("literal spelling variants must agree: %q != %q", raw2, raw)
+	}
+	if got2["ruleId"] != "r-in" {
+		t.Fatalf("alt spelling of same literal text must match: %v", got2)
+	}
+	// 真正的 é 不能被二次解码混入：后一条规则也不成立时落到 default。
+	h3 := newHarness(t, cfgLiteral, `{"tier":"é"}`)
+	got3, _ := evalSuccess(t, h3, "f")
+	if got3["reason"] != "default" || got3["ruleId"] != nil || got3["value"] != true {
+		t.Fatalf("real e-acute must not match backslash text: %v", got3)
+	}
+	h4 := newHarness(t, cfgLiteral, `{"tier":"`+cliUesc('é')+`"}`)
+	got4, _ := evalSuccess(t, h4, "f")
+	if got4["reason"] != "default" || got4["ruleId"] != nil {
+		t.Fatalf("unicode-escaped e-acute must not match backslash text: %v", got4)
+	}
+
+	// 反向：列表只有真正的 é 时，字面文本不命中。
+	cfgReal := inCLIConfig("tier", `["é"]`)
+	h5 := newHarness(t, cfgReal, `{"tier":"`+lit+`","plan":"pro"}`)
+	got5, _ := evalSuccess(t, h5, "f")
+	if got5["ruleId"] != "r-allow" {
+		t.Fatalf("backslash text must not match real e-acute list: %v", got5)
+	}
+}
+
+// TestCLIEvaluateInEarlierFalseRuleExactOnly 端到端区分真正命中与没有命中：
+// 前一条 in 规则返回 false、后一条返回 true 时，只有精确成员才以前一条的
+// ruleId 立即定案 false；外形相近值必须继续采用后一条；都不成立则 default。
+func TestCLIEvaluateInEarlierFalseRuleExactOnly(t *testing.T) {
+	config := `{"flags":[{"key":"f","enabled":true,"default":true,"rules":[
+		{"id":"r-deny","value":false,"conditions":[
+			{"attribute":"tier","op":"in","value":["` + cliUesc('é') + `","ios"]}]},
+		{"id":"r-allow","value":true,"conditions":[
+			{"attribute":"plan","op":"eq","value":"pro"}]}]}]}`
+	nfdEacute := "e" + string(rune(0x0301))
+	bs := string(rune(0x5C))
+	cases := []struct {
+		name   string
+		ctx    string
+		value  bool
+		reason string
+		ruleID any // nil 表示 ruleId 必须为 null
+	}{
+		{"exact member", `{"tier":"é","plan":"pro"}`, false, "rule", "r-deny"},
+		{"exact member escaped", `{"tier":"` + cliUesc('é') + `","plan":"pro"}`, false, "rule", "r-deny"},
+		{"other member", `{"tier":"ios","plan":"pro"}`, false, "rule", "r-deny"},
+		{"nfd lookalike", `{"tier":"` + nfdEacute + `","plan":"pro"}`, true, "rule", "r-allow"},
+		{"uppercase lookalike", `{"tier":"IOS","plan":"pro"}`, true, "rule", "r-allow"},
+		{"whitespace lookalike", `{"tier":" ios","plan":"pro"}`, true, "rule", "r-allow"},
+		{"literal escape text", `{"tier":"` + bs + bs + `u00e9","plan":"pro"}`, true, "rule", "r-allow"},
+		{"missing attribute", `{"plan":"pro"}`, true, "rule", "r-allow"},
+		{"exact member even when later rule misses", `{"tier":"ios"}`, false, "rule", "r-deny"},
+		{"neither matches", `{"tier":"web","plan":"free"}`, true, "default", nil},
+		{"empty context", `{}`, true, "default", nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t, config, tc.ctx)
+			got, _ := evalSuccess(t, h, "f")
+			if got["value"] != tc.value || got["reason"] != tc.reason {
+				t.Fatalf("got %v, want value=%v reason=%s", got, tc.value, tc.reason)
+			}
+			if got["ruleId"] != tc.ruleID {
+				t.Fatalf("ruleId=%v, want %v", got["ruleId"], tc.ruleID)
+			}
+		})
+	}
+}
+
+// TestCLIEvaluateInEmptyStringMemberVsMissing 端到端保护空字符串候选：属性显式
+// 给出空字符串时命中；属性缺失不成立。无效配置（空列表、非字符串项）则非零
+// 退出、stdout 为空，stderr 指出相应位置。
+func TestCLIEvaluateInEmptyStringMemberVsMissing(t *testing.T) {
+	config := `{"flags":[{"key":"f","enabled":true,"default":false,"rules":[
+		{"id":"r-empty","value":true,"conditions":[
+			{"attribute":"tier","op":"in","value":[""]}]}]}]}`
+	for _, tc := range []struct {
+		name string
+		ctx  string
+		hit  bool
+	}{
+		{"explicit empty string", `{"tier":""}`, true},
+		{"missing attribute", `{}`, false},
+		{"empty string on other attribute", `{"other":""}`, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t, config, tc.ctx)
+			got, _ := evalSuccess(t, h, "f")
+			if tc.hit {
+				if got["reason"] != "rule" || got["ruleId"] != "r-empty" {
+					t.Fatalf("got %v, want r-empty hit", got)
+				}
+			} else if got["reason"] != "default" || got["ruleId"] != nil {
+				t.Fatalf("got %v, want default with null ruleId", got)
+			}
+		})
+	}
+
+	// 无效 in 列表：通过 evaluate 使用时非零退出、标准输出为空、指出位置。
+	badConfigs := []struct {
+		name    string
+		config  string
+		wantSub string
+	}{
+		{
+			"empty in-list",
+			`{"flags":[{"key":"f","enabled":true,"default":false,"rules":[` +
+				`{"id":"r","value":true,"conditions":[` +
+				`{"attribute":"a","op":"in","value":[]}]}]}]}`,
+			"in-list must contain at least one item",
+		},
+		{
+			"non-string item first",
+			`{"flags":[{"key":"f","enabled":true,"default":false,"rules":[` +
+				`{"id":"r","value":true,"conditions":[` +
+				`{"attribute":"a","op":"in","value":[1]}]}]}]}`,
+			`conditions[0].value[0]: must be a string`,
+		},
+		{
+			"non-string item second",
+			`{"flags":[{"key":"f","enabled":true,"default":false,"rules":[` +
+				`{"id":"r","value":true,"conditions":[` +
+				`{"attribute":"a","op":"in","value":["ok",false]}]}]}]}`,
+			`conditions[0].value[1]: must be a string`,
+		},
+		{
+			"in-list not array",
+			`{"flags":[{"key":"f","enabled":true,"default":false,"rules":[` +
+				`{"id":"r","value":true,"conditions":[` +
+				`{"attribute":"a","op":"in","value":"x"}]}]}]}`,
+			`must be an array when op is "in"`,
+		},
+	}
+	for _, bc := range badConfigs {
+		t.Run("invalid/"+bc.name, func(t *testing.T) {
+			h := newHarness(t, bc.config, `{"a":"x"}`)
+			var stdout, stderr bytes.Buffer
+			if code := run(h.evalArgs("f"), &stdout, &stderr); code == 0 {
+				t.Fatalf("expected non-zero exit, stdout=%q", stdout.String())
+			}
+			if stdout.Len() != 0 {
+				t.Fatalf("stdout must be empty on invalid config: %q", stdout.String())
+			}
+			if !strings.Contains(stderr.String(), bc.wantSub) {
+				t.Fatalf("stderr=%q, want substring %q", stderr.String(), bc.wantSub)
+			}
+		})
+	}
+}
+
+// TestCLIEvaluateInDuplicateCandidatesAndOrder 端到端保护列表写法稳定性：调整
+// 候选顺序或重复列入已有候选值不改变成员判断，也不会被误报为重复配置。
+func TestCLIEvaluateInDuplicateCandidatesAndOrder(t *testing.T) {
+	contexts := []struct {
+		ctx    string
+		member bool
+	}{
+		{`{"tier":"a"}`, true},
+		{`{"tier":"` + cliUesc('a') + `"}`, true}, // 转义写法与直接写法同成员
+		{`{"tier":"b"}`, true},
+		{`{"tier":"A"}`, false},
+		{`{"tier":" a"}`, false},
+		{`{"tier":"d"}`, false},
+	}
+	lists := []string{
+		`["a","b","c"]`,
+		`["c","b","a"]`,
+		`["a","b","c","a","b","c"]`,
+	}
+	var hitRef, missRef string
+	for li, listJSON := range lists {
+		cfg := `{"flags":[{"key":"f","enabled":true,"default":false,"rules":[` +
+			`{"id":"r-in","value":true,"conditions":[` +
+			`{"attribute":"tier","op":"in","value":` + listJSON + `}]}]}]}`
+		for ci, tc := range contexts {
+			h := newHarness(t, cfg, tc.ctx)
+			_, raw := evalSuccess(t, h, "f")
+			if tc.member {
+				if li == 0 && ci == 0 {
+					hitRef = raw
+				}
+				if raw != hitRef {
+					t.Fatalf("member output drifted across list spellings: %q != %q", raw, hitRef)
+				}
+			} else {
+				if li == 0 && ci == 3 {
+					missRef = raw
+				}
+				if raw != missRef {
+					t.Fatalf("non-member output drifted across list spellings: %q != %q", raw, missRef)
+				}
+			}
+		}
 	}
 }
