@@ -24,6 +24,7 @@ go test ./...
 
 - `reason`：`disabled`（开关关闭，固定 false）、`rule`（命中规则，`ruleId` 为该规则 id）、`default`（无规则命中，取 default，`ruleId` 为 null）。
 - 配置顶层为 `{"flags":[...]}`；每个开关含非空 `key`、布尔 `enabled`/`default`、`rules`；规则含非空 `id`、布尔 `value` 与非空 `conditions`；条件含非空 `attribute`、`op`（`eq`/`in`）和 `value`（eq 为字符串，in 为非空字符串数组）。
+- 配置允许在顶层以及开关、规则、条件对象中携带业务字段之外的附加字段（如负责人、备注、标签）：值可以是字符串、数字、布尔、`null`、数组或对象并继续嵌套，语法合法的大数字（如 `1e400`）也算可接受的附加信息；它们不成为上下文属性、不参与规则判断，也不会出现在结果对象中，详见下文“配置中的附加信息”。
 - 上下文为属性名到字符串的对象，可为 `{}`，空字符串是合法值；属性缺失即条件不成立。比较区分大小写、不裁剪空白。
 - 字符串中的 `\uXXXX` 转义必须组成完整字符：高代理项只能与紧接着的低代理项配对，孤立的高/低代理项或不完整、顺序错误的配对（无论出现在字段名还是字符串值中）都会使读取失败；真正的 `�`（U+FFFD）仍是合法字符串。
 - 两个文件会先完整校验（含未选中或已关闭的开关）；任何参数/文件/JSON/字段/唯一性错误都以非零状态退出，标准输出为空，标准错误指出具体字段与位置。
@@ -184,6 +185,136 @@ config.flags[1].default: field is required
 （用 `go run` 运行时它会在标准错误追加自己的一行 `exit status 1`；程序本身只输出上面那一行。）
 
 把请求的开关键换成合法但已关闭的开关也不会绕过这一步：只要配置中任何开关校验失败，整个命令同样非零退出。只有整份配置通过校验后，关闭的开关才按上一条所述固定返回 `false`。
+
+### 配置中的附加信息（负责人、备注、标签）
+
+维护配置时可以直接在配置里记录负责人、备注、标签等治理信息，无需另开文件。业务字段（顶层 `flags`，开关的 `key`/`enabled`/`default`/`rules`，规则的 `id`/`value`/`conditions`，条件的 `attribute`/`op`/`value`）之外的任何附加字段都会被原样接受并忽略，具体规则如下：
+
+- 附加字段可以放在四个位置：配置顶层对象、开关对象、规则对象、条件对象。
+- 字段值可以是任意合法 JSON 值：字符串、数字、布尔值、`null`、数组或对象；数组与对象内部还能继续嵌套任意深度。
+- 只要 JSON 语法合法，大数字也算可接受的附加信息——例如 `1e400`（超出浮点表示范围）不会被拒绝，它只是一个不参与求值的数字。
+- 附加字段**不是**上下文属性：求值时既不会把它们并入上下文，也不会影响规则选择、布尔结果、命中原因（`reason`）或命中规则编号（`ruleId`）；成功输出只有 `key`/`value`/`reason`/`ruleId` 四个字段，任何附加信息都不会被带回。
+
+把下面这份配置保存为 `config-meta.json`——它在顶层、开关、规则和条件上分别放了附加字段，规则的 `review` 是一个嵌套对象（内部还有 `approvers` 数组），开关上的 `rolloutWeight` 是 `1e400`：
+
+```json
+{
+  "owner": "payments-platform",
+  "schemaVersion": 2,
+  "flags": [
+    {
+      "key": "new-checkout",
+      "enabled": true,
+      "default": false,
+      "owner": "@alice",
+      "labels": ["checkout", "gradual-rollout"],
+      "rolloutWeight": 1e400,
+      "rules": [
+        {
+          "id": "r-pro",
+          "value": true,
+          "note": "付费计划开放新结算页",
+          "review": {
+            "required": true,
+            "approvers": ["@alice", "@bob"]
+          },
+          "conditions": [
+            {
+              "attribute": "plan",
+              "op": "eq",
+              "value": "pro",
+              "rationale": null
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
+```
+
+`context-meta.json` 只包含业务属性，不要把配置里的备注照搬进来：
+
+```json
+{"plan": "pro"}
+```
+
+```bash
+go run ./cmd/payflow evaluate config-meta.json new-checkout context-meta.json
+```
+
+输出与没有任何附加字段时完全相同：
+
+```json
+{"key":"new-checkout","value":true,"reason":"rule","ruleId":"r-pro"}
+```
+
+只改附加信息、不动任何业务字段时，求值输出保持一致。例如负责人从 `@alice` 交接给 `@carol`：顶层 `owner` 改为 `"growth-platform"`，开关 `owner` 改为 `"@carol"`，`labels` 换成 `["checkout", "emergency-rollback"]`，规则 `note`、`review.approvers` 和条件 `rationale` 一并改写——但 `key`/`enabled`/`default`、规则的 `id`/`value`、条件的 `attribute`/`op`/`value` 全部不变。用同一份 `context-meta.json` 重新求值，输出仍是：
+
+```json
+{"key":"new-checkout","value":true,"reason":"rule","ruleId":"r-pro"}
+```
+
+因此可以放心地在配置里维护负责人、备注、标签、审阅记录等：它们是给人和审计流程看的，求值器对它们视而不见。
+
+#### 附加信息也要通过整份配置的格式校验
+
+“被忽略”不等于“不检查”。附加字段与业务字段共用同一份 JSON 文档格式校验：同一对象内重复声明同名字段、非法 UTF-8、不成对的代理项转义、JSON 语法错误或第二个顶层值，出现在任何位置（包括附加字段的深层嵌套中）都会让整份配置被拒绝。校验覆盖所有开关，问题即使位于未被选中或已关闭的开关中，也得不到正常求值结果。
+
+例如下面这份配置——请求的 `new-checkout` 合法，但同一配置中已关闭、且本次根本不会被选中的 `legacy-report` 在其嵌套附加对象 `meta` 里把 `owner` 写了两遍：
+
+```json
+{
+  "flags": [
+    {
+      "key": "new-checkout",
+      "enabled": true,
+      "default": false,
+      "rules": [
+        {"id": "r-pro", "value": true, "conditions": [
+          {"attribute": "plan", "op": "eq", "value": "pro"}
+        ]}
+      ]
+    },
+    {
+      "key": "legacy-report",
+      "enabled": false,
+      "default": true,
+      "meta": {"owner": "@alice", "owner": "@bob"},
+      "rules": []
+    }
+  ]
+}
+```
+
+```bash
+go run ./cmd/payflow evaluate config-meta-dup.json new-checkout context-meta.json
+```
+
+命令以非零状态退出，标准输出为空，标准错误同时给出重复原因与具体位置（用 `go run` 运行时还会在标准错误追加一行 `exit status 1`；程序本身只输出下面那一行）：
+
+```
+config.flags[1].meta.owner: duplicate field "owner"
+```
+
+重复判定只针对**同一个对象**：不同对象各自使用同名字段完全合法——顶层、开关、规则、条件分别放一个 `"owner"` 不会冲突，同一规则的条件数组里多个条件各自携带同名字段也可以，只有在一个 `{}` 内部把同一个名字写两次才是错误。
+
+数字方面也要区分“大”与“语法错误”：`1e400` 是语法合法的数字（如上面的完整示例所示，配置正常通过），而缺少指数数字的 `1e+` 根本不是合法 JSON 数字。例如：
+
+```json
+{"weight": 1e+, "flags": []}
+```
+
+它报告的是 JSON 语法错误，而不是笼统的“数字过大”：
+
+```
+config: invalid JSON: invalid character ',' in exponent of numeric literal
+```
+
+#### 附加字段的边界
+
+- 附加字段不能替代缺少或类型错误的业务字段：开关仍必须提供非空 `key`、布尔 `enabled`/`default` 和 `rules`，规则仍必须提供非空 `id`、布尔 `value` 和非空 `conditions`，条件仍必须提供非空 `attribute`、`op` 与类型正确的 `value`；开关键与规则 id 在各自范围内的唯一性要求也继续适用。例如 `"default": false` 不能省，多写一个 `"owner": "@alice"` 不弥补缺失。
+- 上下文仍然只是“属性名到字符串”的对象：每个顶层属性的值必须是字符串，`{}` 合法、空字符串合法，但对象、数组、数字等一律按类型错误拒绝。配置附加字段里的嵌套备注不能照搬到上下文——上下文里写 `"plan": {"name": "pro"}` 会得到 `context.plan: value must be a string`。
 
 ## 技术方向
 
