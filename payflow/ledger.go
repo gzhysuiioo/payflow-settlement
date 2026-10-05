@@ -927,7 +927,7 @@ func stageOn(st *ledgerState, key balanceKey, newBal int64, rec Record) func() {
 //   - 参数合法时，已成功的退款编号优先判定：目标结算与原因都相同返回 duplicate
 //     及原退款记录（不再入账）；任一不同返回 conflict。
 //   - 新退款编号：找不到成功结算（含原付款只曾失败）返回 not_found；
-//     该结算已被其他退款编号退回返回 refunded，不增加余额。
+//     该结算已被其他退款编号退回返回 already_refunded，不增加余额。
 //   - 成功时把原记录的 charged（含当时已扣手续费）全额退回原账户、原资产；
 //     退款金额与去向完全由原结算确定，原结算记录及其编号、顺序保持不变。
 //   - 失败申请不占用退款编号，之后可修改原因或目标再提交。
@@ -936,128 +936,179 @@ func (l *Ledger) Refund(batch RefundBatch) (*RefundBatchResult, error) {
 		return nil, err
 	}
 	defer l.endOp()
-	out := &RefundBatchResult{Results: make([]RefundResult, 0, len(batch.Refunds))}
 
 	l.reg.mu.Lock()
 	defer l.reg.mu.Unlock()
 
-	for i := range batch.Refunds {
-		req := &batch.Refunds[i]
-		res := RefundResult{ID: req.ID}
-
-		// 1. 参数校验：退款编号、原付款编号、原因三者都必须非空。
-		//    未通过的编号不占用退款资格。
-		if req.ID == "" {
-			res.Status = StatusInvalid
-			res.Reason = reasonEmptyRefundID
-			out.Results = append(out.Results, res)
-			continue
-		}
-		if req.SettlementID == "" {
-			res.Status = StatusInvalid
-			res.Reason = reasonEmptySettlement
-			out.Results = append(out.Results, res)
-			continue
-		}
-		if req.Reason == "" {
-			res.Status = StatusInvalid
-			res.Reason = reasonEmptyReason
-			out.Results = append(out.Results, res)
-			continue
-		}
-
-		// 2. 已成功退款编号优先判定：目标与原因都相同则幂等返回原退款记录；
-		//    任一不同则冲突。两者都不再入账。本批次内先成功的同编号项也在此可见。
-		if prior, exists := l.findRefund(req.ID); exists {
-			if prior.SettlementID == req.SettlementID && prior.Reason == req.Reason {
-				cp := prior
-				res.Status = StatusDuplicate
-				res.Reason = prior.Reason
-				res.SettlementID = prior.SettlementID
-				res.Account = prior.Account
-				res.Asset = prior.Asset
-				res.Charged = prior.Charged
-				res.Record = &cp
-			} else {
-				res.Status = StatusConflict
-				res.Reason = reasonRefundConflict
-			}
-			out.Results = append(out.Results, res)
-			continue
-		}
-
-		// 3. 新退款编号：目标必须是一笔成功结算（原付款只曾失败也算不存在）。
-		target, exists := l.findRecord(req.SettlementID)
-		if !exists {
-			res.Status = StatusNotFound
-			res.Reason = fmt.Sprintf(reasonSettlementGone, req.SettlementID)
-			out.Results = append(out.Results, res)
-			continue
-		}
-
-		// 4. 每笔原付款最多退回一次：已被其他退款编号退回则报告已退款，不加余额。
-		if prior, refunded := l.findRefundOfSettlement(req.SettlementID); refunded {
-			res.Status = StatusAlreadyRefunded
-			res.Reason = fmt.Sprintf(reasonAlreadyRefunded, req.SettlementID, prior.ID)
-			out.Results = append(out.Results, res)
-			continue
-		}
-
-		// 5. 全额退回原账户、原资产（amount 与当时手续费一并退回），
-		//    与退款记录在同一个原子写入中落盘；保存失败回滚该项。
-		rec := RefundRecord{
-			ID:           req.ID,
-			SettlementID: target.ID,
-			Reason:       req.Reason,
-			Account:      target.Account,
-			Asset:        target.Asset,
-			Amount:       target.Amount,
-			Fee:          target.Fee,
-			Charged:      target.Charged,
-			AfterSeq:     int64(len(l.reg.state.Settlements)),
-			Seq:          int64(len(l.reg.state.Refunds)) + 1,
-		}
-		key := balanceKey{target.Account, target.Asset}
-		bal := l.reg.state.Balances[key]
-		rollback := l.stageRefund(key, bal+target.Charged, rec)
-		if err := l.persistLocked(); err != nil {
-			rollback()
-			res.Status = StatusStorage
-			res.Reason = err.Error()
-		} else {
-			cp := rec
-			res.Status = StatusRefundSuccess
-			res.Reason = rec.Reason
-			res.SettlementID = rec.SettlementID
-			res.Account = rec.Account
-			res.Asset = rec.Asset
-			res.Charged = rec.Charged
-			res.Record = &cp
-		}
-		out.Results = append(out.Results, res)
-	}
-	return out, nil
+	results := runRefundBatch(batch, l.reg.state, l.persistRefund)
+	return &RefundBatchResult{Results: results}, nil
 }
 
-// stageRefund 应用一笔退款（余额增加 + 记录追加），返回回滚函数。
-func (l *Ledger) stageRefund(key balanceKey, newBal int64, rec RefundRecord) func() {
-	oldBal, hadKey := l.reg.state.Balances[key]
-	oldLen := len(l.reg.state.Refunds)
-	l.reg.state.Balances[key] = newBal
-	l.reg.state.Refunds = append(l.reg.state.Refunds, rec)
+// refundEffect 是一笔预计成功退款的全部账本效果：给哪个组合退回多少、
+// 留下什么退款记录。它由退款规则产生，本身尚未生效；是否生效、如何生效
+// （先改内存再原子落盘、失败回滚）由生效策略决定。
+type refundEffect struct {
+	key    balanceKey
+	credit int64
+	record RefundRecord
+}
+
+// commitRefund 是退款生效策略：把一笔预计成功的退款应用到状态 st 上。
+// 返回 nil 表示已生效；返回非 nil 表示保存失败，且 st 必须已恢复到
+// 该项执行之前的余额与退款历史。
+type commitRefund func(st *ledgerState, eff refundEffect) error
+
+// runRefundBatch 按输入顺序在给定状态 st 上处理整个退款批次，返回逐项结果。
+// 退款规则（judgeRefund）与退款生效（commit）分离：规则只读取 st 给出判定
+// 和预计退款效果，不改动任何状态；生效策略决定效果如何落地——先改内存再
+// 原子落盘，保存失败时 commit 已回滚该项（余额与退款历史恢复原样），该项
+// 报告 storage_error，不占退款编号，后项继续处理。调用方必须持有 reg.mu。
+func runRefundBatch(batch RefundBatch, st *ledgerState, commit commitRefund) []RefundResult {
+	out := make([]RefundResult, 0, len(batch.Refunds))
+	for i := range batch.Refunds {
+		// 1. 规则判定：纯读取，不产生任何副作用。
+		res, effect := judgeRefund(&batch.Refunds[i], st)
+		if effect == nil {
+			out = append(out, res)
+			continue
+		}
+
+		// 2. 生效：保存失败时 commit 已回滚该项，该项只报告 storage_error，
+		//    不带详情、不留记录、不占编号，后项继续处理。
+		if err := commit(st, *effect); err != nil {
+			out = append(out, RefundResult{ID: res.ID, Status: StatusStorage, Reason: err.Error()})
+			continue
+		}
+
+		// 3. 成功生效后补上状态与原退款记录（详情已由规则填好）。
+		cp := effect.record
+		res.Status = StatusRefundSuccess
+		res.Record = &cp
+		out = append(out, res)
+	}
+	return out
+}
+
+// judgeRefund 按退款规则评估一项请求，只读取状态，不产生副作用。
+// 返回逐项结果；预计成功时结果已填好详情，退款效果以 refundEffect 描述，
+// 由调用方交给生效策略落地。判定顺序即对外约定：参数校验、已成功退款编号
+// 的重复/冲突、目标结算存在性、目标是否已被其他退款编号退回。
+func judgeRefund(req *RefundRequest, st *ledgerState) (RefundResult, *refundEffect) {
+	res := RefundResult{ID: req.ID}
+
+	// 1. 参数校验：退款编号、原付款编号、原因三者都必须非空。
+	//    未通过的编号不占用退款资格。
+	if req.ID == "" {
+		res.Status = StatusInvalid
+		res.Reason = reasonEmptyRefundID
+		return res, nil
+	}
+	if req.SettlementID == "" {
+		res.Status = StatusInvalid
+		res.Reason = reasonEmptySettlement
+		return res, nil
+	}
+	if req.Reason == "" {
+		res.Status = StatusInvalid
+		res.Reason = reasonEmptyReason
+		return res, nil
+	}
+
+	// 2. 已成功退款编号优先判定：目标与原因都相同则幂等返回原退款记录；
+	//    任一不同则冲突。两者都不再入账。本批次内先成功的同编号项也在此可见。
+	if prior, exists := findRefundIn(st.Refunds, req.ID); exists {
+		if prior.SettlementID == req.SettlementID && prior.Reason == req.Reason {
+			res.Status = StatusDuplicate
+			refundDetail(&res, prior)
+			cp := prior
+			res.Record = &cp
+		} else {
+			res.Status = StatusConflict
+			res.Reason = reasonRefundConflict
+		}
+		return res, nil
+	}
+
+	// 3. 新退款编号：目标必须是一笔成功结算（原付款只曾失败也算不存在）。
+	target, exists := findRecordIn(st.Settlements, req.SettlementID)
+	if !exists {
+		res.Status = StatusNotFound
+		res.Reason = fmt.Sprintf(reasonSettlementGone, req.SettlementID)
+		return res, nil
+	}
+
+	// 4. 每笔原付款最多退回一次：已被其他退款编号退回则报告已退款，不加余额。
+	if prior, refunded := findRefundOfSettlementIn(st.Refunds, req.SettlementID); refunded {
+		res.Status = StatusAlreadyRefunded
+		res.Reason = fmt.Sprintf(reasonAlreadyRefunded, req.SettlementID, prior.ID)
+		return res, nil
+	}
+
+	// 5. 预计成功：全额退回原账户、原资产（amount 与当时手续费一并退回）。
+	//    退款金额与去向完全由原结算确定，原结算记录及其编号、顺序保持不变；
+	//    序号按当前退款历史长度连续递增，失败与重复项不消耗序号。
+	rec := RefundRecord{
+		ID:           req.ID,
+		SettlementID: target.ID,
+		Reason:       req.Reason,
+		Account:      target.Account,
+		Asset:        target.Asset,
+		Amount:       target.Amount,
+		Fee:          target.Fee,
+		Charged:      target.Charged,
+		AfterSeq:     int64(len(st.Settlements)),
+		Seq:          int64(len(st.Refunds)) + 1,
+	}
+	refundDetail(&res, rec)
+	return res, &refundEffect{
+		key:    balanceKey{target.Account, target.Asset},
+		credit: target.Charged,
+		record: rec,
+	}
+}
+
+// refundDetail 把一笔退款记录展开为结果详情：原付款关联、账户、资产、
+// 退款总额与原因。首次成功与幂等重复共用同一份内容，保证两处始终一致。
+func refundDetail(res *RefundResult, rec RefundRecord) {
+	res.Reason = rec.Reason
+	res.SettlementID = rec.SettlementID
+	res.Account = rec.Account
+	res.Asset = rec.Asset
+	res.Charged = rec.Charged
+}
+
+// persistRefund 是真实提交的生效策略：先在内存生效，再原子落盘；
+// 落盘失败回滚该项（恢复余额与退款历史），并返回存储错误。
+func (l *Ledger) persistRefund(st *ledgerState, eff refundEffect) error {
+	rollback := stageRefundOn(st, eff.key, st.Balances[eff.key]+eff.credit, eff.record)
+	if err := l.persistLocked(); err != nil {
+		rollback()
+		return err
+	}
+	return nil
+}
+
+// stageRefundOn 在指定状态上应用一笔退款（余额增加 + 记录追加），返回回滚函数
+// （恢复该项执行前的余额与退款记录长度）。
+func stageRefundOn(st *ledgerState, key balanceKey, newBal int64, rec RefundRecord) func() {
+	oldBal, hadKey := st.Balances[key]
+	oldLen := len(st.Refunds)
+	st.Balances[key] = newBal
+	st.Refunds = append(st.Refunds, rec)
 	return func() {
 		if hadKey {
-			l.reg.state.Balances[key] = oldBal
+			st.Balances[key] = oldBal
 		} else {
-			delete(l.reg.state.Balances, key)
+			delete(st.Balances, key)
 		}
-		l.reg.state.Refunds = l.reg.state.Refunds[:oldLen]
+		st.Refunds = st.Refunds[:oldLen]
 	}
 }
 
-func (l *Ledger) findRefund(id string) (RefundRecord, bool) {
+// findRefundIn 在给定退款历史中按编号查找成功退款。
+func findRefundIn(refunds []RefundRecord, id string) (RefundRecord, bool) {
 	// 退款按成功顺序追加且 ID 唯一；单机账本量级直接扫描。
-	for _, r := range l.stateView().Refunds {
+	for _, r := range refunds {
 		if r.ID == id {
 			return r, true
 		}
@@ -1065,9 +1116,9 @@ func (l *Ledger) findRefund(id string) (RefundRecord, bool) {
 	return RefundRecord{}, false
 }
 
-// findRefundOfSettlement 返回退回指定结算的那笔退款（每笔结算最多一笔）。
-func (l *Ledger) findRefundOfSettlement(settlementID string) (RefundRecord, bool) {
-	for _, r := range l.stateView().Refunds {
+// findRefundOfSettlementIn 返回退回指定结算的那笔退款（每笔结算最多一笔）。
+func findRefundOfSettlementIn(refunds []RefundRecord, settlementID string) (RefundRecord, bool) {
+	for _, r := range refunds {
 		if r.SettlementID == settlementID {
 			return r, true
 		}
@@ -1076,16 +1127,6 @@ func (l *Ledger) findRefundOfSettlement(settlementID string) (RefundRecord, bool
 }
 
 func (l *Ledger) stateView() *ledgerState { return l.reg.state }
-
-func (l *Ledger) findRecord(id string) (Record, bool) {
-	// 记录按成功顺序追加且 ID 唯一；条目规模在单机账本量级，直接扫描。
-	for _, r := range l.stateView().Settlements {
-		if r.ID == id {
-			return r, true
-		}
-	}
-	return Record{}, false
-}
 
 // sameRequest 比较全部付款字段与费率。付款字段：账户、付款方、资产、金额、nonce。
 func sameRequest(r Record, it *PaymentIntent, amount int64, feeBps int) bool {
