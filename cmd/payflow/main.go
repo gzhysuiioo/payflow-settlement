@@ -263,11 +263,15 @@ func cmdRefund(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	defer l.Close()
 
 	// 即使批次内全部项都失败，也是正常的逐项结果，退出码仍为 0。
+	// 结果输出阶段失败（写错误或短写，含末尾换行）：退出码 1，错误信封只写
+	// 标准错误；已落账的退款不回滚，批次不会重跑。
 	result, err := l.Refund(batch)
 	if err != nil {
 		return failWithError(stderr, err)
 	}
-	writeJSON(stdout, result)
+	if err := writeJSON(stdout, result); err != nil {
+		return failOutput(stderr, err)
+	}
 	return 0
 }
 
