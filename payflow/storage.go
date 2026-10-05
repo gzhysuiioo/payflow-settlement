@@ -11,31 +11,63 @@ import (
 	"syscall"
 )
 
-// atomicWrite 将 v 以 JSON 原子写入 path：
-//  1. 写入同目录临时文件并 fsync；
-//  2. rename 覆盖目标文件（同文件系统内原子）；
-//  3. 尽力 fsync 目录，帮助 rename 跨掉电容灾。
+// 账本文件的保存规则集中在 saveLedger 一处：序列化 → 同目录临时文件 →
+// fsync → 0600 → 发布 → 目录 fsync。新建账本与更新已有账本只差最后的
+// 发布策略（publishFunc）：
+//   - 更新已有账本用 rename 原子替换（publishReplace）；
+//   - 新建账本用 link(2) 排他创建（publishExclusive），目标被占用即拒绝。
 //
-// 关键不变式：磁盘上的目标文件在任意时刻要么是完整旧内容，
-// 要么是完整新内容（临时文件先 fsync 后改名，JSON 只写一个文档）。
-// 进程在保存期间崩溃，重开只能看到完整的旧状态或新状态，
-// 不会出现“扣款无记录”或“记录未扣款”。
-func atomicWrite(path string, v any) error {
-	perm := os.FileMode(0o600)
+// 关键不变式：磁盘上的目标文件在任意时刻要么是完整旧内容，要么是完整
+// 新内容（临时文件先 fsync 后发布，JSON 只写一个文档）。进程在保存期间
+// 崩溃，重开只能看到完整的旧状态或新状态，不会出现“扣款无记录”或
+// “记录未扣款”。
+//
+// 发布之前任一步失败都会清理临时文件，目标位置不留半成品；发布一旦
+// 完成，新状态已就位，后续目录 fsync 仅尽力而为，失败不再回滚。
+
+// publishFunc 把已完整落盘、已 fsync 的临时文件 tmp 发布到目标 path。
+// 返回非 nil 表示发布失败，调用方负责清理临时文件。
+type publishFunc func(tmp, path string) error
+
+// saveLedger 按统一的保存规则把 v 以 JSON 单文档保存到 path：
+//  1. 写入同目录临时文件并 fsync（stageTempFile）；
+//  2. 由 publish 把临时文件发布到目标位置；
+//  3. 尽力 fsync 目录，帮助发布结果跨掉电保留。
+//
+// 发布失败时临时文件由这里统一清理；发布成功后临时名字也已统一移除
+// （rename 后该名字本就不存在，link 后它是同一 inode 的多余名字）。
+func saveLedger(path string, v any, publish publishFunc) error {
+	tmpName, err := stageTempFile(path, v)
+	if err != nil {
+		return err
+	}
+	if err := publish(tmpName, path); err != nil {
+		_ = os.Remove(tmpName)
+		return err
+	}
+	_ = os.Remove(tmpName)
+	syncParentDir(path)
+	return nil
+}
+
+// stageTempFile 把 v 序列化为单个 JSON 文档，完整写入 path 同目录的
+// 临时文件，fsync 后调整为 0600（仅所有者可读写），返回临时文件路径。
+// 此时目标位置尚未被触碰；任一步失败都清理临时文件并返回 ErrStorage。
+func stageTempFile(path string, v any) (string, error) {
 	data, err := json.Marshal(v)
 	if err != nil {
-		return ledgerError(ErrStorage, "encode ledger: %v", err)
+		return "", ledgerError(ErrStorage, "encode ledger: %v", err)
 	}
 	data = append(data, '\n')
 
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return ledgerError(ErrStorage, "create ledger directory %s: %v", dir, err)
+		return "", ledgerError(ErrStorage, "create ledger directory %s: %v", dir, err)
 	}
 
 	tmp, err := os.CreateTemp(dir, ".ledger-*.tmp")
 	if err != nil {
-		return ledgerError(ErrStorage, "create temp file in %s: %v", dir, err)
+		return "", ledgerError(ErrStorage, "create temp file in %s: %v", dir, err)
 	}
 	tmpName := tmp.Name()
 	removeTemp := func() { _ = os.Remove(tmpName) }
@@ -43,39 +75,50 @@ func atomicWrite(path string, v any) error {
 	if _, err := tmp.Write(data); err != nil {
 		_ = tmp.Close()
 		removeTemp()
-		return ledgerError(ErrStorage, "write temp file: %v", err)
+		return "", ledgerError(ErrStorage, "write temp file: %v", err)
 	}
 	if err := tmp.Sync(); err != nil {
 		_ = tmp.Close()
 		removeTemp()
-		return ledgerError(ErrStorage, "fsync temp file: %v", err)
+		return "", ledgerError(ErrStorage, "fsync temp file: %v", err)
 	}
 	if err := tmp.Close(); err != nil {
 		removeTemp()
-		return ledgerError(ErrStorage, "close temp file: %v", err)
+		return "", ledgerError(ErrStorage, "close temp file: %v", err)
 	}
-	if err := os.Chmod(tmpName, perm); err != nil {
+	if err := os.Chmod(tmpName, 0o600); err != nil {
 		removeTemp()
-		return ledgerError(ErrStorage, "chmod temp file: %v", err)
+		return "", ledgerError(ErrStorage, "chmod temp file: %v", err)
 	}
-	// rename 之后新文件已完整就位。即便此后目录 fsync 失败，也不能再回滚：
-	// 回滚内存会与磁盘（已是新状态）分叉。目录 fsync 仅影响掉电后目录项的
-	// 持久性，而可能出现的两种结局（旧文件/新文件）都是完整状态。
-	if err := os.Rename(tmpName, path); err != nil {
-		removeTemp()
-		return ledgerError(ErrStorage, "rename into place: %v", err)
-	}
-	if d, err := os.Open(dir); err == nil {
+	return tmpName, nil
+}
+
+// syncParentDir 尽力 fsync path 的父目录，帮助已完成的发布跨掉电保留
+// 目录项。发布完成后可能出现的两种结局（旧文件/新文件）都是完整状态，
+// 因此这里失败不影响结果，调用方也不得因此回滚内存状态。
+func syncParentDir(path string) {
+	if d, err := os.Open(filepath.Dir(path)); err == nil {
 		_ = d.Sync()
 		_ = d.Close()
+	}
+}
+
+// publishReplace 用 rename 把临时文件原子发布到 path：目标位置已有的
+// 内容被整体替换，读者任意时刻只能看到完整的旧版本或完整新版本。
+// 用于更新已有账本。
+//
+// rename 之后新文件已完整就位。即便此后目录 fsync 失败，也不能再回滚：
+// 回滚内存会与磁盘（已是新状态）分叉。
+func publishReplace(tmp, path string) error {
+	if err := os.Rename(tmp, path); err != nil {
+		return ledgerError(ErrStorage, "rename into place: %v", err)
 	}
 	return nil
 }
 
-// createExclusive 在 path 处排他地创建新账本文件，绝不覆盖任何已有路径项。
+// publishExclusive 用 link(2)（ATOMIC_CREATE：目标存在即失败）把临时文件
+// 排他发布到 path，绝不覆盖任何已有路径项。用于新建账本。
 //
-// 与 atomicWrite 的关键区别在最后一步：临时文件完整落盘后，用 link(2)
-// （ATOMIC_CREATE：目标存在即失败）把它发布到 path，而不是 rename。
 // 这使“检查路径是否占用”和“创建账本”成为内核里的同一个原子操作：
 //   - 普通文件、目录、损坏或空文件：EEXIST，原内容逐字节不变；
 //   - path 上是符号链接（无论其目标存在与否、指向文件还是目录）：
@@ -90,62 +133,29 @@ func atomicWrite(path string, v any) error {
 // 就是已 fsync 的完整内容（临时文件与 path 指向同一个 inode），
 // 崩溃后同样只可能看到“完整新账本”或“路径不存在”，没有半成品。
 //
-// path 占用时返回带 ErrExists 的账本错误；其余创建/写入失败返回
-// ErrStorage 且不留下账本文件或临时文件。
-func createExclusive(path string, v any) error {
-	data, err := json.Marshal(v)
-	if err != nil {
-		return ledgerError(ErrStorage, "encode ledger: %v", err)
-	}
-	data = append(data, '\n')
-
-	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return ledgerError(ErrStorage, "create ledger directory %s: %v", dir, err)
-	}
-
-	tmp, err := os.CreateTemp(dir, ".ledger-*.tmp")
-	if err != nil {
-		return ledgerError(ErrStorage, "create temp file in %s: %v", dir, err)
-	}
-	tmpName := tmp.Name()
-	removeTemp := func() { _ = os.Remove(tmpName) }
-
-	if _, err := tmp.Write(data); err != nil {
-		_ = tmp.Close()
-		removeTemp()
-		return ledgerError(ErrStorage, "write temp file: %v", err)
-	}
-	if err := tmp.Sync(); err != nil {
-		_ = tmp.Close()
-		removeTemp()
-		return ledgerError(ErrStorage, "fsync temp file: %v", err)
-	}
-	if err := tmp.Close(); err != nil {
-		removeTemp()
-		return ledgerError(ErrStorage, "close temp file: %v", err)
-	}
-	if err := os.Chmod(tmpName, 0o600); err != nil {
-		removeTemp()
-		return ledgerError(ErrStorage, "chmod temp file: %v", err)
-	}
-
-	// 原子排他发布：path 上存在任何路径项（含悬空/指向文件或目录的符号链接）
-	// 都返回 EEXIST，绝不替换它，也不跟随它。
-	if err := os.Link(tmpName, path); err != nil {
-		removeTemp()
+// path 占用时返回带 ErrExists 的账本错误；其余失败返回 ErrStorage。
+func publishExclusive(tmp, path string) error {
+	if err := os.Link(tmp, path); err != nil {
 		if errors.Is(err, syscall.EEXIST) {
 			return ledgerError(ErrExists, "ledger already exists at %s", path)
 		}
 		return ledgerError(ErrStorage, "create ledger at %s: %v", path, err)
 	}
-	// path 与临时文件现在是同一个 inode；移除临时名字不影响已发布的账本。
-	removeTemp()
-	if d, err := os.Open(dir); err == nil {
-		_ = d.Sync()
-		_ = d.Close()
-	}
 	return nil
+}
+
+// atomicWrite 将 v 以 JSON 原子写入 path，替换该位置的已有账本。
+// 保存规则见 saveLedger；发布策略是 rename 原子替换（publishReplace）。
+func atomicWrite(path string, v any) error {
+	return saveLedger(path, v, publishReplace)
+}
+
+// createExclusive 在 path 处排他地创建新账本文件，绝不覆盖任何已有路径项。
+// 保存规则见 saveLedger；发布策略是 link(2) 排他创建（publishExclusive）：
+// 路径占用返回 ErrExists 且原内容不变，写入故障返回 ErrStorage，
+// 两种情况下路径上都不会留下半成品。
+func createExclusive(path string, v any) error {
+	return saveLedger(path, v, publishExclusive)
 }
 
 // validateAndReplay 校验全部成功记录并从冻结的初始余额重放结算与退款：
