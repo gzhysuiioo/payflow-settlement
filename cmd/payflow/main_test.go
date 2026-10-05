@@ -1428,3 +1428,318 @@ func TestCLIEvaluateInvalidInListsRejected(t *testing.T) {
 		})
 	}
 }
+
+// --- 可选 --explain 模式 ------------------------------------------------------
+
+// explainCLIConfig 用于解释模式的端到端测试：r-block 在前返回 false（eq+in），
+// r-pro 在后返回 true（eq）；另含一个已关闭的开关 off 与无规则开关 plain。
+const explainCLIConfig = `{"flags":[
+	{"key":"f","enabled":true,"default":true,"rules":[
+		{"id":"r-block","value":false,"conditions":[
+			{"attribute":"region","op":"eq","value":"cn"},
+			{"attribute":"platform","op":"in","value":["ios","android"]}]},
+		{"id":"r-pro","value":true,"conditions":[
+			{"attribute":"plan","op":"eq","value":"pro"}]}]},
+	{"key":"off","enabled":false,"default":true,"rules":[
+		{"id":"r-only","value":true,"conditions":[
+			{"attribute":"plan","op":"eq","value":"pro"}]}]},
+	{"key":"plain","enabled":true,"default":true,"rules":[]}]}`
+
+// evalExplainArgs 与 evalArgs 相同但末尾带 --explain。
+func (h *harness) evalExplainArgs(key string) []string {
+	return []string{"evaluate", h.configPath, key, h.contextPath, "--explain"}
+}
+
+// explainSuccess 运行带 --explain 的 evaluate 并把 stdout 解码为单个对象。
+func explainSuccess(t *testing.T, h *harness, key string) map[string]any {
+	t.Helper()
+	var stdout, stderr bytes.Buffer
+	if code := run(h.evalExplainArgs(key), &stdout, &stderr); code != 0 {
+		t.Fatalf("exit=%d stderr=%s", code, stderr.String())
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr must be empty on success: %q", stderr.String())
+	}
+	out := stdout.String()
+	if strings.Count(strings.TrimSpace(out), "\n") != 0 {
+		t.Fatalf("stdout must contain exactly one JSON object line: %q", out)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
+		t.Fatalf("stdout is not a single JSON object: %q (%v)", out, err)
+	}
+	return got
+}
+
+// rulesOf 从解释对象中按顺序取出每条规则的 (id, match)。
+func rulesOf(t *testing.T, got map[string]any) []map[string]any {
+	t.Helper()
+	exp, ok := got["explanation"].(map[string]any)
+	if !ok {
+		t.Fatalf("missing explanation object: %v", got)
+	}
+	rules, ok := exp["rules"].([]any)
+	if !ok {
+		t.Fatalf("explanation.rules must be an array: %v", exp)
+	}
+	res := make([]map[string]any, 0, len(rules))
+	for _, r0 := range rules {
+		res = append(res, r0.(map[string]any))
+	}
+	return res
+}
+
+func TestCLIEvaluateExplainRuleHitAndStop(t *testing.T) {
+	h := newHarness(t, explainCLIConfig, `{"region":"cn","platform":"ios","plan":"pro"}`)
+	got := explainSuccess(t, h, "f")
+	// 前四个字段与普通模式一致。
+	if got["key"] != "f" || got["value"] != false || got["reason"] != "rule" || got["ruleId"] != "r-block" {
+		t.Fatalf("unexpected payload: %v", got)
+	}
+	rules := rulesOf(t, got)
+	// 第一条全部条件成立的规则（返回 false）即定案并停止：只有 r-block。
+	if len(rules) != 1 || rules[0]["ruleId"] != "r-block" || rules[0]["match"] != true {
+		t.Fatalf("must list only the first all-match rule, got %v", rules)
+	}
+	conds := rules[0]["conditions"].([]any)
+	if len(conds) != 2 {
+		t.Fatalf("winning rule must show all its conditions: %v", conds)
+	}
+}
+
+func TestCLIEvaluateExplainMissThenHit(t *testing.T) {
+	h := newHarness(t, explainCLIConfig, `{"region":"us","platform":"web","plan":"pro"}`)
+	got := explainSuccess(t, h, "f")
+	if got["key"] != "f" || got["value"] != true || got["reason"] != "rule" || got["ruleId"] != "r-pro" {
+		t.Fatalf("unexpected payload: %v", got)
+	}
+	rules := rulesOf(t, got)
+	if len(rules) != 2 {
+		t.Fatalf("missed earlier rule must be kept, deciding rule included: %v", rules)
+	}
+	if rules[0]["ruleId"] != "r-block" || rules[0]["match"] != false {
+		t.Fatalf("first rule shown as miss: %v", rules[0])
+	}
+	if rules[1]["ruleId"] != "r-pro" || rules[1]["match"] != true {
+		t.Fatalf("second rule shown as hit: %v", rules[1])
+	}
+}
+
+func TestCLIEvaluateExplainConditionDetail(t *testing.T) {
+	// 上下文缺失 region（与显式空字符串不同）、platform 值不在候选列表中。
+	h := newHarness(t, explainCLIConfig, `{"platform":"","plan":"pro"}`)
+	got := explainSuccess(t, h, "f")
+	rules := rulesOf(t, got)
+	conds := rules[0]["conditions"].([]any)
+
+	region := conds[0].(map[string]any)
+	if region["attribute"] != "region" || region["op"] != "eq" ||
+		region["missing"] != true || region["actualValue"] != nil || region["match"] != false {
+		t.Fatalf("missing region condition: %v", region)
+	}
+	platform := conds[1].(map[string]any)
+	// 显式给出的空字符串是真实值，不能标记为缺失；但不在 ["ios","android"]。
+	if platform["missing"] != false || platform["actualValue"] != "" || platform["match"] != false {
+		t.Fatalf("empty-string platform must be present and out of list: %v", platform)
+	}
+	list := platform["compareValue"].([]any)
+	if len(list) != 2 || list[0] != "ios" || list[1] != "android" {
+		t.Fatalf("in compareValue wrong: %v", list)
+	}
+
+	// r-pro 的 plan 条件成立，体现“值不相等 vs 属性缺失 vs 不在列表”的区分。
+	rpro := rules[1]["conditions"].([]any)[0].(map[string]any)
+	if rpro["attribute"] != "plan" || rpro["compareValue"] != "pro" ||
+		rpro["actualValue"] != "pro" || rpro["missing"] != false || rpro["match"] != true {
+		t.Fatalf("plan condition: %v", rpro)
+	}
+}
+
+func TestCLIEvaluateExplainDefaultAndEmptyRules(t *testing.T) {
+	// 没有规则命中：展示全部规则，说明采用默认值。
+	h := newHarness(t, explainCLIConfig, `{"plan":"free"}`)
+	got := explainSuccess(t, h, "f")
+	if got["reason"] != "default" || got["ruleId"] != nil || got["value"] != true {
+		t.Fatalf("unexpected: %v", got)
+	}
+	if rules := rulesOf(t, got); len(rules) != 2 {
+		t.Fatalf("all rules shown on default fallback: %v", rules)
+	}
+	exp := got["explanation"].(map[string]any)
+	if !strings.Contains(strings.ToLower(exp["outcome"].(string)), "default") {
+		t.Fatalf("outcome must mention default: %v", exp["outcome"])
+	}
+
+	// 空规则列表：默认结果 + 空解释。
+	h2 := newHarness(t, explainCLIConfig, `{}`)
+	got2 := explainSuccess(t, h2, "plain")
+	if got2["reason"] != "default" || got2["ruleId"] != nil || got2["value"] != true {
+		t.Fatalf("unexpected: %v", got2)
+	}
+	exp2 := got2["explanation"].(map[string]any)
+	rules2, _ := exp2["rules"].([]any)
+	if len(rules2) != 0 {
+		t.Fatalf("empty rules must give empty explanation: %v", exp2["rules"])
+	}
+}
+
+func TestCLIEvaluateExplainDisabled(t *testing.T) {
+	// 即使上下文本会命中 r-only，关闭开关固定 false，规则解释为空。
+	h := newHarness(t, explainCLIConfig, `{"plan":"pro"}`)
+	got := explainSuccess(t, h, "off")
+	if got["value"] != false || got["reason"] != "disabled" || got["ruleId"] != nil {
+		t.Fatalf("unexpected: %v", got)
+	}
+	exp := got["explanation"].(map[string]any)
+	rules, _ := exp["rules"].([]any)
+	if len(rules) != 0 {
+		t.Fatalf("disabled flag must have empty rule explanation: %v", rules)
+	}
+	if !strings.Contains(strings.ToLower(exp["outcome"].(string)), "disabled") {
+		t.Fatalf("outcome must say disabled fixed false, not default/rule: %v", exp["outcome"])
+	}
+}
+
+func TestCLIEvaluateExplainKeepsListEmptyAndDuplicates(t *testing.T) {
+	cfg := `{"flags":[{"key":"g","enabled":true,"default":false,"rules":[
+		{"id":"r","value":true,"conditions":[
+			{"attribute":"tag","op":"in","value":["","a","a"," "]}]}]}]}`
+	h := newHarness(t, cfg, `{"tag":""}`)
+	var stdout, stderr bytes.Buffer
+	if code := run(h.evalExplainArgs("g"), &stdout, &stderr); code != 0 {
+		t.Fatalf("exit=%d stderr=%s", code, stderr.String())
+	}
+	// compareValue 必须逐字保留空字符串、重复成员、次序与空白。
+	if !strings.Contains(stdout.String(), `"compareValue":["","a","a"," "]`) {
+		t.Fatalf("compareValue must preserve empty/dup/order/whitespace: %s", stdout.String())
+	}
+}
+
+func TestCLIEvaluateExplainNormalModeUnchanged(t *testing.T) {
+	// 不带 --explain 仍是既有四字段对象，且不包含 explanation。
+	h := newHarness(t, explainCLIConfig, `{"plan":"pro"}`)
+	var stdout, stderr bytes.Buffer
+	if code := run(h.evalArgs("plain"), &stdout, &stderr); code != 0 {
+		t.Fatalf("exit=%d stderr=%s", code, stderr.String())
+	}
+	if want := `{"key":"plain","value":true,"reason":"default","ruleId":null}`; strings.TrimSpace(stdout.String()) != want {
+		t.Fatalf("normal output changed: %q", stdout.String())
+	}
+	if strings.Contains(stdout.String(), "explanation") {
+		t.Fatalf("normal mode must not include explanation: %q", stdout.String())
+	}
+}
+
+func TestCLIEvaluateExplainArgumentRules(t *testing.T) {
+	goodCtx := `{}`
+	cases := []struct {
+		name    string
+		argv    func(h *harness) []string
+		wantSub string
+	}{
+		{
+			"unknown fourth argument",
+			func(h *harness) []string {
+				return []string{"evaluate", h.configPath, "plain", h.contextPath, "--verbose"}
+			},
+			"must be --explain",
+		},
+		{
+			"fifth argument rejected",
+			func(h *harness) []string {
+				return []string{"evaluate", h.configPath, "plain", h.contextPath, "--explain", "x"}
+			},
+			"expected 3 arguments",
+		},
+		{
+			"--explain in first position is a config path",
+			func(h *harness) []string {
+				return []string{"evaluate", "--explain", "plain", h.contextPath}
+			},
+			`cannot read config file "--explain"`,
+		},
+		{
+			"--explain in second position is the flag key",
+			func(h *harness) []string {
+				return []string{"evaluate", h.configPath, "--explain", h.contextPath}
+			},
+			`flag key "--explain" not found`,
+		},
+		{
+			"--explain in third position is the context path",
+			func(h *harness) []string {
+				return []string{"evaluate", h.configPath, "plain", "--explain"}
+			},
+			`cannot read context file "--explain"`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t, explainCLIConfig, goodCtx)
+			var stdout, stderr bytes.Buffer
+			code := run(tc.argv(h), &stdout, &stderr)
+			if code == 0 {
+				t.Fatalf("expected non-zero exit")
+			}
+			if stdout.Len() != 0 {
+				t.Fatalf("stdout must be empty on argument error: %q", stdout.String())
+			}
+			if !strings.Contains(stderr.String(), tc.wantSub) {
+				t.Fatalf("stderr=%q, want substring %q", stderr.String(), tc.wantSub)
+			}
+		})
+	}
+}
+
+func TestCLIEvaluateExplainValidationStillWhole(t *testing.T) {
+	// 带 --explain 也不能绕过整份配置/上下文校验：未选中/已关闭开关中的非法
+	// 内容、上下文非字符串值都要非零退出、stdout 为空。
+	cases := []struct {
+		name    string
+		config  string
+		key     string
+		context string
+		wantSub string
+	}{
+		{
+			"illegal disabled flag rule",
+			`{"flags":[
+				{"key":"good","enabled":true,"default":false,"rules":[]},
+				{"key":"off","enabled":false,"default":true,"rules":[
+					{"id":"r","value":true,"conditions":[]}]}]}`,
+			"good", `{}`, "conditions",
+		},
+		{
+			"context non-string",
+			explainCLIConfig, "plain", `{"plan":5}`, "context.plan",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t, tc.config, tc.context)
+			var stdout, stderr bytes.Buffer
+			if code := run(h.evalExplainArgs(tc.key), &stdout, &stderr); code == 0 {
+				t.Fatalf("expected non-zero exit")
+			}
+			if stdout.Len() != 0 {
+				t.Fatalf("stdout must be empty: %q", stdout.String())
+			}
+			if !strings.Contains(stderr.String(), tc.wantSub) {
+				t.Fatalf("stderr=%q want %q", stderr.String(), tc.wantSub)
+			}
+		})
+	}
+}
+
+func TestCLIEvaluateExplainHelp(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"help"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("help exit=%d", code)
+	}
+	h := stdout.String()
+	for _, frag := range []string{"[--explain]", "--explain", "explanation", "compareValue", "actualValue", "missing"} {
+		if !strings.Contains(h, frag) {
+			t.Errorf("help missing %q", frag)
+		}
+	}
+}

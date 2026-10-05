@@ -70,6 +70,44 @@ func (r EvalResult) Equals(other EvalResult) bool {
 	return true
 }
 
+// ConditionExplanation 记录单个条件在给定上下文上的判断：属性名、比较方式
+// （eq/in）、配置中的比较值、上下文实际值以及条件是否成立。属性缺失时
+// Missing 为 true 且 ActualValue 为 nil——与显式给出的空字符串
+// （ActualValue 指向 ""、Missing 为 false）明确区分。
+type ConditionExplanation struct {
+	Attribute    string `json:"attribute"`
+	Op           string `json:"op"`
+	CompareValue any    `json:"compareValue"`
+	// ActualValue 为上下文实际值；属性缺失时为 nil 并把 Missing 置为 true。
+	ActualValue *string `json:"actualValue"`
+	Missing     bool    `json:"missing"`
+	Match       bool    `json:"match"`
+}
+
+// RuleExplanation 记录一条被考虑过的规则：规则编号、是否整体命中以及它的
+// 全部条件逐条判断结果（即使规则在首个失败条件后已确定不命中，其余条件的
+// 判断也照样给出）。
+type RuleExplanation struct {
+	RuleID     string                 `json:"ruleId"`
+	Match      bool                   `json:"match"`
+	Conditions []ConditionExplanation `json:"conditions"`
+}
+
+// EvalExplanation 是解释模式附加在结果对象上的判断过程。Outcome 用一句话
+// 说明最终结果的依据；Rules 按配置顺序列出实际考虑过的规则，到第一条全部
+// 条件成立的规则为止（含该规则），开关关闭时为空列表。
+type EvalExplanation struct {
+	Outcome string            `json:"outcome"`
+	Rules   []RuleExplanation `json:"rules"`
+}
+
+// ExplainedResult 是解释模式的输出：四个既有字段与普通模式逐字一致，
+// 另带 explanation 判断记录。
+type ExplainedResult struct {
+	EvalResult
+	Explanation EvalExplanation `json:"explanation"`
+}
+
 // Context is a validated map of attribute names to string values.
 type Context struct {
 	values map[string]string
@@ -300,6 +338,105 @@ func (r *Rule) matches(ctx *Context) bool {
 	return true
 }
 
+// EvaluateExplain 与 Evaluate 采用完全相同的定案规则（关闭固定 false、
+// 首条全部条件成立的规则决定结果、否则取 default），并额外产出按配置顺序
+// 排列的判断记录：每条在定案前被考虑过的规则都给出 id、是否命中与全部条件
+// 的逐条判断；第一条命中的规则（即使返回 false）也计入并立即停止，其后的
+// 规则不出现。开关关闭时不评估任何规则，解释中的规则列表为空，结果依据只
+// 说明关闭导致固定 false。
+func (f *Flag) EvaluateExplain(ctx *Context) ExplainedResult {
+	if !f.Enabled {
+		return ExplainedResult{
+			EvalResult: EvalResult{Key: f.Key, Value: false, Reason: EvalDisabled, RuleID: nil},
+			Explanation: EvalExplanation{
+				Outcome: "flag is disabled; result is fixed to false without evaluating rules or the default",
+				Rules:   []RuleExplanation{},
+			},
+		}
+	}
+	considered := make([]RuleExplanation, 0, len(f.Rules))
+	for i := range f.Rules {
+		rule := &f.Rules[i]
+		re := rule.explain(ctx)
+		considered = append(considered, re)
+		if re.Match {
+			id := rule.ID
+			return ExplainedResult{
+				EvalResult: EvalResult{Key: f.Key, Value: rule.Value, Reason: EvalRule, RuleID: &id},
+				Explanation: EvalExplanation{
+					Outcome: fmt.Sprintf("first matching rule %q decides the result; later rules are not considered", rule.ID),
+					Rules:   considered,
+				},
+			}
+		}
+	}
+	return ExplainedResult{
+		EvalResult: EvalResult{Key: f.Key, Value: f.Default, Reason: EvalDefault, RuleID: nil},
+		Explanation: EvalExplanation{
+			Outcome: "no rule matched; the flag default is used",
+			Rules:   considered,
+		},
+	}
+}
+
+// explain 评估一条规则的全部条件并逐条记录判断结果；Match 为所有条件都
+// 成立。与 matches 不同，它不会在首个失败条件处短路，因此每个条件的属性、
+// 比较值、实际值与是否成立都能展示出来。
+func (r *Rule) explain(ctx *Context) RuleExplanation {
+	re := RuleExplanation{RuleID: r.ID, Match: true, Conditions: make([]ConditionExplanation, 0, len(r.Conditions))}
+	for i := range r.Conditions {
+		ce := r.Conditions[i].explain(ctx)
+		re.Conditions = append(re.Conditions, ce)
+		if !ce.Match {
+			re.Match = false
+		}
+	}
+	if len(re.Conditions) == 0 {
+		re.Match = false
+	}
+	return re
+}
+
+// explain 判断单个条件并记录属性名、比较方式、配置比较值、上下文实际值与
+// 是否成立。属性缺失用 Missing=true、ActualValue=nil 表示，绝不与显式
+// 空字符串（ActualValue 指向 ""）混淆。
+func (c Condition) explain(ctx *Context) ConditionExplanation {
+	ce := ConditionExplanation{Attribute: c.Attribute, Op: c.Op}
+	switch c.Op {
+	case "eq":
+		ce.CompareValue = c.strVal
+	case "in":
+		// 复制一份，避免外部切片与解释记录共享底层数组。
+		list := make([]string, len(c.inVal))
+		copy(list, c.inVal)
+		ce.CompareValue = list
+	default:
+		// 解析阶段已拒绝未知运算符，防御性处理。
+		ce.CompareValue = nil
+	}
+	v, present := ctx.Get(c.Attribute)
+	if !present {
+		ce.Missing = true
+		ce.Match = false
+		return ce
+	}
+	ce.ActualValue = &v
+	switch c.Op {
+	case "eq":
+		ce.Match = v == c.strVal
+	case "in":
+		for _, candidate := range c.inVal {
+			if v == candidate {
+				ce.Match = true
+				break
+			}
+		}
+	default:
+		ce.Match = false
+	}
+	return ce
+}
+
 func (c Condition) matches(ctx *Context) bool {
 	v, present := ctx.Get(c.Attribute)
 	if !present {
@@ -323,6 +460,20 @@ func (c Condition) matches(ctx *Context) bool {
 
 // MarshalResult renders the result as a single compact JSON object.
 func MarshalResult(r EvalResult) ([]byte, error) {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(r); err != nil {
+		return nil, err
+	}
+	return bytes.TrimRight(buf.Bytes(), "\n"), nil
+}
+
+// MarshalExplain renders an explained result as a single compact JSON object:
+// key/value/reason/ruleId 四个字段与 MarshalResult 逐字一致，其后追加
+// explanation 判断记录；列表中的空字符串、重复成员与次序原样保留，不裁剪
+// 空白、不合并大小写。
+func MarshalExplain(r ExplainedResult) ([]byte, error) {
 	var buf bytes.Buffer
 	enc := json.NewEncoder(&buf)
 	enc.SetEscapeHTML(false)

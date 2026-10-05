@@ -10,6 +10,7 @@
 go run ./cmd/payflow demo
 go run ./cmd/payflow version
 go run ./cmd/payflow evaluate config.json <flag-key> context.json
+go run ./cmd/payflow evaluate config.json <flag-key> context.json --explain
 go test ./...
 ```
 
@@ -130,6 +131,62 @@ go run ./cmd/payflow evaluate config.json new-checkout context-none.json
 ```
 
 两条规则都不命中时取开关的 `default`（这里为 `true`），`reason` 为 `default`、`ruleId` 为 `null`，与命中规则的输出（`reason` 为 `rule`、`ruleId` 为规则 id）明确区分。
+
+### 解释模式：`--explain`
+
+想知道结果究竟采用了哪条规则、或为什么落到默认值，可以在前三个参数之后再加第四个参数 `--explain`。它只在**第四个参数位置**被识别：
+
+```bash
+go run ./cmd/payflow evaluate config.json new-checkout context-missing.json --explain
+```
+
+成功时标准输出仍只有一个 JSON 对象：前四个字段 `key`/`value`/`reason`/`ruleId` 与不带选项时逐字一致，其后追加一个 `explanation` 对象。沿用上文缺少 `region` 的上下文（`{"platform":"ios","plan":"pro"}`）：
+
+```json
+{"key":"new-checkout","value":true,"reason":"rule","ruleId":"r-pro","explanation":{"outcome":"first matching rule \"r-pro\" decides the result; later rules are not considered","rules":[{"ruleId":"r-block-cn-mobile","match":false,"conditions":[{"attribute":"region","op":"eq","compareValue":"cn","actualValue":null,"missing":true,"match":false},{"attribute":"platform","op":"in","compareValue":["ios","android"],"actualValue":"ios","missing":false,"match":true}]},{"ruleId":"r-pro","match":true,"conditions":[{"attribute":"plan","op":"eq","compareValue":"pro","actualValue":"pro","missing":false,"match":true}]}]}}
+```
+
+`explanation` 的内容：
+
+- `outcome`：一句话说明最终结果的依据——由首条命中规则定案、没有规则命中而采用默认值、还是开关关闭固定返回 `false`。
+- `rules`：**按配置数组顺序**列出实际考虑过的规则，每条给出 `ruleId`、规则是否整体命中（`match`）以及该规则**全部条件**的逐条判断。即使规则已因前一个条件不成立而确定不命中，后面的条件也照样给出判断，不会只列到第一个失败条件。
+- 每个条件记录五要素：`attribute`（属性名）、`op`（比较方式 `eq`/`in`）、`compareValue`（配置中的比较值：eq 为字符串、in 为字符串数组）、`actualValue`（上下文实际值）、`missing`（属性是否缺失）与 `match`（该条件是否成立）。据此可以区分三种不成立：
+  - **属性缺失**：`missing` 为 `true`、`actualValue` 为 `null`；
+  - **值不相等**（eq）：`missing` 为 `false`、`actualValue` 是实际字符串但 `match` 为 `false`；
+  - **不在候选列表**（in）：`missing` 为 `false`、`actualValue` 有值但不等于 `compareValue` 列表中的任何成员。
+- 属性缺失与显式空字符串严格区分：上下文写 `"region":""` 时 `actualValue` 是 `""`、`missing` 为 `false`；只有完全没有这个属性时才是 `actualValue:null`、`missing:true`。
+- 所有字符串都按 JSON 解码后的内容展示：in 列表中的空字符串、重复成员与先后次序原样保留（如 `["","a","a"]`），不裁剪空白、不合并大小写。
+
+解释与最终结果严格对应：规则按配置次序逐条判断，**第一条全部条件成立的规则决定结果并立即停止**——即使它返回 `false`，其后的规则也不会出现在 `rules` 里；在它之前未命中的规则仍保留。上文 `r-block-cn-mobile` 返回 `false`，当上下文同时满足两条规则（`region=cn`、`platform=android`、`plan=pro`）时，解释里只有 `r-block-cn-mobile` 一条，且结果为 `false`：
+
+```json
+{"key":"new-checkout","value":false,"reason":"rule","ruleId":"r-block-cn-mobile","explanation":{"outcome":"first matching rule \"r-block-cn-mobile\" decides the result; later rules are not considered","rules":[{"ruleId":"r-block-cn-mobile","match":true,"conditions":[{"attribute":"region","op":"eq","compareValue":"cn","actualValue":"cn","missing":false,"match":true},{"attribute":"platform","op":"in","compareValue":["ios","android"],"actualValue":"android","missing":false,"match":true}]}]}}
+```
+
+所有规则都未命中时，`rules` 会列出这些规则及其条件判断，`reason` 为 `default`，`outcome` 说明采用了开关的默认值（上下文 `{"region":"us","platform":"web","plan":"free"}`）：
+
+```json
+{"key":"new-checkout","value":true,"reason":"default","ruleId":null,"explanation":{"outcome":"no rule matched; the flag default is used","rules":[{"ruleId":"r-block-cn-mobile","match":false,"conditions":[{"attribute":"region","op":"eq","compareValue":"cn","actualValue":"us","missing":false,"match":false},{"attribute":"platform","op":"in","compareValue":["ios","android"],"actualValue":"web","missing":false,"match":false}]},{"ruleId":"r-pro","match":false,"conditions":[{"attribute":"plan","op":"eq","compareValue":"pro","actualValue":"free","missing":false,"match":false}]}]}}
+```
+
+开关关闭时固定返回 `false`，解释只说明“关闭导致固定 `false`”，`rules` 为空列表——即使上下文本会命中某条规则，也不会把默认值或那条可能命中的规则写成结果依据。对上文的 `legacy-report` 求值：
+
+```bash
+go run ./cmd/payflow evaluate config.json legacy-report context.json --explain
+```
+
+```json
+{"key":"legacy-report","value":false,"reason":"disabled","ruleId":null,"explanation":{"outcome":"flag is disabled; result is fixed to false without evaluating rules or the default","rules":[]}}
+```
+
+规则列表为空的开关（`"rules":[]`）返回默认结果，解释中的 `rules` 同样为空数组。
+
+参数规则：
+
+- 只有 `evaluate <config.json> <flag-key> <context.json>` 三个参数时是普通模式，输出仍是既有的四字段 JSON 对象，不含 `explanation`。
+- `--explain` 只在第四个参数位置生效；第四个参数写成其他任何内容（如 `--verbose`）、或给出第五个参数，都作为参数错误以非零状态退出，标准输出为空，原因写入标准错误。
+- 前三个参数位置中出现字面文本 `--explain` 时，仍分别按配置路径、开关键、上下文路径处理，不会被误当成选项——例如把开关键就命名为 `--explain` 时，会按该字面键去配置中查找（找不到则报未找到）。
+- 带不带 `--explain` 都先完整校验整份配置与上下文（含未选中或已关闭的开关）；任何参数、文件或校验失败都非零退出、标准输出为空、原因写入标准错误，不会输出半份解释。
 
 ### 关闭的开关与配置校验
 
