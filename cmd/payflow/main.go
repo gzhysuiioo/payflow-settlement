@@ -76,8 +76,17 @@ func usage(w io.Writer) {
 }
 
 // initRequest 是 init 的输入：{"balances":[...]}。
+// Balance 用指针解析：缺省或写成 null 与显式写 0 必须区分——前者是漏填，
+// 整次初始化按 invalid_parameter 拒绝；后者是用户有意设置的合法零余额。
+// 字符串、小数、布尔值与超出 int64 范围的数值仍在 JSON 解码阶段被拒绝。
 type initRequest struct {
-	Balances []payflow.BalanceInit `json:"balances"`
+	Balances []initBalance `json:"balances"`
+}
+
+type initBalance struct {
+	Account string `json:"account"`
+	Asset   string `json:"asset"`
+	Balance *int64 `json:"balance"`
 }
 
 type errorEnvelope struct {
@@ -171,7 +180,19 @@ func cmdInit(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	if err := requireEOF(dec, "init"); err != nil {
 		return failEnvelope(stderr, payflow.ErrInvalid, err.Error())
 	}
-	if err := payflow.CreateLedger(*ledgerPath, req.Balances); err != nil {
+	// 逐条确认 balance 被明确提供：缺省或 null 都按漏填拒绝整次初始化，
+	// 不创建账本；显式 0 是合法零余额，正整数（含 int64 上限）按原值保存。
+	// 全部条目通过后才调用 CreateLedger，前面的合法条目不会被单独保存。
+	balances := make([]payflow.BalanceInit, len(req.Balances))
+	for i, b := range req.Balances {
+		if b.Balance == nil {
+			return failEnvelope(stderr, payflow.ErrInvalid, fmt.Sprintf(
+				"initial balance %d (%s/%s): balance must be explicitly provided as a non-negative int64 (missing or null; use \"balance\":0 for an intentional zero balance)",
+				i, b.Account, b.Asset))
+		}
+		balances[i] = payflow.BalanceInit{Account: b.Account, Asset: b.Asset, Balance: *b.Balance}
+	}
+	if err := payflow.CreateLedger(*ledgerPath, balances); err != nil {
 		return failWithError(stderr, err)
 	}
 	writeJSON(stdout, map[string]any{
