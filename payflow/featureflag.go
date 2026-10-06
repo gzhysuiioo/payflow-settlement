@@ -312,95 +312,111 @@ func (c *Config) Find(key string) *Flag {
 }
 
 // Evaluate deterministically evaluates a flag against a context.
-// 未启用固定 false（reason=disabled），不使用默认值或规则；启用后取首条
-// 所有条件均成立的规则的 value；无匹配取 default。求值不依赖时间、随机数
-// 或 map 遍历顺序，同一配置与上下文重复求值结果一致。
+// 它与 EvaluateExplain 共用同一个定案函数 decide：普通模式只取四字段结果，
+// 不产出判断记录；因此两种模式对“条件是否成立、哪条规则决定结果、关闭与默认
+// 分支”的判断永远一致，不需要在两处分别维护。
 func (f *Flag) Evaluate(ctx *Context) EvalResult {
+	result, _ := f.decide(ctx, false)
+	return result
+}
+
+// decide 是开关求值唯一的定案实现，普通模式与解释模式都调用它：
+// 未启用固定 false（reason=disabled），不使用默认值或规则；启用后按配置顺序
+// 逐条评估规则，第一条所有条件均成立的规则立即以其 value 定案——即使它返回
+// false，也不能被后面返回 true 的规则或默认值覆盖；没有规则命中时取 default。
+// trace 为 false 时只返回结果（普通模式）；为 true 时另外按配置顺序收集定案前
+// 考虑过的规则（包含最终命中的那条，其后的规则不出现；没有规则命中时包含全部
+// 规则），供解释模式直接展示。求值不依赖时间、随机数或 map 遍历顺序，同一配置
+// 与上下文重复求值结果一致。
+func (f *Flag) decide(ctx *Context, trace bool) (EvalResult, []RuleExplanation) {
+	result := EvalResult{Key: f.Key}
 	if !f.Enabled {
-		return EvalResult{Key: f.Key, Value: false, Reason: EvalDisabled, RuleID: nil}
+		result.Value = false
+		result.Reason = EvalDisabled
+		return result, []RuleExplanation{}
+	}
+	var considered []RuleExplanation
+	if trace {
+		considered = make([]RuleExplanation, 0, len(f.Rules))
 	}
 	for i := range f.Rules {
 		rule := &f.Rules[i]
-		if rule.matches(ctx) {
+		// 同一次规则判断同时给出命中结论与逐条条件记录：结果与解释不可能分歧。
+		matched, re := rule.evaluateRule(ctx)
+		if trace {
+			considered = append(considered, re)
+		}
+		if matched {
 			id := rule.ID
-			return EvalResult{Key: f.Key, Value: rule.Value, Reason: EvalRule, RuleID: &id}
+			result.Value = rule.Value
+			result.Reason = EvalRule
+			result.RuleID = &id
+			return result, considered
 		}
 	}
-	return EvalResult{Key: f.Key, Value: f.Default, Reason: EvalDefault, RuleID: nil}
+	result.Value = f.Default
+	result.Reason = EvalDefault
+	return result, considered
 }
 
-func (r *Rule) matches(ctx *Context) bool {
-	for i := range r.Conditions {
-		if !r.Conditions[i].matches(ctx) {
-			return false
-		}
-	}
-	return true
-}
-
-// EvaluateExplain 与 Evaluate 采用完全相同的定案规则（关闭固定 false、
-// 首条全部条件成立的规则决定结果、否则取 default），并额外产出按配置顺序
-// 排列的判断记录：每条在定案前被考虑过的规则都给出 id、是否命中与全部条件
-// 的逐条判断；第一条命中的规则（即使返回 false）也计入并立即停止，其后的
-// 规则不出现。开关关闭时不评估任何规则，解释中的规则列表为空，结果依据只
-// 说明关闭导致固定 false。
+// EvaluateExplain 与 Evaluate 采用完全相同的定案规则——两者都只调用 decide，
+// 这里仅把 decide 收集到的判断记录连同同一份结果一起返回：关闭固定 false、
+// 首条全部条件成立的规则决定结果（即使返回 false）、否则取 default。记录按
+// 配置顺序列出每条在定案前被考虑过的规则（id、是否命中与全部条件的逐条判断），
+// 到第一条命中的规则为止并包含它，其后的规则不出现；没有规则命中时列出全部
+// 规则。开关关闭时不评估任何规则，规则列表为空，结果依据只说明关闭导致
+// 固定 false。
 func (f *Flag) EvaluateExplain(ctx *Context) ExplainedResult {
-	if !f.Enabled {
-		return ExplainedResult{
-			EvalResult: EvalResult{Key: f.Key, Value: false, Reason: EvalDisabled, RuleID: nil},
-			Explanation: EvalExplanation{
-				Outcome: "flag is disabled; result is fixed to false without evaluating rules or the default",
-				Rules:   []RuleExplanation{},
-			},
+	result, considered := f.decide(ctx, true)
+	er := ExplainedResult{EvalResult: result}
+	switch result.Reason {
+	case EvalDisabled:
+		er.Explanation = EvalExplanation{
+			Outcome: "flag is disabled; result is fixed to false without evaluating rules or the default",
+			Rules:   considered,
 		}
-	}
-	considered := make([]RuleExplanation, 0, len(f.Rules))
-	for i := range f.Rules {
-		rule := &f.Rules[i]
-		re := rule.explain(ctx)
-		considered = append(considered, re)
-		if re.Match {
-			id := rule.ID
-			return ExplainedResult{
-				EvalResult: EvalResult{Key: f.Key, Value: rule.Value, Reason: EvalRule, RuleID: &id},
-				Explanation: EvalExplanation{
-					Outcome: fmt.Sprintf("first matching rule %q decides the result; later rules are not considered", rule.ID),
-					Rules:   considered,
-				},
-			}
+	case EvalRule:
+		er.Explanation = EvalExplanation{
+			Outcome: fmt.Sprintf("first matching rule %q decides the result; later rules are not considered", *result.RuleID),
+			Rules:   considered,
 		}
-	}
-	return ExplainedResult{
-		EvalResult: EvalResult{Key: f.Key, Value: f.Default, Reason: EvalDefault, RuleID: nil},
-		Explanation: EvalExplanation{
+	default: // EvalDefault
+		er.Explanation = EvalExplanation{
 			Outcome: "no rule matched; the flag default is used",
 			Rules:   considered,
-		},
+		}
 	}
+	return er
 }
 
-// explain 评估一条规则的全部条件并逐条记录判断结果；Match 为所有条件都
-// 成立。与 matches 不同，它不会在首个失败条件处短路，因此每个条件的属性、
-// 比较值、实际值与是否成立都能展示出来。
-func (r *Rule) explain(ctx *Context) RuleExplanation {
+// evaluateRule 对一条规则做唯一的一次判断，同时给出两种产物：matched 是规则
+// 是否整体命中（供定案使用），RuleExplanation 是同一次判断的逐条记录（供解释
+// 使用）。全部条件都会判断，不在首个失败条件处短路——规则只有所有条件都成立
+// 才算命中，而解释需要展示每个条件的属性、比较值、实际值与是否成立；规则要求
+// 至少一个条件，配置解析时已保证，但这里仍以“无条件即不命中”作为防御性兜底，
+// 使 matched 与记录的 Match 始终来自同一处判断。
+func (r *Rule) evaluateRule(ctx *Context) (bool, RuleExplanation) {
 	re := RuleExplanation{RuleID: r.ID, Match: true, Conditions: make([]ConditionExplanation, 0, len(r.Conditions))}
 	for i := range r.Conditions {
-		ce := r.Conditions[i].explain(ctx)
+		matched, ce := r.Conditions[i].evaluateCondition(ctx)
 		re.Conditions = append(re.Conditions, ce)
-		if !ce.Match {
+		if !matched {
 			re.Match = false
 		}
 	}
 	if len(re.Conditions) == 0 {
 		re.Match = false
 	}
-	return re
+	return re.Match, re
 }
 
-// explain 判断单个条件并记录属性名、比较方式、配置比较值、上下文实际值与
-// 是否成立。属性缺失用 Missing=true、ActualValue=nil 表示，绝不与显式
-// 空字符串（ActualValue 指向 ""）混淆。
-func (c Condition) explain(ctx *Context) ConditionExplanation {
+// evaluateCondition 对单个条件做唯一的一次判断，返回该条件是否成立以及同一次
+// 判断的完整记录：属性名、比较方式、配置比较值、上下文实际值。属性缺失用
+// Missing=true、ActualValue=nil 表示，绝不与显式空字符串（ActualValue 指向 ""、
+// Missing=false）混淆。eq 与 in 都按解码后的字符串精确比较：不裁剪空白、不合并
+// 大小写或组合字符；in 的比较列表保留空字符串、重复成员与原有顺序。普通模式与
+// 解释模式都只调用这里，故解释里展示的成立与否就是定案时实际采用的判断。
+func (c Condition) evaluateCondition(ctx *Context) (bool, ConditionExplanation) {
 	ce := ConditionExplanation{Attribute: c.Attribute, Op: c.Op}
 	switch c.Op {
 	case "eq":
@@ -416,9 +432,10 @@ func (c Condition) explain(ctx *Context) ConditionExplanation {
 	}
 	v, present := ctx.Get(c.Attribute)
 	if !present {
+		// ce.Missing 必须显式置 true：结构体零值是 false，缺失误标成存在会
+		// 同时改变解释记录与（借由同一 Match 结论的）定案。
 		ce.Missing = true
-		ce.Match = false
-		return ce
+		return false, ce
 	}
 	ce.ActualValue = &v
 	switch c.Op {
@@ -434,28 +451,7 @@ func (c Condition) explain(ctx *Context) ConditionExplanation {
 	default:
 		ce.Match = false
 	}
-	return ce
-}
-
-func (c Condition) matches(ctx *Context) bool {
-	v, present := ctx.Get(c.Attribute)
-	if !present {
-		return false
-	}
-	switch c.Op {
-	case "eq":
-		return v == c.strVal
-	case "in":
-		for _, candidate := range c.inVal {
-			if v == candidate {
-				return true
-			}
-		}
-		return false
-	default:
-		// 解析阶段已拒绝未知运算符，防御性处理。
-		return false
-	}
+	return ce.Match, ce
 }
 
 // MarshalResult renders the result as a single compact JSON object.
