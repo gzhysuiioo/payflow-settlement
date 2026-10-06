@@ -311,19 +311,49 @@ func (c *Config) Find(key string) *Flag {
 	return nil
 }
 
-// evaluate 是普通模式与解释模式共同维护的唯一定案路径：关闭固定 false
+// decide 是普通模式与解释模式共同维护的唯一定案路径：关闭固定 false
 // （reason=disabled），不使用默认值或规则；启用后取首条所有条件均成立的规则的
 // value（即使它返回 false 也立即定案，后续规则不再考虑）；无匹配取 default。
-// 求值不依赖时间、随机数或 map 遍历顺序。定案所依据的逐条条件判断与规则遍历过程
-// 一并记录在返回值中，普通模式只取其中的结果字段，解释模式额外展示判断记录，
-// 因此两种模式对同一份配置与上下文不可能给出不同判断。
-func (f *Flag) evaluate(ctx *Context) evaluation {
+// 求值不依赖时间、随机数或 map 遍历顺序。它只准备最终结果所需的信息：逐条规则
+// 遍历时仅复用 Condition.matches 的布尔判断，不整理条件详情、不复制 in 候选列表，
+// 因此普通模式的额外内存开销与候选列表长度无关。解释记录由 explain 沿同一规则
+// 次序另行构建，判断谓词只有 matches 一处，两种模式对同一份配置与上下文不可能
+// 给出不同判断。
+func (f *Flag) decide(ctx *Context) EvalResult {
+	if !f.Enabled {
+		return EvalResult{Key: f.Key, Value: false, Reason: EvalDisabled, RuleID: nil}
+	}
+	for i := range f.Rules {
+		rule := &f.Rules[i]
+		if rule.matches(ctx) {
+			id := rule.ID
+			return EvalResult{Key: f.Key, Value: rule.Value, Reason: EvalRule, RuleID: &id}
+		}
+	}
+	return EvalResult{Key: f.Key, Value: f.Default, Reason: EvalDefault, RuleID: nil}
+}
+
+// Evaluate deterministically evaluates a flag against a context；定案规则与规则
+// 优先级统一由 decide 维护，本入口只返回四字段结果，不产生任何解释记录开销。
+func (f *Flag) Evaluate(ctx *Context) EvalResult {
+	return f.decide(ctx)
+}
+
+// EvaluateExplain 与 Evaluate 走同一条 decide 定案路径（关闭固定 false、
+// 首条全部条件成立的规则决定结果、否则取 default），并额外沿同一规则次序构建
+// 判断记录作为 explanation：每条在定案前被考虑过的规则都给出 id、是否命中与
+// 全部条件的逐条判断；第一条命中的规则（即使返回 false）也计入并立即停止，其后
+// 的规则不出现。开关关闭时不评估任何规则，解释中的规则列表为空，结果依据只
+// 说明关闭导致固定 false。
+func (f *Flag) EvaluateExplain(ctx *Context) ExplainedResult {
 	result := EvalResult{Key: f.Key}
 	if !f.Enabled {
-		return evaluation{
-			result:  EvalResult{Key: f.Key, Value: false, Reason: EvalDisabled, RuleID: nil},
-			outcome: "flag is disabled; result is fixed to false without evaluating rules or the default",
-			rules:   []RuleExplanation{},
+		return ExplainedResult{
+			EvalResult: EvalResult{Key: f.Key, Value: false, Reason: EvalDisabled, RuleID: nil},
+			Explanation: EvalExplanation{
+				Outcome: "flag is disabled; result is fixed to false without evaluating rules or the default",
+				Rules:   []RuleExplanation{},
+			},
 		}
 	}
 	// considered 按配置顺序收集定案前实际考虑过的规则，到第一条全部条件成立的
@@ -331,82 +361,103 @@ func (f *Flag) evaluate(ctx *Context) evaluation {
 	considered := make([]RuleExplanation, 0, len(f.Rules))
 	for i := range f.Rules {
 		rule := &f.Rules[i]
-		re := rule.evaluate(ctx)
+		re := rule.explain(ctx)
 		considered = append(considered, re)
 		if re.Match {
 			id := rule.ID
 			result = EvalResult{Key: f.Key, Value: rule.Value, Reason: EvalRule, RuleID: &id}
-			return evaluation{
-				result:  result,
-				outcome: fmt.Sprintf("first matching rule %q decides the result; later rules are not considered", rule.ID),
-				rules:   considered,
+			return ExplainedResult{
+				EvalResult: result,
+				Explanation: EvalExplanation{
+					Outcome: fmt.Sprintf("first matching rule %q decides the result; later rules are not considered", rule.ID),
+					Rules:   considered,
+				},
 			}
 		}
 	}
 	result = EvalResult{Key: f.Key, Value: f.Default, Reason: EvalDefault, RuleID: nil}
-	return evaluation{
-		result:  result,
-		outcome: "no rule matched; the flag default is used",
-		rules:   considered,
-	}
-}
-
-// evaluation 是一次求值的完整记录：定案的四字段结果、一句话依据以及按配置顺序
-// 考虑过的规则判断记录。普通模式只用 Result；解释模式三者都输出。
-type evaluation struct {
-	result  EvalResult
-	outcome string
-	rules   []RuleExplanation
-}
-
-// Evaluate deterministically evaluates a flag against a context；定案规则与判断
-// 细节统一由 evaluate 维护，本入口只返回四字段结果。
-func (f *Flag) Evaluate(ctx *Context) EvalResult {
-	return f.evaluate(ctx).result
-}
-
-// EvaluateExplain 与 Evaluate 走同一条 evaluate 定案路径（关闭固定 false、
-// 首条全部条件成立的规则决定结果、否则取 default），并额外把该路径产出的判断
-// 记录作为 explanation：每条在定案前被考虑过的规则都给出 id、是否命中与全部
-// 条件的逐条判断；第一条命中的规则（即使返回 false）也计入并立即停止，其后的
-// 规则不出现。开关关闭时不评估任何规则，解释中的规则列表为空，结果依据只
-// 说明关闭导致固定 false。
-func (f *Flag) EvaluateExplain(ctx *Context) ExplainedResult {
-	e := f.evaluate(ctx)
 	return ExplainedResult{
-		EvalResult: e.result,
+		EvalResult: result,
 		Explanation: EvalExplanation{
-			Outcome: e.outcome,
-			Rules:   e.rules,
+			Outcome: "no rule matched; the flag default is used",
+			Rules:   considered,
 		},
 	}
 }
 
-// evaluate 判断一条规则的全部条件并逐条记录判断结果；Match 为所有条件都
-// 成立。它不会在首个失败条件处短路，因此每个条件的属性、比较值、实际值与
-// 是否成立都能展示出来，规则整体的命中判断与条件逐条判断共用这一份结果。
-func (r *Rule) evaluate(ctx *Context) RuleExplanation {
+// matches 判断一条规则的全部条件是否都成立；普通定案路径只调用它，不做任何
+// 解释性分配。是否命中与解释模式共用各 Condition.matches 的同一份判断。
+func (r *Rule) matches(ctx *Context) bool {
+	if len(r.Conditions) == 0 {
+		// 解析阶段已要求规则至少含一个条件，这里只是防御性处理，避免无条件的
+		// 规则被当成命中。
+		return false
+	}
+	for i := range r.Conditions {
+		if !r.Conditions[i].matches(ctx) {
+			return false
+		}
+	}
+	return true
+}
+
+// explain 构建一条规则的解释记录：逐条条件给出判断，Match 为所有条件都成立。
+// 它只在解释模式被调用，不会在首个失败条件处短路，因此每个条件的属性、比较值、
+// 实际值与是否成立都能展示出来；条件的成立与否仍取自与普通模式相同的
+// Condition.matches，两种模式不各维护一套比较逻辑。
+func (r *Rule) explain(ctx *Context) RuleExplanation {
 	re := RuleExplanation{RuleID: r.ID, Match: true, Conditions: make([]ConditionExplanation, 0, len(r.Conditions))}
 	for i := range r.Conditions {
-		ce := r.Conditions[i].evaluate(ctx)
+		ce := r.Conditions[i].explain(ctx)
 		re.Conditions = append(re.Conditions, ce)
 		if !ce.Match {
 			re.Match = false
 		}
 	}
 	if len(re.Conditions) == 0 {
-		// 解析阶段已要求规则至少含一个条件，这里只是防御性处理，避免无条件的
-		// 规则被当成命中。
+		// 与 matches 的防御性处理保持一致：无条件规则不命中。
 		re.Match = false
 	}
 	return re
 }
 
-// evaluate 判断单个条件并记录属性名、比较方式、配置比较值、上下文实际值与
-// 是否成立；规则与开关各层级的“条件是否成立”都以这里的 Match 为准，普通模式
-// 与解释模式不再各算一遍。属性缺失用 Missing=true、ActualValue=nil 表示，
-// 绝不与显式空字符串（ActualValue 指向 ""）混淆。
-func (c Condition) evaluate(ctx *Context) ConditionExplanation {
+// matches 判断单个条件在给定上下文中是否成立，是普通定案与解释记录共同维护的
+// 唯一比较入口：从上下文取一次属性值后交给 holds 判定。它只返回布尔结果，不
+// 复制候选列表，开销不随候选数量增长。
+func (c Condition) matches(ctx *Context) bool {
+	v, present := ctx.Get(c.Attribute)
+	return c.holds(v, present)
+}
+
+// holds 是 eq/in 比较的唯一实现处，普通定案与解释构建都复用它：属性缺失即不
+// 成立；eq 按字符串精确相等；in 按候选列表逐项精确比较，命中即止。属性缺失与
+// 显式空字符串在这里天然区分：缺失时 present 为 false，显式 "" 则以空串参与比较。
+func (c Condition) holds(v string, present bool) bool {
+	if !present {
+		return false
+	}
+	switch c.Op {
+	case "eq":
+		return v == c.strVal
+	case "in":
+		for _, candidate := range c.inVal {
+			if v == candidate {
+				return true
+			}
+		}
+		return false
+	default:
+		// 解析阶段已拒绝未知运算符，防御性处理。
+		return false
+	}
+}
+
+// explain 在 matches/holds 的同一判断之上补齐展示用详情：属性名、比较方式、
+// 配置比较值、上下文实际值以及条件是否成立。仅解释模式调用：in 的比较值在此
+// 复制一份，使调用方改写解释记录中的候选列表不会回流到配置；实际值取上下文
+// 字符串的副本指针，改写它也不影响上下文或另一份记录。属性缺失用 Missing=true、
+// ActualValue=nil 表示，绝不与显式空字符串（ActualValue 指向 ""）混淆。
+func (c Condition) explain(ctx *Context) ConditionExplanation {
 	ce := ConditionExplanation{Attribute: c.Attribute, Op: c.Op}
 	switch c.Op {
 	case "eq":
@@ -421,25 +472,14 @@ func (c Condition) evaluate(ctx *Context) ConditionExplanation {
 		ce.CompareValue = nil
 	}
 	v, present := ctx.Get(c.Attribute)
+	// 命中判断复用与普通模式相同的 holds，不再各写一份比较。
+	ce.Match = c.holds(v, present)
 	if !present {
 		ce.Missing = true
-		ce.Match = false
 		return ce
 	}
-	ce.ActualValue = &v
-	switch c.Op {
-	case "eq":
-		ce.Match = v == c.strVal
-	case "in":
-		for _, candidate := range c.inVal {
-			if v == candidate {
-				ce.Match = true
-				break
-			}
-		}
-	default:
-		ce.Match = false
-	}
+	actual := v
+	ce.ActualValue = &actual
 	return ce
 }
 
