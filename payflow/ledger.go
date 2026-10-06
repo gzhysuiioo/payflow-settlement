@@ -677,7 +677,7 @@ func (l *Ledger) Submit(batch FeeBatch) (*BatchResult, error) {
 	l.reg.mu.Lock()
 	defer l.reg.mu.Unlock()
 
-	results := runBatch(batch, limits, l.reg.state, l.persistCharge)
+	results := runBatch(batch, limits, l.reg.state, l.persistEffect)
 	return &BatchResult{Results: results}, nil
 }
 
@@ -712,7 +712,7 @@ func (l *Ledger) Preview(batch FeeBatch) (*PreviewResult, error) {
 
 	// 在快照副本上模拟：预览结束后真实状态与磁盘文件保持原样。
 	sim := cloneState(l.reg.state)
-	results := runBatch(batch, limits, sim, simulateCharge)
+	results := runBatch(batch, limits, sim, simulateEffect)
 	return &PreviewResult{DryRun: true, Results: results}, nil
 }
 
@@ -726,27 +726,63 @@ func validateBatch(batch FeeBatch) (map[balanceKey]int64, error) {
 	return validateLimits(batch.Limits)
 }
 
-// chargeEffect 是一笔预计成功扣款的全部账本效果：扣哪个组合、扣多少、
-// 留下什么结算记录。它由付款规则产生，本身尚未生效；是否生效、如何生效
-// （真实落盘或预览模拟）由生效策略决定。
-type chargeEffect struct {
-	key    balanceKey
-	total  int64
-	record Record
+// ledgerEffect 是一笔预计成功落账（付款扣款或退款退回）的全部账本效果：
+// 变动哪个组合、余额增减多少、向哪一类成功历史追加什么记录。delta 为正
+// 表示增加余额（退款），为负表示减少余额（付款扣款）。它由各自的业务规则
+// 产生，本身尚未生效；是否生效、如何生效（真实落盘或预览模拟）由生效策略
+// 决定。付款与退款共用这一个效果结构，因此“改余额 + 追加成功记录 +
+// 保存失败恢复原状”的落账步骤只需在 applyEffect 一处维护。
+type ledgerEffect struct {
+	key      balanceKey
+	delta    int64
+	settling *Record       // 付款成功时追加到结算历史；退款时为 nil
+	refund   *RefundRecord // 退款成功时追加到退款历史；付款时为 nil
 }
 
-// commitCharge 是扣款生效策略：把一笔预计成功的扣款应用到状态 st 上。
+// applyEffect 把一笔预计成功的落账效果应用到状态 st：余额变动与对应成功
+// 记录在同一步完成，查询不会看到只有余额变化而没有记录的状态。返回回滚
+// 函数，恢复该项执行前的余额与对应历史长度（只撤销该项自己的变化，
+// 不动另一类历史、不动之前已成功的记录）。付款与退款的落账与回滚都走
+// 这一个出口。
+func applyEffect(st *ledgerState, eff ledgerEffect) func() {
+	oldBal, hadKey := st.Balances[eff.key]
+	st.Balances[eff.key] = oldBal + eff.delta
+
+	var oldSettlements, oldRefunds int
+	if eff.settling != nil {
+		oldSettlements = len(st.Settlements)
+		st.Settlements = append(st.Settlements, *eff.settling)
+	} else {
+		oldRefunds = len(st.Refunds)
+		st.Refunds = append(st.Refunds, *eff.refund)
+	}
+
+	return func() {
+		if hadKey {
+			st.Balances[eff.key] = oldBal
+		} else {
+			delete(st.Balances, eff.key)
+		}
+		if eff.settling != nil {
+			st.Settlements = st.Settlements[:oldSettlements]
+		} else {
+			st.Refunds = st.Refunds[:oldRefunds]
+		}
+	}
+}
+
+// commitEffect 是落账生效策略：把一笔预计成功的效果应用到状态 st 上。
 // 返回 nil 表示已生效；返回非 nil 表示保存失败，且 st 必须已恢复到
 // 该项执行之前的余额与历史。
-type commitCharge func(st *ledgerState, eff chargeEffect) error
+type commitEffect func(st *ledgerState, eff ledgerEffect) error
 
 // runBatch 按输入顺序在给定状态 st 上处理整个批次，返回逐项结果。
-// 付款规则（judgeIntent）与扣款生效（commit）分离：规则只读取 st 与
-// 本批次已用额度给出判定和预计扣款效果，不改动任何状态；生效策略决定
+// 付款规则（judgeIntent）与落账生效（commit）分离：规则只读取 st 与
+// 本批次已用额度给出判定和预计落账效果，不改动任何状态；生效策略决定
 // 效果如何落地——真实提交先改内存再原子落盘、失败回滚并报告
 // storage_error，预览只在副本上推进内存状态、绝不落盘。两种操作共用
 // 同一份规则，因此逐项判定完全一致。调用方必须持有 reg.mu。
-func runBatch(batch FeeBatch, limits map[balanceKey]int64, st *ledgerState, commit commitCharge) []ItemResult {
+func runBatch(batch FeeBatch, limits map[balanceKey]int64, st *ledgerState, commit commitEffect) []ItemResult {
 	out := make([]ItemResult, 0, len(batch.Intents))
 
 	// 本次批次内各组合已消耗的额度，从零开始，仅成功生效的扣款计入。
@@ -756,15 +792,15 @@ func runBatch(batch FeeBatch, limits map[balanceKey]int64, st *ledgerState, comm
 		it := &batch.Intents[i]
 
 		// 1. 规则判定：纯读取，不产生任何副作用。
-		res, charge := judgeIntent(it, batch.FeeBps, limits, used, st)
-		if charge == nil {
+		res, eff := judgeIntent(it, batch.FeeBps, limits, used, st)
+		if eff == nil {
 			out = append(out, res)
 			continue
 		}
 
 		// 2. 生效：保存失败时 commit 已回滚该项（余额与历史恢复原样），
 		//    该项报告 storage_error，不留记录、不占额度，后项继续处理。
-		if err := commit(st, *charge); err != nil {
+		if err := commit(st, *eff); err != nil {
 			res.Status = StatusStorage
 			res.Reason = err.Error()
 			out = append(out, res)
@@ -772,8 +808,8 @@ func runBatch(batch FeeBatch, limits map[balanceKey]int64, st *ledgerState, comm
 		}
 
 		// 3. 只有成功生效的扣款才消耗本批次额度（预览同样如此）。
-		used[charge.key] += charge.total
-		cp := charge.record
+		used[eff.key] += -eff.delta
+		cp := *eff.settling
 		res.Status = StatusSettled
 		res.Record = &cp
 		out = append(out, res)
@@ -782,10 +818,10 @@ func runBatch(batch FeeBatch, limits map[balanceKey]int64, st *ledgerState, comm
 }
 
 // judgeIntent 按付款规则评估一项请求，只读取状态与额度用量，不产生副作用。
-// 返回逐项结果；预计成功时结果只填编号，扣款效果以 chargeEffect 描述，
+// 返回逐项结果；预计成功时结果只填编号，落账效果以 ledgerEffect 描述，
 // 由调用方交给生效策略落地。判定顺序即对外约定：参数校验、已成功编号的
 // 重复/冲突、状态、溢出、本批次限额（先于余额）、余额。
-func judgeIntent(it *PaymentIntent, feeBps int, limits map[balanceKey]int64, used map[balanceKey]int64, st *ledgerState) (ItemResult, *chargeEffect) {
+func judgeIntent(it *PaymentIntent, feeBps int, limits map[balanceKey]int64, used map[balanceKey]int64, st *ledgerState) (ItemResult, *ledgerEffect) {
 	res := ItemResult{ID: it.ID}
 
 	// 1. 参数校验。未通过的编号不占用去重资格。
@@ -848,37 +884,39 @@ func judgeIntent(it *PaymentIntent, feeBps int, limits map[balanceKey]int64, use
 		return res, nil
 	}
 
-	// 7. 预计成功：描述扣款效果（序号按当前历史长度连续递增）。
-	return res, &chargeEffect{
-		key:   key,
-		total: total,
-		record: Record{
-			ID:        it.ID,
-			Account:   it.Account,
-			Paymaster: it.Paymaster,
-			Asset:     it.Asset,
-			Amount:    amount,
-			Nonce:     it.Nonce,
-			FeeBps:    feeBps,
-			Fee:       fee,
-			Charged:   total,
-			Seq:       int64(len(st.Settlements)) + 1,
-		},
+	// 7. 预计成功：描述落账效果（余额扣减总额、序号按当前结算历史长度
+	//    连续递增）。
+	rec := Record{
+		ID:        it.ID,
+		Account:   it.Account,
+		Paymaster: it.Paymaster,
+		Asset:     it.Asset,
+		Amount:    amount,
+		Nonce:     it.Nonce,
+		FeeBps:    feeBps,
+		Fee:       fee,
+		Charged:   total,
+		Seq:       int64(len(st.Settlements)) + 1,
+	}
+	return res, &ledgerEffect{
+		key:      key,
+		delta:    -total,
+		settling: &rec,
 	}
 }
 
-// simulateCharge 是预览的生效策略：只在（副本）状态上推进余额与历史，
-// 绝不触碰磁盘，因此不会失败，预览结果中也不会出现 storage_error。
-func simulateCharge(st *ledgerState, eff chargeEffect) error {
-	st.Balances[eff.key] -= eff.total
-	st.Settlements = append(st.Settlements, eff.record)
+// simulateEffect 是预览的生效策略：只在（副本）状态上推进余额与对应
+// 历史，绝不触碰磁盘，因此不会失败，预览结果中也不会出现 storage_error。
+func simulateEffect(st *ledgerState, eff ledgerEffect) error {
+	applyEffect(st, eff)
 	return nil
 }
 
-// persistCharge 是真实提交的生效策略：先在内存生效，再原子落盘；
-// 落盘失败回滚该项（恢复余额与历史），并返回存储错误。
-func (l *Ledger) persistCharge(st *ledgerState, eff chargeEffect) error {
-	rollback := stageOn(st, eff.key, st.Balances[eff.key]-eff.total, eff.record)
+// persistEffect 是真实落账（付款与退款共用）的生效策略：先在内存生效
+// （余额变动与成功记录同一步完成），再原子落盘；落盘失败回滚该项
+// （applyEffect 返回的回滚恢复余额与对应历史），并返回存储错误。
+func (l *Ledger) persistEffect(st *ledgerState, eff ledgerEffect) error {
+	rollback := applyEffect(st, eff)
 	if err := l.persistLocked(); err != nil {
 		rollback()
 		return err
@@ -915,23 +953,6 @@ func findRecordIn(records []Record, id string) (Record, bool) {
 	return Record{}, false
 }
 
-// stageOn 在指定状态上应用一笔扣款与记录，返回回滚函数（恢复该项执行前的
-// 余额与记录长度）。
-func stageOn(st *ledgerState, key balanceKey, newBal int64, rec Record) func() {
-	oldBal, hadKey := st.Balances[key]
-	oldLen := len(st.Settlements)
-	st.Balances[key] = newBal
-	st.Settlements = append(st.Settlements, rec)
-	return func() {
-		if hadKey {
-			st.Balances[key] = oldBal
-		} else {
-			delete(st.Balances, key)
-		}
-		st.Settlements = st.Settlements[:oldLen]
-	}
-}
-
 // validateRefundRequest 校验一项退款请求：退款编号、原付款编号、原因三者
 // 都必须非空，校验顺序即对外约定（id → settlement_id → reason）。
 // 未通过校验的编号不占用退款资格，之后可修改后重新提交。
@@ -948,15 +969,6 @@ func validateRefundRequest(req *RefundRequest) (string, bool) {
 	return "", true
 }
 
-// refundEffect 是一笔预计成功退款的全部账本效果：退回哪个组合、退回多少、
-// 留下什么退款记录。它由退款规则产生，本身尚未生效；是否生效、如何生效
-// （真实落盘，失败则回滚）由生效策略决定。
-type refundEffect struct {
-	key    balanceKey
-	amount int64
-	record RefundRecord
-}
-
 // attachRefundDetail 把一笔成功退款（首次成功或幂等重复携带的同一条原记录）
 // 的统一详情填入逐项结果：原付款编号、账户、资产、退款总额、原因与完整退款
 // 记录。首次成功与重复申请共用这一个出口，保证两者拼装出的详情逐字一致。
@@ -971,11 +983,11 @@ func attachRefundDetail(res *RefundResult, rec RefundRecord) {
 }
 
 // judgeRefund 按退款规则评估一项请求，只读取状态 st，不产生任何副作用。
-// 返回逐项结果；预计成功时结果只填编号，退款效果以 refundEffect 描述，
+// 返回逐项结果；预计成功时结果只填编号，落账效果以 ledgerEffect 描述，
 // 由调用方交给生效策略落地。判定顺序即对外约定：参数校验、已成功退款编号
 // 的重复/冲突（优先于目标判断，即使新目标不存在也不退化成 not_found）、
 // 目标结算存在性、目标是否已被其他退款编号退回。
-func judgeRefund(req *RefundRequest, st *ledgerState) (RefundResult, *refundEffect) {
+func judgeRefund(req *RefundRequest, st *ledgerState) (RefundResult, *ledgerEffect) {
 	res := RefundResult{ID: req.ID}
 
 	// 1. 参数校验。未通过的编号不占用退款资格。
@@ -1028,25 +1040,21 @@ func judgeRefund(req *RefundRequest, st *ledgerState) (RefundResult, *refundEffe
 		AfterSeq:     int64(len(st.Settlements)),
 		Seq:          int64(len(st.Refunds)) + 1,
 	}
-	return res, &refundEffect{
+	return res, &ledgerEffect{
 		key:    balanceKey{target.Account, target.Asset},
-		amount: target.Charged,
-		record: rec,
+		delta:  target.Charged,
+		refund: &rec,
 	}
 }
 
-// commitRefund 是退款生效策略：把一笔预计成功的退款应用到状态 st 上。
-// 返回 nil 表示已生效；返回非 nil 表示保存失败，且 st 必须已恢复到
-// 该项执行之前的余额与退款历史。
-type commitRefund func(st *ledgerState, eff refundEffect) error
-
 // runRefundBatch 按输入顺序在给定状态 st 上处理整个退款批次，返回逐项结果。
-// 退款规则（judgeRefund）与生效（commit）分离：规则只读取 st 给出判定和
-// 预计退款效果，不改动任何状态；生效策略决定效果如何落地——真实提交先改
-// 内存再原子落盘、失败回滚并报告 storage_error。保存失败时 commit 已回滚
-// 该项（余额与退款历史恢复原样），该项不占退款编号、不把原付款标成已退款，
-// 前项成功保留、后项继续处理。调用方必须持有 reg.mu。
-func runRefundBatch(batch RefundBatch, st *ledgerState, commit commitRefund) []RefundResult {
+// 退款规则（judgeRefund）与落账生效（commit）分离：规则只读取 st 给出判定
+// 和预计落账效果，不改动任何状态；生效策略与付款提交共用同一套
+// applyEffect/落盘/回滚步骤——真实提交先改内存再原子落盘、失败回滚并报告
+// storage_error。保存失败时 commit 已回滚该项（余额与退款历史恢复原样），
+// 该项不占退款编号、不把原付款标成已退款，前项成功保留、后项继续处理。
+// 调用方必须持有 reg.mu。
+func runRefundBatch(batch RefundBatch, st *ledgerState, commit commitEffect) []RefundResult {
 	out := make([]RefundResult, 0, len(batch.Refunds))
 	for i := range batch.Refunds {
 		req := &batch.Refunds[i]
@@ -1069,38 +1077,10 @@ func runRefundBatch(batch RefundBatch, st *ledgerState, commit commitRefund) []R
 
 		// 3. 成功落账：与重复申请一样通过统一出口拼装详情。
 		res.Status = StatusRefundSuccess
-		attachRefundDetail(&res, eff.record)
+		attachRefundDetail(&res, *eff.refund)
 		out = append(out, res)
 	}
 	return out
-}
-
-// persistRefund 是真实退款的生效策略：先在内存生效，再原子落盘；
-// 落盘失败回滚该项（恢复余额与退款历史），并返回存储错误。
-func (l *Ledger) persistRefund(st *ledgerState, eff refundEffect) error {
-	rollback := stageRefundOn(st, eff.key, st.Balances[eff.key]+eff.amount, eff.record)
-	if err := l.persistLocked(); err != nil {
-		rollback()
-		return err
-	}
-	return nil
-}
-
-// stageRefundOn 在指定状态上应用一笔退款（余额增加 + 退款记录追加），
-// 返回回滚函数（恢复该项执行前的余额与退款记录长度）。
-func stageRefundOn(st *ledgerState, key balanceKey, newBal int64, rec RefundRecord) func() {
-	oldBal, hadKey := st.Balances[key]
-	oldLen := len(st.Refunds)
-	st.Balances[key] = newBal
-	st.Refunds = append(st.Refunds, rec)
-	return func() {
-		if hadKey {
-			st.Balances[key] = oldBal
-		} else {
-			delete(st.Balances, key)
-		}
-		st.Refunds = st.Refunds[:oldLen]
-	}
 }
 
 // findRefundIn 在给定退款历史中按编号查找成功记录。
@@ -1147,7 +1127,7 @@ func (l *Ledger) Refund(batch RefundBatch) (*RefundBatchResult, error) {
 	l.reg.mu.Lock()
 	defer l.reg.mu.Unlock()
 
-	results := runRefundBatch(batch, l.reg.state, l.persistRefund)
+	results := runRefundBatch(batch, l.reg.state, l.persistEffect)
 	return &RefundBatchResult{Results: results}, nil
 }
 
