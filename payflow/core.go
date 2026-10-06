@@ -3,7 +3,6 @@ package payflow
 
 import (
 	"fmt"
-	"math"
 	"sort"
 )
 
@@ -43,21 +42,22 @@ func Execute(intent Intent, feeBps int, spent map[string]bool, balance int64) Se
 	if spent[intent.ID] {
 		return Settlement{Intent: intent.ID, Status: "rejected", Reason: "duplicate settlement attempt"}
 	}
-	if intent.Amount <= 0 {
+	if !validPaymentAmount(intent.Amount) {
 		return Settlement{Intent: intent.ID, Status: "rejected", Reason: reasonBadAmount}
 	}
-	if feeBps < 0 || feeBps > 10000 {
+	if !validFeeBps(feeBps) {
 		return Settlement{
 			Intent: intent.ID,
 			Status: "rejected",
 			Reason: fmt.Sprintf("fee_bps must be within [0,10000], got %d", feeBps),
 		}
 	}
-	fee := feeFor(intent.Amount, feeBps)
-	if fee > math.MaxInt64-intent.Amount {
+	// 手续费在 int64 内精确得出（中间乘积允许越界）；只有总额本身越界才
+	// 拒绝，不把回绕出的负数当成扣款或退化成普通余额不足。
+	_, total, ok := chargeBreakdown(intent.Amount, feeBps)
+	if !ok {
 		return Settlement{Intent: intent.ID, Status: "rejected", Reason: reasonOverflow}
 	}
-	total := intent.Amount + fee
 	if total > balance {
 		return Settlement{Intent: intent.ID, Status: "failed", Reason: "insufficient balance for amount plus fee"}
 	}

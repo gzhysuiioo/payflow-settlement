@@ -184,17 +184,11 @@ func validateAndReplay(initial, final map[balanceKey]int64, records []Record, re
 		if _, ok := initial[balanceKey{r.Account, r.Asset}]; !ok {
 			return ledgerError(ErrCorrupt, "settlement %q touches account/asset absent from initial balances", r.ID)
 		}
-		if r.Amount <= 0 || r.Fee < 0 || r.Charged <= 0 {
-			return ledgerError(ErrCorrupt, "settlement %q has non-positive amounts", r.ID)
-		}
-		if r.FeeBps < 0 || r.FeeBps > 10000 {
-			return ledgerError(ErrCorrupt, "settlement %q has invalid fee bps", r.ID)
-		}
-		if want := feeFor(r.Amount, r.FeeBps); want != r.Fee {
-			return ledgerError(ErrCorrupt, "settlement %q fee mismatch: file %d, want %d", r.ID, r.Fee, want)
-		}
-		if r.Charged != r.Amount+r.Fee {
-			return ledgerError(ErrCorrupt, "settlement %q charged != amount + fee", r.ID)
+		// 金额、费率、手续费与扣款总额的数值规则与实际结算共用同一处维护
+		// （validateStoredCharge）：历史付款不符合当前规则即判账本损坏，
+		// 即使文件校验和正确也不能接受。
+		if err := validateStoredCharge(r.ID, r.Amount, r.FeeBps, r.Fee, r.Charged); err != nil {
+			return err
 		}
 		if int64(i)+1 != r.Seq {
 			return ledgerError(ErrCorrupt, "settlement %q sequence gap", r.ID)
