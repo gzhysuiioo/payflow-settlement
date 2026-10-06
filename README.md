@@ -132,6 +132,121 @@ go run ./cmd/payflow evaluate config.json new-checkout context-none.json
 
 两条规则都不命中时取开关的 `default`（这里为 `true`），`reason` 为 `default`、`ruleId` 为 `null`，与命中规则的输出（`reason` 为 `rule`、`ruleId` 为规则 id）明确区分。
 
+### 上下文属性的类型错误与逐处修正
+
+上下文只接受“属性名到字符串”的对象。当多个属性的值类型都不对时，错误信息一次只指出一处，按它在文件中出现的先后次序报告；修掉这一处再运行，下一处才会暴露。下面用一个已启用、默认值为 `false`、仅在 `plan` 等于 `pro` 时返回 `true` 的开关演示完整修正过程。把配置保存为 `config.json`：
+
+```json
+{
+  "flags": [
+    {
+      "key": "new-checkout",
+      "enabled": true,
+      "default": false,
+      "rules": [
+        {
+          "id": "r-pro",
+          "value": true,
+          "conditions": [
+            {"attribute": "plan", "op": "eq", "value": "pro"}
+          ]
+        }
+      ]
+    }
+  ]
+}
+```
+
+**第一步**：`context.json` 故意把两个属性都写成非字符串——`user.name` 的值是数字 `1e400`，`plan` 的值是布尔 `false`：
+
+```json
+{"user.name":1e400,"plan":false}
+```
+
+```bash
+go run ./cmd/payflow evaluate config.json new-checkout context.json
+```
+
+标准错误输出（标准输出为空，退出码非零）：
+
+```
+context["user.name"]: value must be a string
+```
+
+（用 `go run` 运行时它会在标准错误追加自己的一行 `exit status 1`；程序本身只输出上面那一行。）
+
+注意错误位置是 `context["user.name"]` 而不是 `context.user.name`：`user.name` 是**一个完整属性名**，点号是名字本身的字符；方括号包住一个 JSON 字符串只是字段路径对这类名字的定位写法（只含字母、数字、下划线的简单名字如 `plan` 才用点号，写作 `context.plan`），并不提示要把它拆成 `user` 对象下嵌套的 `name` 字段——上下文只有一层属性，不存在嵌套对象。
+
+这里还要分清“数字大”与“类型错”：`1e400` 是语法合法的 JSON 数字（只是数量级超出浮点表示范围），它被拒绝不是因为数字太大造成语法错误，而是因为上下文的每个值都必须是字符串——布尔、`null`、对象、数组与任何数字一样都会在此被拒绝。修正方法是给值加上引号。
+
+**第二步**：只把前一项改成字符串 `"1e400"`，`plan` 仍保持布尔：
+
+```json
+{"user.name":"1e400","plan":false}
+```
+
+```bash
+go run ./cmd/payflow evaluate config.json new-checkout context.json
+```
+
+```
+context.plan: value must be a string
+```
+
+第一处通过校验后，报错才前进到文件中的下一处 `context.plan`。加上引号的 `"1e400"` 保留的是原样字符串（`1`、`e`、`4`、`0`、`0` 五个字符），求值器不会把它自动转回数字，也不做任何数值换算。
+
+**第三步**：再把 `plan` 改成字符串 `"pro"`：
+
+```json
+{"user.name":"1e400","plan":"pro"}
+```
+
+```bash
+go run ./cmd/payflow evaluate config.json new-checkout context.json
+```
+
+```json
+{"key":"new-checkout","value":true,"reason":"rule","ruleId":"r-pro"}
+```
+
+这次退出码为 0、标准输出有完整结果对象：`value` 为 `true`；`reason` 为 `rule` 表示结果来自命中的规则（而不是开关默认值或关闭固定值）；`ruleId` 为 `"r-pro"` 指出命中的是配置里的哪一条规则。按每一步错误位置的提示逐处修正输入，最终就能读到这样的成功结果。
+
+修正过程旁边的几点说明：
+
+- **多个类型错误按文件先后次序报告，不按属性名字母排序**：报告次序取自 JSON 原文中字段的出现位置。把示例两个字段的书写次序对调（`{"plan":false,"user.name":1e400}`），首先报出的就是 `context.plan`，与 `plan`、`user.name` 的字母先后无关。
+- **带点号的名字是一个整体**：`context["user.name"]` 中的方括号只是定位符号，含义是“名为 `user.name` 的这一个属性”，不要据此把上下文改写成 `{"user":{"name":...}}` 这样的嵌套对象——嵌套对象本身又是非法属性值。
+- **`1e400` 合法但此处不收**：它通过 JSON 语法检查没有问题，被拒仅仅因为上下文值只收字符串；写成 `"1e400"` 后它是五个字符的原样字符串，不会被解析或舍入成数字。
+- **未使用的属性也必须通过校验**：示例规则只引用了 `plan`，但 `user.name` 同样是上下文的顶层属性，类型错误照样让整个求值失败。整份上下文在任何规则匹配之前先完整校验，与属性是否被规则引用无关。
+- **格式错误先于属性类型错误**：“按文件次序逐个报告属性类型错误”以文档本身通过格式校验为前提。同一对象内的重复字段、非法 UTF-8、不成对的 `\uXXXX` 转义、JSON 语法错误或第二个顶层值等格式问题会先被报告——例如把 `"user.name"` 在同一对象写两遍，得到的是 `context["user.name"]: duplicate field "user.name"`，而不是任何值类型错误（格式规则见下文“附加信息也要通过整份配置的格式校验”，配置与上下文共用同一组格式校验）。修完格式问题后才进入属性值的类型检查。
+- **普通模式与 `--explain` 失败方式一致**：在三个路径参数之后再带上 `--explain` 遇到上述上下文校验失败时，同样非零退出、标准输出为空、原因写入标准错误，不会产生部分求值结果，也不会输出半份解释：
+
+```bash
+go run ./cmd/payflow evaluate config.json new-checkout context.json --explain
+# （标准错误）context["user.name"]: value must be a string
+# 标准输出为空，退出码非零
+```
+
+#### “输入校验失败”与“合法求值返回 false”
+
+非零退出的校验失败不要和求值成功但布尔值为 `false` 混淆。把上下文改成两个属性都是合法字符串、但 `plan` 不是 `pro`：
+
+```json
+{"user.name":"1e400","plan":"free"}
+```
+
+```bash
+go run ./cmd/payflow evaluate config.json new-checkout context.json
+```
+
+```json
+{"key":"new-checkout","value":false,"reason":"default","ruleId":null}
+```
+
+命令退出码为 0、标准输出有完整结果对象：输入完全合法，只是没有规则命中，于是取开关的 `default`（这里恰好是 `false`），`reason` 为 `default`、`ruleId` 为 `null`。两种情况的区别是：
+
+- **输入校验失败**：退出码非零，标准输出为空，没有结果对象，原因只能去标准错误读取（如 `context.plan: value must be a string`）；
+- **合法求值返回 `false`**：退出码为 0，标准输出照常给出结果对象，`value` 为什么是 `false` 由 `reason` 说明（`default` 表示无规则命中取默认值、`disabled` 表示开关关闭、`rule` 加 `ruleId` 则表示命中了一条返回 `false` 的规则，参见上文“完整示例：多条规则与命中优先级”）。
+
 ### 解释模式：`--explain`
 
 想知道结果究竟采用了哪条规则、或为什么落到默认值，可以在前三个参数之后再加第四个参数 `--explain`。它只在**第四个参数位置**被识别：
