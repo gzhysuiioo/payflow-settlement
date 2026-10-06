@@ -608,7 +608,132 @@ config: invalid JSON: invalid character ',' in exponent of numeric literal
 #### 附加字段的边界
 
 - 附加字段不能替代缺少或类型错误的业务字段：开关仍必须提供非空 `key`、布尔 `enabled`/`default` 和 `rules`，规则仍必须提供非空 `id`、布尔 `value` 和非空 `conditions`，条件仍必须提供非空 `attribute`、`op` 与类型正确的 `value`；开关键与规则 id 在各自范围内的唯一性要求也继续适用。例如 `"default": false` 不能省，多写一个 `"owner": "@alice"` 不弥补缺失。
-- 上下文仍然只是“属性名到字符串”的对象：每个顶层属性的值必须是字符串，`{}` 合法、空字符串合法，但对象、数组、数字等一律按类型错误拒绝。配置附加字段里的嵌套备注不能照搬到上下文——上下文里写 `"plan": {"name": "pro"}` 会得到 `context.plan: value must be a string`。
+- 上下文仍然只是“属性名到字符串”的对象：每个顶层属性的值必须是字符串，`{}` 合法、空字符串合法，但对象、数组、数字等一律按类型错误拒绝。配置附加字段里的嵌套备注不能照搬到上下文——上下文里写 `"plan": {"name": "pro"}` 会得到 `context.plan: value must be a string`。报错位置的写法、多个属性类型错误的报告次序与逐步修正示例见下文“上下文校验失败：报错位置与逐处修正”。
+
+### 上下文校验失败：报错位置与逐处修正
+
+上下文的每个顶层属性都必须是字符串，而校验发生在一切求值之前：整份上下文先通过校验，才会查找开关、匹配规则。校验失败时**没有求值这一步**，普通模式与 `--explain` 的行为完全相同——非零退出、标准输出为空、一行原因写入标准错误；`--explain` 也不会产出半截解释。这与“合法求值得到 `false`”是两回事，后者退出码为 0、JSON 结果照常打印在标准输出（见本节末尾对照）。
+
+把下面这份配置保存为 `config-pro.json`——开关 `new-checkout` 已启用、默认值 `false`，只有一条规则 `r-pro`：`plan` 等于 `pro` 时返回 `true`：
+
+```json
+{
+  "flags": [
+    {
+      "key": "new-checkout",
+      "enabled": true,
+      "default": false,
+      "rules": [
+        {
+          "id": "r-pro",
+          "value": true,
+          "conditions": [
+            {"attribute": "plan", "op": "eq", "value": "pro"}
+          ]
+        }
+      ]
+    }
+  ]
+}
+```
+
+#### 第一次：两个属性都不是字符串
+
+`context-bad-1.json`：
+
+```json
+{"user.name":1e400,"plan":false}
+```
+
+```bash
+go run ./cmd/payflow evaluate config-pro.json new-checkout context-bad-1.json
+```
+
+标准输出为空，标准错误为（用 `go run` 运行时它还会在标准错误追加一行 `exit status 1`；程序本身只输出下面这一行）：
+
+```
+context["user.name"]: value must be a string
+```
+
+报错位置写作 `context["user.name"]`：`user.name` 是**一个完整的属性名**，点号只是名字里的普通字符。上下文只有“属性名 → 字符串”这一层，不支持嵌套对象；位置里的方括号仅仅是给“不符合简单标识符（字母或下划线开头，只含字母、数字、下划线）”的字段名加上 JSON 字符串引号，并不提示要把输入改成 `{"user":{"name":...}}` 之类的嵌套结构。名字是简单标识符时才用点号连接，如下一步的 `context.plan`。
+
+`1e400` 本身是语法合法的 JSON 数字（它作为配置里的附加字段值会被原样接受，见上文“配置中的附加信息”）；这里被拒绝不是因为数字太大或存在语法错误，而是**上下文属性值只收字符串**——数字再合法也不行。修正方式是加上引号，且加上引号后保留的是原样字符串 `"1e400"`（5 个字符），不会被自动换算成数字或 `Infinity`。
+
+另请注意：这条规则只引用了 `plan`，并没有用到 `user.name`；但未使用的属性同样必须先通过上下文校验，不能因为规则不读它就写成非字符串值。
+
+#### 第二次：只修第一处，报错推进到下一处
+
+只给第一项加上引号、其余不动，存为 `context-bad-2.json`：
+
+```json
+{"user.name":"1e400","plan":false}
+```
+
+```bash
+go run ./cmd/payflow evaluate config-pro.json new-checkout context-bad-2.json
+```
+
+```
+context.plan: value must be a string
+```
+
+一次只报告第一处类型错误：`user.name` 修好后，同样的检查继续向后推进，这次轮到 `plan`（`false` 是布尔值，不是字符串）。按标准错误里的位置逐处修正、重新运行即可。
+
+多个属性类型错误时，报告次序是**属性在文件中的先后次序**，不按属性名字母排序：这份文件里 `user.name` 写在 `plan` 前面，于是先报它——尽管按字母序 `plan` 应排在 `user.name` 之前。把两个字段的书写次序对调成 `{"plan":false,"user.name":1e400}`，第一处报错就变成 `context.plan: value must be a string`。报告次序取自文件令牌流而非 Go map 遍历，同一份文件多次运行，报告的属性固定不变。
+
+#### 第三次：两处都修正，得到命中规则的结果
+
+`context-ok.json`：
+
+```json
+{"user.name":"1e400","plan":"pro"}
+```
+
+```bash
+go run ./cmd/payflow evaluate config-pro.json new-checkout context-ok.json
+```
+
+```json
+{"key":"new-checkout","value":true,"reason":"rule","ruleId":"r-pro"}
+```
+
+这时上下文通过校验、规则条件成立：`value` 是结果布尔值 `true`；`reason` 为 `rule` 表示结果由规则定案（而不是取 `default` 或因开关关闭固定为假）；`ruleId` 给出定案规则的编号 `r-pro`。
+
+#### 校验失败不等于合法求值返回 false
+
+把上下文改成类型全部合法、但规则不命中（`plan` 不是 `pro`），存为 `context-ok-free.json`：
+
+```json
+{"user.name":"1e400","plan":"free"}
+```
+
+```bash
+go run ./cmd/payflow evaluate config-pro.json new-checkout context-ok-free.json
+```
+
+```json
+{"key":"new-checkout","value":false,"reason":"default","ruleId":null}
+```
+
+这是一次**成功的求值**：退出码为 0，JSON 结果打印在标准输出；`false` 是开关真实的求值结果（无规则命中，取 `default: false`，所以 `reason` 为 `default`、`ruleId` 为 `null`）。它与上文那种“输入被拒绝、没有结果对象、标准输出为空、退出码非零”的校验失败有本质区别；开关关闭时的 `{"...","value":false,"reason":"disabled","ruleId":null}` 同理也是合法求值结果，不是输入错误。
+
+`--explain` 不会绕过或放宽校验：对第一步的 `context-bad-1.json` 加上 `--explain`，得到的仍是标准错误里同一行 `context["user.name"]: value must be a string`、非零退出、标准输出为空——既没有四字段结果，也没有 `explanation` 对象，不会产生任何部分求值或部分解释。
+
+#### 文档格式错误先于属性类型错误
+
+属性报错次序以“文档格式已通过校验”为前提：非法 UTF-8、不成对的 `\uXXXX` 转义、同一对象内的重复字段、JSON 语法错误或第二个顶层值、顶层不是对象等格式问题，都会先于属性值类型错误被报告。例如把 `plan` 在同一个对象里写两遍：
+
+```json
+{"plan":false,"plan":1}
+```
+
+报告的是重复字段这一格式错误，而不是其中任何一个值的类型错误：
+
+```
+context.plan: duplicate field "plan"
+```
+
+也就是说，先保证整份上下文是一份合法、无重复字段的 JSON 对象，再按文件次序逐个把属性值改成字符串，两类问题不会互相遮盖。
 
 ## 技术方向
 
