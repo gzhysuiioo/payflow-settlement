@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -601,14 +600,9 @@ func (l *Ledger) endOp() {
 	tryEvict(l.path, l.reg)
 }
 
-// feeFor 计算手续费：amount*feeBps/10000 向下取整。
-// amount>0、0<=feeBps<=10000 时朴素乘积可能溢出 int64，
-// 拆成商和余数两部分即可在 int64 内精确完成。
-func feeFor(amount int64, feeBps int) int64 {
-	hi := amount / 10000
-	lo := amount % 10000
-	return hi*int64(feeBps) + (lo*int64(feeBps))/10000
-}
+// 付款金额、费率、手续费与扣款总额的数值规则集中在 charge.go
+// （amountValid/feeBpsValid/feeFor/chargeFor），本地结算、遗留单笔结算
+// 与账本历史校验共用同一实现。
 
 func validateIntent(it PaymentIntent) (int64, string, bool) {
 	if it.ID == "" {
@@ -620,7 +614,7 @@ func validateIntent(it PaymentIntent) (int64, string, bool) {
 	if it.Asset == "" {
 		return 0, reasonEmptyAsset, false
 	}
-	if it.Amount == nil || *it.Amount <= 0 {
+	if it.Amount == nil || !amountValid(*it.Amount) {
 		return 0, reasonBadAmount, false
 	}
 	return *it.Amount, "", true
@@ -719,8 +713,8 @@ func (l *Ledger) Preview(batch FeeBatch) (*PreviewResult, error) {
 // validateBatch 执行批次级校验：费率范围与本次扣款上限。任一不合法都返回
 // 批次级错误（invalid_parameter），调用方不得执行任何意图（空批次同样检查）。
 func validateBatch(batch FeeBatch) (map[balanceKey]int64, error) {
-	if batch.FeeBps < 0 || batch.FeeBps > 10000 {
-		return nil, ledgerError(ErrInvalid, "fee_bps must be within [0,10000], got %d", batch.FeeBps)
+	if !feeBpsValid(batch.FeeBps) {
+		return nil, ledgerError(ErrInvalid, "%s", reasonBadFeeBps(batch.FeeBps))
 	}
 	// 限额非法是批次级错误：任何意图都不执行（空意图列表同样检查）。
 	return validateLimits(batch.Limits)
@@ -856,13 +850,12 @@ func judgeIntent(it *PaymentIntent, feeBps int, limits map[balanceKey]int64, use
 	}
 
 	// 4. 手续费与扣款总额（溢出明确按参数错误拒绝）。
-	fee := feeFor(amount, feeBps)
-	if fee > math.MaxInt64-amount {
+	fee, total, ok := chargeFor(amount, feeBps)
+	if !ok {
 		res.Status = StatusInvalid
 		res.Reason = reasonOverflow
 		return res, nil
 	}
-	total := amount + fee
 
 	key := balanceKey{it.Account, it.Asset}
 

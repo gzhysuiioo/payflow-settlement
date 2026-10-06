@@ -184,16 +184,19 @@ func validateAndReplay(initial, final map[balanceKey]int64, records []Record, re
 		if _, ok := initial[balanceKey{r.Account, r.Asset}]; !ok {
 			return ledgerError(ErrCorrupt, "settlement %q touches account/asset absent from initial balances", r.ID)
 		}
-		if r.Amount <= 0 || r.Fee < 0 || r.Charged <= 0 {
+		if !amountValid(r.Amount) || r.Fee < 0 || r.Charged <= 0 {
 			return ledgerError(ErrCorrupt, "settlement %q has non-positive amounts", r.ID)
 		}
-		if r.FeeBps < 0 || r.FeeBps > 10000 {
+		if !feeBpsValid(r.FeeBps) {
 			return ledgerError(ErrCorrupt, "settlement %q has invalid fee bps", r.ID)
 		}
-		if want := feeFor(r.Amount, r.FeeBps); want != r.Fee {
-			return ledgerError(ErrCorrupt, "settlement %q fee mismatch: file %d, want %d", r.ID, r.Fee, want)
+		// 手续费与扣款总额必须与统一数值规则（charge.go）逐字一致；
+		// 总额不可表示为 int64 时同样视为 charged 不符。
+		fee, total, ok := chargeFor(r.Amount, r.FeeBps)
+		if fee != r.Fee {
+			return ledgerError(ErrCorrupt, "settlement %q fee mismatch: file %d, want %d", r.ID, r.Fee, fee)
 		}
-		if r.Charged != r.Amount+r.Fee {
+		if !ok || r.Charged != total {
 			return ledgerError(ErrCorrupt, "settlement %q charged != amount + fee", r.ID)
 		}
 		if int64(i)+1 != r.Seq {
