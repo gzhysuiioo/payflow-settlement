@@ -311,96 +311,102 @@ func (c *Config) Find(key string) *Flag {
 	return nil
 }
 
-// Evaluate deterministically evaluates a flag against a context.
-// 未启用固定 false（reason=disabled），不使用默认值或规则；启用后取首条
-// 所有条件均成立的规则的 value；无匹配取 default。求值不依赖时间、随机数
-// 或 map 遍历顺序，同一配置与上下文重复求值结果一致。
-func (f *Flag) Evaluate(ctx *Context) EvalResult {
+// evaluate 是普通模式与解释模式共同维护的唯一定案路径：关闭固定 false
+// （reason=disabled），不使用默认值或规则；启用后取首条所有条件均成立的规则的
+// value（即使它返回 false 也立即定案，后续规则不再考虑）；无匹配取 default。
+// 求值不依赖时间、随机数或 map 遍历顺序。定案所依据的逐条条件判断与规则遍历过程
+// 一并记录在返回值中，普通模式只取其中的结果字段，解释模式额外展示判断记录，
+// 因此两种模式对同一份配置与上下文不可能给出不同判断。
+func (f *Flag) evaluate(ctx *Context) evaluation {
+	result := EvalResult{Key: f.Key}
 	if !f.Enabled {
-		return EvalResult{Key: f.Key, Value: false, Reason: EvalDisabled, RuleID: nil}
-	}
-	for i := range f.Rules {
-		rule := &f.Rules[i]
-		if rule.matches(ctx) {
-			id := rule.ID
-			return EvalResult{Key: f.Key, Value: rule.Value, Reason: EvalRule, RuleID: &id}
+		return evaluation{
+			result:  EvalResult{Key: f.Key, Value: false, Reason: EvalDisabled, RuleID: nil},
+			outcome: "flag is disabled; result is fixed to false without evaluating rules or the default",
+			rules:   []RuleExplanation{},
 		}
 	}
-	return EvalResult{Key: f.Key, Value: f.Default, Reason: EvalDefault, RuleID: nil}
-}
-
-func (r *Rule) matches(ctx *Context) bool {
-	for i := range r.Conditions {
-		if !r.Conditions[i].matches(ctx) {
-			return false
-		}
-	}
-	return true
-}
-
-// EvaluateExplain 与 Evaluate 采用完全相同的定案规则（关闭固定 false、
-// 首条全部条件成立的规则决定结果、否则取 default），并额外产出按配置顺序
-// 排列的判断记录：每条在定案前被考虑过的规则都给出 id、是否命中与全部条件
-// 的逐条判断；第一条命中的规则（即使返回 false）也计入并立即停止，其后的
-// 规则不出现。开关关闭时不评估任何规则，解释中的规则列表为空，结果依据只
-// 说明关闭导致固定 false。
-func (f *Flag) EvaluateExplain(ctx *Context) ExplainedResult {
-	if !f.Enabled {
-		return ExplainedResult{
-			EvalResult: EvalResult{Key: f.Key, Value: false, Reason: EvalDisabled, RuleID: nil},
-			Explanation: EvalExplanation{
-				Outcome: "flag is disabled; result is fixed to false without evaluating rules or the default",
-				Rules:   []RuleExplanation{},
-			},
-		}
-	}
+	// considered 按配置顺序收集定案前实际考虑过的规则，到第一条全部条件成立的
+	// 规则为止（含该规则）；无规则或全部不命中时为空列表而非 nil。
 	considered := make([]RuleExplanation, 0, len(f.Rules))
 	for i := range f.Rules {
 		rule := &f.Rules[i]
-		re := rule.explain(ctx)
+		re := rule.evaluate(ctx)
 		considered = append(considered, re)
 		if re.Match {
 			id := rule.ID
-			return ExplainedResult{
-				EvalResult: EvalResult{Key: f.Key, Value: rule.Value, Reason: EvalRule, RuleID: &id},
-				Explanation: EvalExplanation{
-					Outcome: fmt.Sprintf("first matching rule %q decides the result; later rules are not considered", rule.ID),
-					Rules:   considered,
-				},
+			result = EvalResult{Key: f.Key, Value: rule.Value, Reason: EvalRule, RuleID: &id}
+			return evaluation{
+				result:  result,
+				outcome: fmt.Sprintf("first matching rule %q decides the result; later rules are not considered", rule.ID),
+				rules:   considered,
 			}
 		}
 	}
+	result = EvalResult{Key: f.Key, Value: f.Default, Reason: EvalDefault, RuleID: nil}
+	return evaluation{
+		result:  result,
+		outcome: "no rule matched; the flag default is used",
+		rules:   considered,
+	}
+}
+
+// evaluation 是一次求值的完整记录：定案的四字段结果、一句话依据以及按配置顺序
+// 考虑过的规则判断记录。普通模式只用 Result；解释模式三者都输出。
+type evaluation struct {
+	result  EvalResult
+	outcome string
+	rules   []RuleExplanation
+}
+
+// Evaluate deterministically evaluates a flag against a context；定案规则与判断
+// 细节统一由 evaluate 维护，本入口只返回四字段结果。
+func (f *Flag) Evaluate(ctx *Context) EvalResult {
+	return f.evaluate(ctx).result
+}
+
+// EvaluateExplain 与 Evaluate 走同一条 evaluate 定案路径（关闭固定 false、
+// 首条全部条件成立的规则决定结果、否则取 default），并额外把该路径产出的判断
+// 记录作为 explanation：每条在定案前被考虑过的规则都给出 id、是否命中与全部
+// 条件的逐条判断；第一条命中的规则（即使返回 false）也计入并立即停止，其后的
+// 规则不出现。开关关闭时不评估任何规则，解释中的规则列表为空，结果依据只
+// 说明关闭导致固定 false。
+func (f *Flag) EvaluateExplain(ctx *Context) ExplainedResult {
+	e := f.evaluate(ctx)
 	return ExplainedResult{
-		EvalResult: EvalResult{Key: f.Key, Value: f.Default, Reason: EvalDefault, RuleID: nil},
+		EvalResult: e.result,
 		Explanation: EvalExplanation{
-			Outcome: "no rule matched; the flag default is used",
-			Rules:   considered,
+			Outcome: e.outcome,
+			Rules:   e.rules,
 		},
 	}
 }
 
-// explain 评估一条规则的全部条件并逐条记录判断结果；Match 为所有条件都
-// 成立。与 matches 不同，它不会在首个失败条件处短路，因此每个条件的属性、
-// 比较值、实际值与是否成立都能展示出来。
-func (r *Rule) explain(ctx *Context) RuleExplanation {
+// evaluate 判断一条规则的全部条件并逐条记录判断结果；Match 为所有条件都
+// 成立。它不会在首个失败条件处短路，因此每个条件的属性、比较值、实际值与
+// 是否成立都能展示出来，规则整体的命中判断与条件逐条判断共用这一份结果。
+func (r *Rule) evaluate(ctx *Context) RuleExplanation {
 	re := RuleExplanation{RuleID: r.ID, Match: true, Conditions: make([]ConditionExplanation, 0, len(r.Conditions))}
 	for i := range r.Conditions {
-		ce := r.Conditions[i].explain(ctx)
+		ce := r.Conditions[i].evaluate(ctx)
 		re.Conditions = append(re.Conditions, ce)
 		if !ce.Match {
 			re.Match = false
 		}
 	}
 	if len(re.Conditions) == 0 {
+		// 解析阶段已要求规则至少含一个条件，这里只是防御性处理，避免无条件的
+		// 规则被当成命中。
 		re.Match = false
 	}
 	return re
 }
 
-// explain 判断单个条件并记录属性名、比较方式、配置比较值、上下文实际值与
-// 是否成立。属性缺失用 Missing=true、ActualValue=nil 表示，绝不与显式
-// 空字符串（ActualValue 指向 ""）混淆。
-func (c Condition) explain(ctx *Context) ConditionExplanation {
+// evaluate 判断单个条件并记录属性名、比较方式、配置比较值、上下文实际值与
+// 是否成立；规则与开关各层级的“条件是否成立”都以这里的 Match 为准，普通模式
+// 与解释模式不再各算一遍。属性缺失用 Missing=true、ActualValue=nil 表示，
+// 绝不与显式空字符串（ActualValue 指向 ""）混淆。
+func (c Condition) evaluate(ctx *Context) ConditionExplanation {
 	ce := ConditionExplanation{Attribute: c.Attribute, Op: c.Op}
 	switch c.Op {
 	case "eq":
@@ -435,27 +441,6 @@ func (c Condition) explain(ctx *Context) ConditionExplanation {
 		ce.Match = false
 	}
 	return ce
-}
-
-func (c Condition) matches(ctx *Context) bool {
-	v, present := ctx.Get(c.Attribute)
-	if !present {
-		return false
-	}
-	switch c.Op {
-	case "eq":
-		return v == c.strVal
-	case "in":
-		for _, candidate := range c.inVal {
-			if v == candidate {
-				return true
-			}
-		}
-		return false
-	default:
-		// 解析阶段已拒绝未知运算符，防御性处理。
-		return false
-	}
 }
 
 // MarshalResult renders the result as a single compact JSON object.
