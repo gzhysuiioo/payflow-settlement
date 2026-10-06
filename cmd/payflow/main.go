@@ -76,8 +76,31 @@ func usage(w io.Writer) {
 }
 
 // initRequest 是 init 的输入：{"balances":[...]}。
+// Balance 用指针解码，只为区分“未提供/null”与显式写出的 0：
+// 缺失或 null 的余额必须整次拒绝，不能默默当成 0 落账；显式 0 仍是合法余额。
+// 校验通过后转换为 payflow.BalanceInit，库的公开数据写法不变。
 type initRequest struct {
-	Balances []payflow.BalanceInit `json:"balances"`
+	Balances []balanceInitJSON `json:"balances"`
+}
+
+type balanceInitJSON struct {
+	Account string `json:"account"`
+	Asset   string `json:"asset"`
+	Balance *int64 `json:"balance"`
+}
+
+// toBalanceInits 把解码后的余额列表转换为库的 BalanceInit 列表。
+// 任一条目未明确提供 balance（缺省或 null）即返回错误，下标从 0 开始；
+// 调用方必须整次拒绝，不得用部分合法条目初始化账本。
+func toBalanceInits(list []balanceInitJSON) ([]payflow.BalanceInit, error) {
+	out := make([]payflow.BalanceInit, len(list))
+	for i, b := range list {
+		if b.Balance == nil {
+			return nil, fmt.Errorf("initial balance %d (%s/%s): balance must be provided explicitly as a non-negative int64 (use 0 for an intentional zero balance)", i, b.Account, b.Asset)
+		}
+		out[i] = payflow.BalanceInit{Account: b.Account, Asset: b.Asset, Balance: *b.Balance}
+	}
+	return out, nil
 }
 
 type errorEnvelope struct {
@@ -171,13 +194,19 @@ func cmdInit(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	if err := requireEOF(dec, "init"); err != nil {
 		return failEnvelope(stderr, payflow.ErrInvalid, err.Error())
 	}
-	if err := payflow.CreateLedger(*ledgerPath, req.Balances); err != nil {
+	// 先整体校验余额是否都明确给出：任一缺失/null 即整次拒绝，
+	// 不创建账本，也不把前面的合法条目单独落账。
+	inits, err := toBalanceInits(req.Balances)
+	if err != nil {
+		return failEnvelope(stderr, payflow.ErrInvalid, err.Error())
+	}
+	if err := payflow.CreateLedger(*ledgerPath, inits); err != nil {
 		return failWithError(stderr, err)
 	}
 	writeJSON(stdout, map[string]any{
 		"status":   "initialized",
 		"ledger":   *ledgerPath,
-		"accounts": len(req.Balances),
+		"accounts": len(inits),
 	})
 	return 0
 }
