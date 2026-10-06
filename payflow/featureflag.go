@@ -314,55 +314,73 @@ func (c *Config) Find(key string) *Flag {
 // evaluate 是普通模式与解释模式共同维护的唯一定案路径：关闭固定 false
 // （reason=disabled），不使用默认值或规则；启用后取首条所有条件均成立的规则的
 // value（即使它返回 false 也立即定案，后续规则不再考虑）；无匹配取 default。
-// 求值不依赖时间、随机数或 map 遍历顺序。定案所依据的逐条条件判断与规则遍历过程
-// 一并记录在返回值中，普通模式只取其中的结果字段，解释模式额外展示判断记录，
-// 因此两种模式对同一份配置与上下文不可能给出不同判断。
-func (f *Flag) evaluate(ctx *Context) evaluation {
-	result := EvalResult{Key: f.Key}
+// 求值不依赖时间、随机数或 map 遍历顺序。keepRecord 为 false（普通模式）时只
+// 算出定案结果，不整理任何判断记录；为 true（解释模式）时把定案所依据的逐条
+// 条件判断与规则遍历过程一并记录在返回值中。两种模式共用这里的规则优先级与
+// 条件比较，对同一份配置与上下文不可能给出不同判断。
+func (f *Flag) evaluate(ctx *Context, keepRecord bool) evaluation {
 	if !f.Enabled {
-		return evaluation{
-			result:  EvalResult{Key: f.Key, Value: false, Reason: EvalDisabled, RuleID: nil},
-			outcome: "flag is disabled; result is fixed to false without evaluating rules or the default",
-			rules:   []RuleExplanation{},
+		ev := evaluation{
+			result: EvalResult{Key: f.Key, Value: false, Reason: EvalDisabled, RuleID: nil},
 		}
+		if keepRecord {
+			ev.outcome = "flag is disabled; result is fixed to false without evaluating rules or the default"
+			ev.rules = []RuleExplanation{}
+		}
+		return ev
 	}
 	// considered 按配置顺序收集定案前实际考虑过的规则，到第一条全部条件成立的
-	// 规则为止（含该规则）；无规则或全部不命中时为空列表而非 nil。
-	considered := make([]RuleExplanation, 0, len(f.Rules))
+	// 规则为止（含该规则）；无规则或全部不命中时为空列表而非 nil。仅解释模式
+	// 收集，普通模式不为判断记录分配任何空间。
+	var considered []RuleExplanation
+	if keepRecord {
+		considered = make([]RuleExplanation, 0, len(f.Rules))
+	}
 	for i := range f.Rules {
 		rule := &f.Rules[i]
-		re := rule.evaluate(ctx)
-		considered = append(considered, re)
-		if re.Match {
+		var matched bool
+		if keepRecord {
+			re := rule.evaluate(ctx)
+			considered = append(considered, re)
+			matched = re.Match
+		} else {
+			matched = rule.matches(ctx)
+		}
+		if matched {
 			id := rule.ID
-			result = EvalResult{Key: f.Key, Value: rule.Value, Reason: EvalRule, RuleID: &id}
-			return evaluation{
-				result:  result,
-				outcome: fmt.Sprintf("first matching rule %q decides the result; later rules are not considered", rule.ID),
-				rules:   considered,
+			ev := evaluation{
+				result: EvalResult{Key: f.Key, Value: rule.Value, Reason: EvalRule, RuleID: &id},
+				rules:  considered,
 			}
+			if keepRecord {
+				ev.outcome = fmt.Sprintf("first matching rule %q decides the result; later rules are not considered", rule.ID)
+			}
+			return ev
 		}
 	}
-	result = EvalResult{Key: f.Key, Value: f.Default, Reason: EvalDefault, RuleID: nil}
-	return evaluation{
-		result:  result,
-		outcome: "no rule matched; the flag default is used",
-		rules:   considered,
+	ev := evaluation{
+		result: EvalResult{Key: f.Key, Value: f.Default, Reason: EvalDefault, RuleID: nil},
+		rules:  considered,
 	}
+	if keepRecord {
+		ev.outcome = "no rule matched; the flag default is used"
+	}
+	return ev
 }
 
-// evaluation 是一次求值的完整记录：定案的四字段结果、一句话依据以及按配置顺序
-// 考虑过的规则判断记录。普通模式只用 Result；解释模式三者都输出。
+// evaluation 是一次求值的产出：定案的四字段结果，以及仅解释模式才填写的
+// 一句话依据与按配置顺序考虑过的规则判断记录。普通模式只用 result，outcome
+// 与 rules 保持零值，不为它们付出整理与复制开销。
 type evaluation struct {
 	result  EvalResult
 	outcome string
 	rules   []RuleExplanation
 }
 
-// Evaluate deterministically evaluates a flag against a context；定案规则与判断
-// 细节统一由 evaluate 维护，本入口只返回四字段结果。
+// Evaluate deterministically evaluates a flag against a context；定案规则与
+// 解释模式统一由 evaluate 维护，本入口只取最终结果，不生成判断记录。
 func (f *Flag) Evaluate(ctx *Context) EvalResult {
-	return f.evaluate(ctx).result
+	return f.evaluate(ctx, false).result
 }
 
 // EvaluateExplain 与 Evaluate 走同一条 evaluate 定案路径（关闭固定 false、
@@ -372,7 +390,7 @@ func (f *Flag) Evaluate(ctx *Context) EvalResult {
 // 规则不出现。开关关闭时不评估任何规则，解释中的规则列表为空，结果依据只
 // 说明关闭导致固定 false。
 func (f *Flag) EvaluateExplain(ctx *Context) ExplainedResult {
-	e := f.evaluate(ctx)
+	e := f.evaluate(ctx, true)
 	return ExplainedResult{
 		EvalResult: e.result,
 		Explanation: EvalExplanation{
@@ -382,9 +400,27 @@ func (f *Flag) EvaluateExplain(ctx *Context) ExplainedResult {
 	}
 }
 
+// matches 判断一条规则是否全部条件成立，在首个失败条件处短路。它不产生任何
+// 判断记录，是普通求值路径使用的轻量入口；条件是否成立与解释模式共用
+// Condition.compare 这同一份比较逻辑。
+func (r *Rule) matches(ctx *Context) bool {
+	if len(r.Conditions) == 0 {
+		// 解析阶段已要求规则至少含一个条件，这里只是防御性处理，避免无条件的
+		// 规则被当成命中。
+		return false
+	}
+	for i := range r.Conditions {
+		if !r.Conditions[i].matches(ctx) {
+			return false
+		}
+	}
+	return true
+}
+
 // evaluate 判断一条规则的全部条件并逐条记录判断结果；Match 为所有条件都
 // 成立。它不会在首个失败条件处短路，因此每个条件的属性、比较值、实际值与
 // 是否成立都能展示出来，规则整体的命中判断与条件逐条判断共用这一份结果。
+// 仅供解释模式使用。
 func (r *Rule) evaluate(ctx *Context) RuleExplanation {
 	re := RuleExplanation{RuleID: r.ID, Match: true, Conditions: make([]ConditionExplanation, 0, len(r.Conditions))}
 	for i := range r.Conditions {
@@ -395,17 +431,40 @@ func (r *Rule) evaluate(ctx *Context) RuleExplanation {
 		}
 	}
 	if len(re.Conditions) == 0 {
-		// 解析阶段已要求规则至少含一个条件，这里只是防御性处理，避免无条件的
-		// 规则被当成命中。
+		// 与 matches 相同的防御性处理：无条件的规则不命中。
 		re.Match = false
 	}
 	return re
 }
 
+// matches 判断单个条件是否成立，不产生判断记录。属性缺失一律不成立；其余
+// 情况交给 compare 这个唯一的比较实现。
+func (c Condition) matches(ctx *Context) bool {
+	v, present := ctx.Get(c.Attribute)
+	return present && c.compare(v)
+}
+
+// compare 是 eq/in 两类条件唯一的比较实现：给定上下文中的实际值，报告条件
+// 是否成立。普通模式的 matches 与解释模式的 evaluate 都以它为准，两种模式
+// 不会各算一套。未知运算符（解析阶段已拒绝，这里防御性处理）一律不成立。
+func (c Condition) compare(actual string) bool {
+	switch c.Op {
+	case "eq":
+		return actual == c.strVal
+	case "in":
+		for _, candidate := range c.inVal {
+			if actual == candidate {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // evaluate 判断单个条件并记录属性名、比较方式、配置比较值、上下文实际值与
-// 是否成立；规则与开关各层级的“条件是否成立”都以这里的 Match 为准，普通模式
-// 与解释模式不再各算一遍。属性缺失用 Missing=true、ActualValue=nil 表示，
-// 绝不与显式空字符串（ActualValue 指向 ""）混淆。
+// 是否成立；是否成立由 compare 这同一份比较逻辑得出，与普通模式不再各算一遍。
+// 属性缺失用 Missing=true、ActualValue=nil 表示，绝不与显式空字符串
+// （ActualValue 指向 ""）混淆。仅供解释模式使用。
 func (c Condition) evaluate(ctx *Context) ConditionExplanation {
 	ce := ConditionExplanation{Attribute: c.Attribute, Op: c.Op}
 	switch c.Op {
@@ -427,19 +486,7 @@ func (c Condition) evaluate(ctx *Context) ConditionExplanation {
 		return ce
 	}
 	ce.ActualValue = &v
-	switch c.Op {
-	case "eq":
-		ce.Match = v == c.strVal
-	case "in":
-		for _, candidate := range c.inVal {
-			if v == candidate {
-				ce.Match = true
-				break
-			}
-		}
-	default:
-		ce.Match = false
-	}
+	ce.Match = c.compare(v)
 	return ce
 }
 
