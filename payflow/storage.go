@@ -169,15 +169,17 @@ func createExclusive(path string, v any) error {
 func validateAndReplay(initial, final map[balanceKey]int64, records []Record, refunds []RefundRecord) error {
 	// 先校验结算自身的结构不变式（余额相关的判定由后面的交错重放完成，
 	// 因为退款回收的余额允许同一笔钱被再次扣出，累计毛扣款可能超过初始余额）。
-	seen := map[string]bool{}
+	// 同一遍扫描顺带建立“编号 -> 记录”索引：ID 已在此确认唯一，后面的退款
+	// 关联校验直接按编号 O(1) 定位原付款，不必为每条退款重扫整段付款历史。
+	settlementByID := make(map[string]int, len(records))
 	for i, r := range records {
 		if r.ID == "" {
 			return ledgerError(ErrCorrupt, "settlement %d has empty id", i)
 		}
-		if seen[r.ID] {
+		if _, dup := settlementByID[r.ID]; dup {
 			return ledgerError(ErrCorrupt, "duplicate settlement id %q", r.ID)
 		}
-		seen[r.ID] = true
+		settlementByID[r.ID] = i
 		if r.Account == "" || r.Asset == "" {
 			return ledgerError(ErrCorrupt, "settlement %q missing account or asset", r.ID)
 		}
@@ -237,16 +239,14 @@ func validateAndReplay(initial, final map[balanceKey]int64, records []Record, re
 		}
 		prevAfterSeq = rf.AfterSeq
 		prevRefundID = rf.ID
-		var target *Record
-		for j := range records {
-			if records[j].Seq <= rf.AfterSeq && records[j].ID == rf.SettlementID {
-				target = &records[j]
-				break
-			}
-		}
-		if target == nil {
+		// 按退款发生时的付款历史判断关联：编号必须存在，且该付款的成功
+		// 序号不得晚于退款的 after_seq（退款不能引用它发生之后才成功的
+		// 付款，即使该付款最终出现在完整历史中）。两种情形沿用同一诊断。
+		idx, exists := settlementByID[rf.SettlementID]
+		if !exists || records[idx].Seq > rf.AfterSeq {
 			return ledgerError(ErrCorrupt, "refund %q references non-existent settlement %q", rf.ID, rf.SettlementID)
 		}
+		target := &records[idx]
 		if rf.Account != target.Account || rf.Asset != target.Asset ||
 			rf.Amount != target.Amount || rf.Fee != target.Fee || rf.Charged != target.Charged {
 			return ledgerError(ErrCorrupt, "refund %q amount or destination differs from settlement %q", rf.ID, rf.SettlementID)
