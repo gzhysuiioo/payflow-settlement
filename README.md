@@ -26,7 +26,7 @@ go test ./...
 ```
 
 - `reason`：`disabled`（开关关闭，固定 false）、`rule`（命中规则，`ruleId` 为该规则 id）、`default`（无规则命中，取 default，`ruleId` 为 null）。
-- 配置顶层为 `{"flags":[...]}`；每个开关含非空 `key`、布尔 `enabled`/`default`、`rules`；规则含非空 `id`、布尔 `value` 与非空 `conditions`；条件含非空 `attribute`、`op`（`eq`/`in`）和 `value`（eq 为字符串，in 为非空字符串数组）。
+- 配置顶层为 `{"flags":[...]}`；每个开关含非空 `key`、布尔 `enabled`/`default`、`rules`；规则含非空 `id`、布尔 `value` 与非空 `conditions`（`id` 只在**所属开关的 `rules` 内**唯一，不同开关可以复用同一个编号，复制规则时是否要改号见下文“规则编号什么时候必须改：id 的唯一性范围”）；条件含非空 `attribute`、`op`（`eq`/`in`）和 `value`（eq 为字符串，in 为非空字符串数组）。
 - 配置允许在顶层以及开关、规则、条件对象中携带业务字段之外的附加字段（如负责人、备注、标签）：值可以是字符串、数字、布尔、`null`、数组或对象并继续嵌套，语法合法的大数字（如 `1e400`）也算可接受的附加信息；它们不成为上下文属性、不参与规则判断，也不会出现在结果对象中，详见下文“配置中的附加信息”。
 - 上下文为属性名到字符串的对象，可为 `{}`，空字符串是合法值；属性缺失即条件不成立。比较区分大小写、不裁剪空白。
 - 字符串中的 `\uXXXX` 转义必须组成完整字符：高代理项只能与紧接着的低代理项配对，孤立的高/低代理项或不完整、顺序错误的配对（无论出现在字段名还是字符串值中）都会使读取失败；真正的 `�`（U+FFFD）仍是合法字符串。
@@ -481,6 +481,253 @@ evaluate: flag key "café🎉x" not found in config "config-similar.json"
 ```
 
 命令非零退出、标准输出为空。小结：配置里先按 JSON 解码得到真实名称，再判重、再与命令行参数做逐码点精确相等；参数里写什么就查找什么，转义只存在于 JSON 文本这一层。
+
+### 规则编号什么时候必须改：id 的唯一性范围
+
+规则 `id` 的唯一性以**开关**为界：同一个开关的 `rules` 数组里不允许出现两条解码后同名的规则；不同开关的规则互不相干，编号相同完全合法，`id` 并不要求在整份配置中全局唯一。复制规则时可以照此判断：
+
+- **把规则复制（或移动）到另一个开关**：原编号原样保留即可——只要接收方开关里没有同号规则就合法。两个开关各有一条 `r-pro` 不构成任何冲突。
+- **在同一个开关内新增一条规则**：新规则的 `id` 必须与该开关已有的每条规则都不同，否则整份配置在读取校验阶段就被拒绝，不会进入求值。
+
+还要注意：跨开关复用 id 不会让两条规则变成“同一条规则”。每次求值只在命令行指定的那个开关内部按数组次序挑选规则，绝不会因为编号相同而跨开关选择、覆盖或合并。阅读结果时要结合结果中的 `key` 识别规则属于哪个开关，不能只凭 `ruleId` 就把两个开关里的同号规则当成同一条配置。
+
+#### 贯穿示例：两个开关共用同一个规则编号
+
+把下面这份配置保存为 `config-shared.json`：两个开关 `fast-checkout` 与 `express-settlement` 各有一条 id 为 `r-pro` 的规则，条件完全相同（`plan` 等于 `pro`），但返回值相反——前者 `true`、后者 `false`；两个开关的 `default` 也特意取反，方便区分：
+
+```json
+{
+  "flags": [
+    {
+      "key": "fast-checkout",
+      "enabled": true,
+      "default": false,
+      "rules": [
+        {
+          "id": "r-pro",
+          "value": true,
+          "conditions": [
+            {"attribute": "plan", "op": "eq", "value": "pro"}
+          ]
+        }
+      ]
+    },
+    {
+      "key": "express-settlement",
+      "enabled": true,
+      "default": true,
+      "rules": [
+        {
+          "id": "r-pro",
+          "value": false,
+          "conditions": [
+            {"attribute": "plan", "op": "eq", "value": "pro"}
+          ]
+        }
+      ]
+    }
+  ]
+}
+```
+
+上下文保存为 `context-pro.json`，下面两次求值复用同一份：
+
+```json
+{"plan": "pro"}
+```
+
+分别对两个开关求值：
+
+```bash
+go run ./cmd/payflow evaluate config-shared.json fast-checkout context-pro.json
+go run ./cmd/payflow evaluate config-shared.json express-settlement context-pro.json
+```
+
+输出依次为：
+
+```json
+{"key":"fast-checkout","value":true,"reason":"rule","ruleId":"r-pro"}
+```
+
+```json
+{"key":"express-settlement","value":false,"reason":"rule","ruleId":"r-pro"}
+```
+
+两次都是命中规则（`reason` 为 `rule`）、`ruleId` 都是 `r-pro`；把两者区分开的是结果里的 `key` 与布尔 `value`：`fast-checkout` 采用的是它自己那条返回 `true` 的规则，`express-settlement` 采用的是它自己那条返回 `false` 的规则。相同编号没有让求值跨开关挑选规则——每个命令只在第二个参数指定的开关内部匹配条件。因此消费结果时应把 `(key, ruleId)` 合起来作为规则身份：在汇总多个开关的日志、指标或审计流水中，只按 `ruleId` 去重或关联，会把这两条彼此独立的合法配置错误地并成一条。
+
+#### 在同一个开关内加入同号规则：没有求值结果
+
+继续沿用上面的文件，这次在 `fast-checkout` 内**追加**第二条 id 仍为 `r-pro` 的规则，其余字段全部合法（条件与第一条相同），另一个开关保持不动。整份存为 `config-dup-rule.json`：
+
+```json
+{
+  "flags": [
+    {
+      "key": "fast-checkout",
+      "enabled": true,
+      "default": false,
+      "rules": [
+        {
+          "id": "r-pro",
+          "value": true,
+          "conditions": [
+            {"attribute": "plan", "op": "eq", "value": "pro"}
+          ]
+        },
+        {
+          "id": "r-pro",
+          "value": false,
+          "conditions": [
+            {"attribute": "plan", "op": "eq", "value": "pro"}
+          ]
+        }
+      ]
+    },
+    {
+      "key": "express-settlement",
+      "enabled": true,
+      "default": true,
+      "rules": [
+        {
+          "id": "r-pro",
+          "value": false,
+          "conditions": [
+            {"attribute": "plan", "op": "eq", "value": "pro"}
+          ]
+        }
+      ]
+    }
+  ]
+}
+```
+
+```bash
+go run ./cmd/payflow evaluate config-dup-rule.json fast-checkout context-pro.json
+```
+
+这一次没有任何求值结果：命令以非零状态退出，标准输出为空，标准错误指出**第二次出现**该编号的字段位置，并提示它在本开关内第一次出现的位置：
+
+```
+config.flags[0].rules[1].id: duplicate rule id "r-pro" (first at rules[0])
+```
+
+（用 `go run` 运行时标准错误还会追加一行 `exit status 1`；程序本身只输出上面那一行。）
+
+- 位置 `config.flags[0].rules[1].id` 指向后一条规则的 `id` 字段；括号中的 `first at rules[0]` 说明同一编号第一次出现在**同一开关**的 `rules[0]`（“首次出现”始终在所属开关的 `rules` 内计数，不会追溯到别的开关——`express-settlement` 里的 `r-pro` 是合法复用，不算首次出现）。
+- 这是**配置读取失败，不是求值结果**：标准输出没有 JSON 对象，退出码非零。绝不能把它解释成“开关返回了 false”：开关真实算出 `false` 时退出码为 0，标准输出照常是带 `"value":false` 的结果对象，且 `reason` 为 `rule`、`default` 或 `disabled` 之一（对照见上文“上下文校验失败”末尾的“校验失败不等于合法求值返回 false”）。
+- 普通模式与 `--explain` 都不能跳过这个错误。加上第四个参数 `--explain`，得到的是同一行错误、同样的非零退出与空标准输出——既没有四字段结果，也没有 `explanation` 对象：
+
+```bash
+go run ./cmd/payflow evaluate config-dup-rule.json fast-checkout context-pro.json --explain
+```
+
+```
+config.flags[0].rules[1].id: duplicate rule id "r-pro" (first at rules[0])
+```
+
+- 改选另一个开关也绕不过去。规则 id 唯一性是整份配置的校验项，在任何求值之前对全部开关完整检查；即使本次请求的是不含重复的 `express-settlement`，得到的仍是同一行错误：
+
+```bash
+go run ./cmd/payflow evaluate config-dup-rule.json express-settlement context-pro.json
+```
+
+```
+config.flags[0].rules[1].id: duplicate rule id "r-pro" (first at rules[0])
+```
+
+这与上文“关闭的开关与配置校验”中缺失必填字段的情形一致：只要有一个开关通不过校验，整个命令就没有结果。
+
+#### 只改第二条规则的编号：配置重新被接受
+
+只把第二条规则的 `id` 从 `r-pro` 改成不同的文字 `r-allow`，规则在数组中的次序、`value`、`conditions` 全部不动（即把上一份配置的 `rules[1].id` 改写，其余逐字不变），存为 `config-dup-rule-fixed.json`：
+
+```json
+        {
+          "id": "r-allow",
+          "value": false,
+          "conditions": [
+            {"attribute": "plan", "op": "eq", "value": "pro"}
+          ]
+        }
+```
+
+```bash
+go run ./cmd/payflow evaluate config-dup-rule-fixed.json fast-checkout context-pro.json
+```
+
+```json
+{"key":"fast-checkout","value":true,"reason":"rule","ruleId":"r-pro"}
+```
+
+配置重新被接受，结果与只有第一条规则时完全一致：这个上下文同时满足两条规则，但规则按数组次序检查，`r-pro` 在前，由它定案返回 `true`，后面的 `r-allow` 即使同样命中、即使返回 `false` 也不会被考虑。由此可以看清编号的两个“不”：
+
+- **编号不用于排序**。检查顺序只取决于 `rules` 数组里的书写次序，不会因为 `r-allow` 与 `r-pro` 的字典序先后而重排；想改变谁先被考虑，只能交换规则在数组中的位置（见上文“完整示例：多条规则与命中优先级”）。
+- **编号不改变首条匹配定案的语义**。第一条全部条件成立的规则立即决定结果，哪怕它返回 `false`。把 id 改成不同文字仅仅是让配置恢复合法，条件匹配与优先级行为一字未变。id 的用途只是在结果的 `ruleId` 与 `--explain` 记录中标识“由哪条规则定案”。
+
+#### 换一种 JSON 写法不能消除同一开关内的冲突
+
+与开关键一样，规则 id 是否重复按 JSON **解码后**的文字判断：一条规则直接写出字符、另一条用合法的 `\uXXXX` 转义写出同一个编号，解码后仍然同名，不能靠“换一种写法”绕过冲突。例如把第二条规则 id 中的字母 `p`（U+0070）写成转义（其余仍与 `config-dup-rule.json` 相同）：
+
+```json
+        {
+          "id": "r-\u0070ro",
+          "value": false,
+          "conditions": [
+            {"attribute": "plan", "op": "eq", "value": "pro"}
+          ]
+        }
+```
+
+`r-\u0070ro` 解码后就是 `r-pro`（`p` 的转义写在它原本的位置上，前后文字不变）——转义外形与直接字符只是同一文字的两种 JSON 写法。整份配置得到的报错与两条都直接写 `"r-pro"` 时逐字相同，且错误信息引用的是解码后的文字（显示为 `"r-pro"`，不是转义外形）：
+
+```
+config.flags[0].rules[1].id: duplicate rule id "r-pro" (first at rules[0])
+```
+
+所以解决冲突只能改成一个**解码后确实不同**的编号（如上一步的 `r-allow`）。反过来在跨开关场景中，一个开关写 `r-pro`、另一个写 `r-\u0070ro` 仍只算合法复用。另需区分：不成对的代理项转义属于文档格式错误，会在这一步之前被拒绝（见本页开头关于 `\uXXXX` 的说明），与这里的唯一性检查无关。
+
+#### 重复规则位于未选中或已关闭的开关中，也会阻止整份配置求值
+
+唯一性检查覆盖**所有**开关，不限于命令行选中的那个。在 `config-shared.json` 末尾再追加一个已关闭的开关 `legacy-report`：它 `"enabled": false`，求值时本应固定返回 `false`、不读取任何规则，但它的 `rules` 里放了两条同号规则。整份存为 `config-dup-rule-disabled.json`：
+
+```json
+    {
+      "key": "legacy-report",
+      "enabled": false,
+      "default": false,
+      "rules": [
+        {
+          "id": "r-pro",
+          "value": true,
+          "conditions": [
+            {"attribute": "plan", "op": "eq", "value": "pro"}
+          ]
+        },
+        {
+          "id": "r-pro",
+          "value": false,
+          "conditions": [
+            {"attribute": "plan", "op": "eq", "value": "pro"}
+          ]
+        }
+      ]
+    }
+```
+
+即使请求的是与它完全无关的 `express-settlement`，普通模式与 `--explain` 都同样失败：
+
+```bash
+go run ./cmd/payflow evaluate config-dup-rule-disabled.json express-settlement context-pro.json
+go run ./cmd/payflow evaluate config-dup-rule-disabled.json express-settlement context-pro.json --explain
+```
+
+两条命令的标准输出都为空，标准错误都是：
+
+```
+config.flags[2].rules[1].id: duplicate rule id "r-pro" (first at rules[0])
+```
+
+把 `legacy-report` 改成 `"enabled": true` 但本次不选它，结果也一样——“未被选中”和“已关闭”都不豁免校验。注意位置中的 `flags[2]` 是 `legacy-report` 在开关数组中的下标，而 `first at rules[0]` 指的是**该开关内部**的第一条规则：重复计数从不出开关边界，所以前两个开关里的同号规则永远不会互相冲突，藏在任意开关里的重复却会让整份配置无法求值。
 
 ### 配置中的附加信息（负责人、备注、标签）
 
