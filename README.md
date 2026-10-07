@@ -17,7 +17,9 @@ go test ./...
 ## 离线特性开关求值
 
 `evaluate` 在本机离线对单个特性开关求值，依次传入配置文件路径、开关键与上下文文件路径，
-两个文件均为 UTF-8 JSON。成功时标准输出仅包含一个对象：
+两个文件均为 UTF-8 JSON。命令行用法见本页各小节；在自己的 Go 程序里直接调用同一套离线
+求值（解析、普通求值、解释求值、结果序列化与错误处理）见文末“在 Go 程序中直接调用”。
+成功时标准输出仅包含一个对象：
 
 ```json
 {"key":"new-checkout","value":true,"reason":"rule","ruleId":"r-pro"}
@@ -734,6 +736,345 @@ context.plan: duplicate field "plan"
 ```
 
 也就是说，先保证整份上下文是一份合法、无重复字段的 JSON 对象，再按文件次序逐个把属性值改成字符串，两类问题不会互相遮盖。
+
+## 在 Go 程序中直接调用
+
+上文各小节都是命令行输出；同一套离线求值也以 Go API 公开在包 `github.com/gzhysuiioo/payflow-settlement/payflow`，仅用标准库，没有任何网络或时间依赖。若你的程序就在本模块内，直接 `import` 该包；否则在自己的模块里 `require`（或 `replace` 到本地路径）本模块即可。入口分两类，沿用与命令行完全相同的输入校验和求值含义：
+
+| 入口 | 输入 | 用途 |
+| --- | --- | --- |
+| `payflow.ParseConfig(raw []byte)` / `payflow.ParseContext(raw []byte)` | 已在内存中的 UTF-8 JSON 字节 | 不碰文件系统，直接接收 JSON 字节 |
+| `payflow.LoadConfig(path)` / `payflow.LoadContext(path)` | 本地文件路径 | 读取本地文件后交给同一个 `Parse*`，读取失败保留 `os` 原始错误 |
+| `(*Config).Find(key)` | 开关键 | 按解码后文字精确查找，查不到返回 `nil` |
+| `(*Flag).Evaluate(ctx)` | 已校验的 `*Context` | 普通求值，返回 `EvalResult`（`Key`/`Value`/`Reason`/`RuleID`） |
+| `(*Flag).EvaluateExplain(ctx)` | 已校验的 `*Context` | 解释求值，返回 `ExplainedResult`（嵌入 `EvalResult`，另带 `Explanation`） |
+| `payflow.MarshalResult(...)` / `payflow.MarshalExplain(...)` | 上述结果 | 渲染成与命令行逐字一致的紧凑 JSON 对象（`[]byte`） |
+
+`Reason` 的取值是包常量 `payflow.EvalDisabled`/`payflow.EvalRule`/`payflow.EvalDefault`；`RuleID` 是 `*string`，只有命中规则时非 nil。
+
+### 同一个开关、两个上下文：缺失与空字符串
+
+下面这份配置只含开关 `guest-checkout`：已启用、默认 `true`，只有一条规则 `r-block-guest`（命中时返回 `false`）。规则的两个条件同时使用 `eq`（`plan` 等于 `pro`）和 `in`（`tier` 属于候选列表），候选列表特意包含空字符串与重复成员，且保持给定次序：
+
+```go
+const configJSON = `{
+  "flags": [
+    {
+      "key": "guest-checkout",
+      "enabled": true,
+      "default": true,
+      "rules": [
+        {
+          "id": "r-block-guest",
+          "value": false,
+          "conditions": [
+            {"attribute": "plan", "op": "eq", "value": "pro"},
+            {"attribute": "tier", "op": "in", "value": ["", "a", "a"]}
+          ]
+        }
+      ]
+    }
+  ]
+}`
+```
+
+同一份配置分别处理两个上下文：上下文 A 缺少 `tier`，上下文 B 显式给出 `"tier":""`；两者的 `plan` 都是 `"pro"`，因此两次结果的差异只可能来自“缺失”与“空字符串”。完整程序：
+
+```go
+package main
+
+import (
+	"fmt"
+
+	"github.com/gzhysuiioo/payflow-settlement/payflow"
+)
+
+const configJSON = `{ ... 同上 ... }`
+
+func ruleIDText(r payflow.EvalResult) string {
+	if r.RuleID == nil {
+		return "<nil>"
+	}
+	return *r.RuleID
+}
+
+func actualText(c payflow.ConditionExplanation) string {
+	if c.ActualValue == nil {
+		return "<nil>"
+	}
+	return fmt.Sprintf("%q", *c.ActualValue)
+}
+
+func printPlain(label string, r payflow.EvalResult) {
+	fmt.Printf("[%s] value=%v reason=%q ruleId=%s\n", label, r.Value, r.Reason, ruleIDText(r))
+	b, err := payflow.MarshalResult(r)
+	if err != nil {
+		panic(err)
+	}
+	fmt.Printf("[%s] json: %s\n", label, string(b))
+}
+
+func printExplain(label string, x payflow.ExplainedResult) {
+	fmt.Printf("[%s] value=%v reason=%q ruleId=%s\n", label, x.Value, x.Reason, ruleIDText(x.EvalResult))
+	fmt.Printf("[%s] outcome: %s\n", label, x.Explanation.Outcome)
+	for _, rr := range x.Explanation.Rules {
+		fmt.Printf("[%s] rule %s match=%v\n", label, rr.RuleID, rr.Match)
+		for _, c := range rr.Conditions {
+			fmt.Printf("[%s]   cond attribute=%q op=%q compareValue=%#v actualValue=%s missing=%v match=%v\n",
+				label, c.Attribute, c.Op, c.CompareValue, actualText(c), c.Missing, c.Match)
+		}
+	}
+	b, err := payflow.MarshalExplain(x)
+	if err != nil {
+		panic(err)
+	}
+	fmt.Printf("[%s] json: %s\n", label, string(b))
+}
+
+func main() {
+	cfg, err := payflow.ParseConfig([]byte(configJSON))
+	if err != nil {
+		panic(err)
+	}
+	flag := cfg.Find("guest-checkout")
+	if flag == nil {
+		panic("guest-checkout not found")
+	}
+
+	// 上下文 A：缺少 tier。
+	ctxMissing, err := payflow.ParseContext([]byte(`{"plan":"pro"}`))
+	if err != nil {
+		panic(err)
+	}
+	// 上下文 B：显式提供空字符串 tier。
+	ctxEmpty, err := payflow.ParseContext([]byte(`{"plan":"pro","tier":""}`))
+	if err != nil {
+		panic(err)
+	}
+
+	// 普通求值：只要四字段结果。
+	plainMissing := flag.Evaluate(ctxMissing)
+	plainEmpty := flag.Evaluate(ctxEmpty)
+	printPlain("missing", plainMissing)
+	printPlain("empty", plainEmpty)
+
+	// 带解释的求值：同一开关、同样两个上下文，各取一份独立记录。
+	recMissing := flag.EvaluateExplain(ctxMissing)
+	recEmpty := flag.EvaluateExplain(ctxEmpty)
+	printExplain("missing", recMissing)
+	printExplain("empty", recEmpty)
+
+	// 普通结果与解释的最终结果逐字一致。
+	fmt.Println("plain == explained final result (missing):",
+		plainMissing.Equals(recMissing.EvalResult))
+	fmt.Println("plain == explained final result (empty):",
+		plainEmpty.Equals(recEmpty.EvalResult))
+}
+```
+
+运行输出（`#v` 那行用 Go 语法直接打印出比较值的真实类型）：
+
+```text
+[missing] value=true reason="default" ruleId=<nil>
+[missing] json: {"key":"guest-checkout","value":true,"reason":"default","ruleId":null}
+[empty] value=false reason="rule" ruleId=r-block-guest
+[empty] json: {"key":"guest-checkout","value":false,"reason":"rule","ruleId":"r-block-guest"}
+[missing] value=true reason="default" ruleId=<nil>
+[missing] outcome: no rule matched; the flag default is used
+[missing] rule r-block-guest match=false
+[missing]   cond attribute="plan" op="eq" compareValue="pro" actualValue="pro" missing=false match=true
+[missing]   cond attribute="tier" op="in" compareValue=[]string{"", "a", "a"} actualValue=<nil> missing=true match=false
+[missing] json: {"key":"guest-checkout","value":true,"reason":"default","ruleId":null,"explanation":{"outcome":"no rule matched; the flag default is used","rules":[{"ruleId":"r-block-guest","match":false,"conditions":[{"attribute":"plan","op":"eq","compareValue":"pro","actualValue":"pro","missing":false,"match":true},{"attribute":"tier","op":"in","compareValue":["","a","a"],"actualValue":null,"missing":true,"match":false}]}]}}
+[empty] value=false reason="rule" ruleId=r-block-guest
+[empty] outcome: first matching rule "r-block-guest" decides the result; later rules are not considered
+[empty] rule r-block-guest match=true
+[empty]   cond attribute="plan" op="eq" compareValue="pro" actualValue="pro" missing=false match=true
+[empty]   cond attribute="tier" op="in" compareValue=[]string{"", "a", "a"} actualValue="" missing=false match=true
+[empty] json: {"key":"guest-checkout","value":false,"reason":"rule","ruleId":"r-block-guest","explanation":{"outcome":"first matching rule \"r-block-guest\" decides the result; later rules are not considered","rules":[{"ruleId":"r-block-guest","match":true,"conditions":[{"attribute":"plan","op":"eq","compareValue":"pro","actualValue":"pro","missing":false,"match":true},{"attribute":"tier","op":"in","compareValue":["","a","a"],"actualValue":"","missing":false,"match":true}]}]}}
+plain == explained final result (missing): true
+plain == explained final result (empty): true
+```
+
+据此可以把调用方拿到的 Go 对象与 JSON 一一对应起来：
+
+- **最终结果与解释严格对应**：解释记录嵌入的 `EvalResult` 与普通求值得到的 `EvalResult` 字段逐字一致（示例最后两行的 `Equals` 比较均为 `true`）。上下文 A 无规则命中，布尔值是 `true`、`Reason` 为 `payflow.EvalDefault`（即 `"default"`）、`RuleID` 为 `nil`；上下文 B 命中唯一规则，布尔值是 `false`、`Reason` 为 `payflow.EvalRule`、`RuleID` 指向 `"r-block-guest"`。
+- **没有规则命中时的规则编号就是 `nil`**：Go 里 `RuleID *string == nil`，序列化成 JSON 的 `"ruleId":null`；命中规则时它是非 nil 指针，解引用得到规则 id。不要用“`RuleID` 是不是空字符串”判断，未命中用 nil 表示。
+- **缺失的实际值如何表示**：`ConditionExplanation.ActualValue` 是 `*string`。上下文 A 缺少 `tier`，它是 `nil` 指针且 `Missing == true`，JSON 中是 `"actualValue":null,"missing":true`；上下文 B 显式给空字符串，它是指向 `""` 的非 nil 指针、`Missing == false`，JSON 中是 `"actualValue":"","missing":false`。二者在 Go 类型层面和 JSON 层面都不会混淆。
+- **比较值的类型随运算符而定**：`CompareValue` 字段是 `any`，`eq` 条件里装的是普通 `string`（示例中 `compareValue="pro"`），`in` 条件里装的是 `[]string`（`compareValue=[]string{"", "a", "a"}`）。需要读列表时做一次类型断言：`list := cond.CompareValue.([]string)`。
+- **候选次序与重复成员原样保留**：`in` 的比较值就是配置中的那个数组，空字符串排在第一位、两个 `"a"` 重复且不去重、次序不变；JSON 里同样逐字是 `["","a","a"]`。求值时按此次序逐个比较，命中任一成员即可（空字符串也能命中——上下文 B 正是因此让规则成立）。
+- **JSON 与命令行一致**：`MarshalResult`/`MarshalExplain` 输出的就是上文 `evaluate`/`--explain` 命令打印的同一形态紧凑对象，`<`、`>`、`&` 不转义，非 ASCII 字符直接输出。
+
+### 保存解释记录与后续操作的关系
+
+每次调用 `EvaluateExplain` 都按当时的配置与上下文**重新构建并返回一份独立记录**：in 候选列表会复制一份，不与配置共享底层数组。因此为展示而修改手里这份记录的文字（`Outcome`）、实际值（`ActualValue`）或候选列表（`CompareValue`），都只作用于这份记录——不会改回原配置、原上下文，不会串到另一份已取得的记录，也不会改变之后任何一次求值；反过来，之后换用上下文再次求值，也不会覆盖此前保存的记录。
+
+```go
+package main
+
+import (
+	"fmt"
+
+	"github.com/gzhysuiioo/payflow-settlement/payflow"
+)
+
+const configJSON = `{ ... 同上 ... }`
+
+func mustExplain(flag *payflow.Flag, raw string) payflow.ExplainedResult {
+	ctx, err := payflow.ParseContext([]byte(raw))
+	if err != nil {
+		panic(err)
+	}
+	return flag.EvaluateExplain(ctx)
+}
+
+func main() {
+	cfg, err := payflow.ParseConfig([]byte(configJSON))
+	if err != nil {
+		panic(err)
+	}
+	flag := cfg.Find("guest-checkout")
+
+	// 同一份配置分别对两个上下文求值，各得一份独立记录。
+	recMissing := mustExplain(flag, `{"plan":"pro"}`)
+	recEmpty := mustExplain(flag, `{"plan":"pro","tier":""}`)
+
+	tierBefore := recMissing.Explanation.Rules[0].Conditions[1]
+	fmt.Printf("recMissing tier before: compareValue=%#v actualValue=%v missing=%v\n",
+		tierBefore.CompareValue, tierBefore.ActualValue, tierBefore.Missing)
+	emptyBefore, _ := payflow.MarshalExplain(recEmpty)
+
+	// 只为展示而改写 recMissing：文字、缺失实际值、in 候选列表各动一处。
+	recMissing.Explanation.Outcome = "rewritten by the caller for display"
+	injected := "injected-for-display"
+	recMissing.Explanation.Rules[0].Conditions[1].ActualValue = &injected
+	recMissing.Explanation.Rules[0].Conditions[1].Missing = false
+	tier := &recMissing.Explanation.Rules[0].Conditions[1]
+	list := tier.CompareValue.([]string)
+	list[0] = "x" // 就地改候选首项（原为空字符串）
+	tier.CompareValue = append(list, "b")
+
+	tierAfter := recMissing.Explanation.Rules[0].Conditions[1]
+	fmt.Printf("recMissing tier after:  compareValue=%#v actualValue=%q missing=%v\n",
+		tierAfter.CompareValue, *tierAfter.ActualValue, tierAfter.Missing)
+
+	emptyAfter, _ := payflow.MarshalExplain(recEmpty)
+	fmt.Println("recEmpty JSON unchanged after editing recMissing:",
+		string(emptyBefore) == string(emptyAfter))
+
+	// 换用上下文再次求值：新结果属于新上下文，之前保存的记录保持当时内容。
+	fresh := mustExplain(flag, `{"plan":"free","tier":""}`)
+	fmt.Printf("fresh on {plan:free}: value=%v reason=%q ruleId=%v\n",
+		fresh.Value, fresh.Reason, fresh.RuleID)
+	fmt.Printf("saved recEmpty still:  value=%v reason=%q ruleId=%q\n",
+		recEmpty.Value, recEmpty.Reason, *recEmpty.RuleID)
+	fmt.Println("saved recMissing outcome still edited:", recMissing.Explanation.Outcome)
+
+	// 对照：普通结构体赋值不会复制 Rules 背后的嵌套数据，两个变量看到同一份。
+	a := mustExplain(flag, `{"plan":"pro","tier":""}`)
+	dup := a // 不是一次新的求值
+	dup.Explanation.Rules[0].Conditions[1].CompareValue = []string{"z"}
+	fmt.Printf("a sees dup's edit through shared nested data: %v (a list now %#v)\n",
+		a.Explanation.Rules[0].Conditions[1].CompareValue.([]string)[0] == "z",
+		a.Explanation.Rules[0].Conditions[1].CompareValue)
+	again := mustExplain(flag, `{"plan":"pro","tier":""}`)
+	fmt.Printf("a fresh evaluation always rebuilds its own list: %#v\n",
+		again.Explanation.Rules[0].Conditions[1].CompareValue)
+}
+```
+
+输出：
+
+```text
+recMissing tier before: compareValue=[]string{"", "a", "a"} actualValue=<nil> missing=true
+recMissing tier after:  compareValue=[]string{"x", "a", "a", "b"} actualValue="injected-for-display" missing=false
+recEmpty JSON unchanged after editing recMissing: true
+fresh on {plan:free}: value=true reason="default" ruleId=<nil>
+saved recEmpty still:  value=false reason="rule" ruleId="r-block-guest"
+saved recMissing outcome still edited: rewritten by the caller for display
+a sees dup's edit through shared nested data: true (a list now []string{"z"})
+a fresh evaluation always rebuilds its own list: []string{"", "a", "a"}
+```
+
+前后对照说明：
+
+- 被改写的 `recMissing` 的 `tier` 条件，比较值从 `[]string{"", "a", "a"}`、实际值 `nil`/`missing=true`，变成 `[]string{"x", "a", "a", "b"}`、实际值 `"injected-for-display"`/`missing=false`；但同次运行里另一份记录 `recEmpty` 序列化后逐字节不变（`... unchanged ...: true`），配置中的候选仍可由下一次求值证明是原样。
+- 换成 `{"plan":"free","tier":""}` 再求值得到的是新上下文自己的结果（`true`/`default`/`nil`）；此前保存的 `recEmpty` 仍是当时的 `false`/`rule`/`r-block-guest`，被改写过的 `recMissing` 也保留展示文字。重新求值只读配置与上下文，不读任何旧记录。
+- **结构体赋值不等于两份独立记录**：`dup := a` 只是一次浅拷贝，`dup` 与 `a` 仍共享 `Explanation.Rules` 背后的切片、条件和字符串数据，通过 `dup` 改嵌套字段，`a` 立刻看得到（输出中 `a` 的候选变成了 `[]string{"z"}`）。要得到互不影响的两份记录，只能对同一/另一上下文再次调用 `EvaluateExplain`——它会重建列表（末行又恢复为 `[]string{"", "a", "a"}`）；若只是想复制一份在手记录上再改，需自行深拷贝相关切片。
+
+### 失败时如何结束操作
+
+读取与校验发生在求值之前。任何错误都应让调用方保留具体错误并结束，**不产出求值结果**；这与“合法规则返回 `false`”的成功结果完全不同。注意区分两类现有入口：`ParseConfig`/`ParseContext` 接收 JSON 字节，`LoadConfig`/`LoadContext` 读取本地文件（读不到文件时错误来自 `os`，外层包上文件路径）；两者之后走的是同一套严格校验。查不到开关时 `Find` 返回 `nil`，需显式告知“未找到”，不能把它当成 `false` 结果，也不能在 nil 开关上继续求值。
+
+```go
+package main
+
+import (
+	"fmt"
+
+	"github.com/gzhysuiioo/payflow-settlement/payflow"
+)
+
+func main() {
+	// 入口一：直接接收 JSON 字节（不碰文件系统），与读文件走同一套严格校验。
+	goodConfig := []byte(`{"flags":[{"key":"f","enabled":true,"default":true,"rules":[
+	  {"id":"r-ok","value":false,"conditions":[
+	    {"attribute":"plan","op":"eq","value":"pro"}]}]}]}`)
+	cfg, err := payflow.ParseConfig(goodConfig)
+	if err != nil {
+		fmt.Println("stop, no result:", err) // 读取/校验失败：保留错误，不产出求值结果
+		return
+	}
+	ctx, err := payflow.ParseContext([]byte(`{"plan":"pro"}`))
+	if err != nil {
+		fmt.Println("stop, no result:", err)
+		return
+	}
+	// 合法规则返回 false 仍是成功结果：reason=rule，在库里不以错误呈现。
+	if flag := cfg.Find("f"); flag != nil {
+		r := flag.Evaluate(ctx)
+		fmt.Printf("legal false is a success result: value=%v reason=%q ruleId=%q\n",
+			r.Value, r.Reason, *r.RuleID)
+	}
+
+	// 入口二：读取本地文件，校验错误（含文件不存在）原样上抛。
+	if _, err := payflow.LoadConfig("no-such-config.json"); err != nil {
+		fmt.Println("stop, no result:", err)
+	}
+	if _, err := payflow.LoadContext("no-such-context.json"); err != nil {
+		fmt.Println("stop, no result:", err)
+	}
+	// 上下文属性值不是字符串：ParseContext/LoadContext 给出的具体错误原样保留。
+	if _, err := payflow.ParseContext([]byte(`{"plan":false}`)); err != nil {
+		fmt.Println("stop, no result:", err)
+	}
+	if _, err := payflow.ParseConfig([]byte(`{"flags":[{"key":"f","enabled":"yes","default":true,"rules":[]}]}`)); err != nil {
+		fmt.Println("stop, no result:", err)
+	}
+
+	// 查不到指定开关：明确告知未找到，不当成返回 false，也不继续求值。
+	if f := cfg.Find("absent-flag"); f == nil {
+		fmt.Println(`flag key "absent-flag" not found; stop, do not treat as false`)
+	}
+}
+```
+
+输出：
+
+```text
+legal false is a success result: value=false reason="rule" ruleId="r-ok"
+stop, no result: cannot read config file "no-such-config.json": open no-such-config.json: no such file or directory
+stop, no result: cannot read context file "no-such-context.json": open no-such-context.json: no such file or directory
+stop, no result: context.plan: value must be a string
+stop, no result: config.flags[0].enabled: must be a boolean
+flag key "absent-flag" not found; stop, do not treat as false
+```
+
+要点：
+
+- 本地文件不存在时，`Load*` 保留 `cannot read ... file: open ...: no such file or directory` 这样的具体错误（包上了路径与文件类别）；直接喂字节的 `Parse*` 则不会产生文件读取错误。
+- 上下文属性值不是字符串（如 `{"plan":false}`）得到 `context.plan: value must be a string`；配置字段类型错误同样给出字段位置（`config.flags[0].enabled: must be a boolean`）。命令行文档中的其余校验（重复字段、代理项转义、整份配置全量校验等）在库里原样适用——`Parse*`/`Load*` 不会因为嵌入使用而放宽。
+- 第一行是**成功求值**：规则 `r-ok` 合法且返回 `false`，所以 `value=false`、`reason="rule"`、`ruleId="r-ok"`，没有 error；它与上面四行“校验失败、没有结果对象”有本质区别，也与开关关闭的 `reason="disabled"`、无规则命中的 `reason="default"` 区分。
+- `Find` 返回 `nil` 表示配置中没有该键：调用方应明确报“未找到”并停止，既不能把缺失误判为 `false` 布尔结果，也不能对 nil 开关调用 `Evaluate`。
 
 ## 技术方向
 
