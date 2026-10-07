@@ -295,6 +295,121 @@ JSON
 - `payflow version`：版本号；
 - `payflow.Execute` / `payflow.Reconcile` API 保持可用。
 
+### payflow.Execute — 内存单笔结算
+
+`payflow.Execute(intent, feeBps, spent, balance)` 对**一笔**付款意图应用手续费
+策略并按编号幂等，返回 `Settlement`。它是纯内存计算：不写本地账本、不保存
+任何结果，余额与编号标记的维护责任都在调用者一侧。
+
+**调用者负责维护余额。** 传入的 `balance` 是**本次调用**的可用余额，`Execute`
+只读它做判断，不会替调用者更新它，也不会把结果写进本地账本。成功返回的
+`Charged` 已包含手续费（金额 + `amount*feeBps/10000` 向下取整），调用者据此
+更新自己保存的余额：`balance -= settlement.Charged`。只有 `settled` 才能这样
+扣减；`failed` 与 `rejected` 的结果没有发生扣款，绝不能用来减少调用者的余额。
+
+**调用者负责维护编号标记表。** `spent` 是由调用者创建并保留的可写编号标记表，
+多次调用之间应共用同一份，由 `Execute` 在**成功**时写入编号。余额不足
+（`failed`）或参数、状态被拒绝（`rejected`）都不会占用编号，因此失败编号
+可以修改请求后重新提交。
+
+**状态分类。** `intent.State` 必须显式为 `"pending"`，空状态（零值）或其他状态
+返回 `rejected`（原因 `intent is not pending`）。金额非正、费率越界、扣款总额
+溢出 int64 同样返回 `rejected`。参数与状态都合法但 `amount + fee` 超过本次
+可用余额时返回 `failed`（原因 `insufficient balance for amount plus fee`）——
+`failed` 与 `rejected` 是分开的两类，前者只是这次余额不够，后者是请求本身
+不被接受；两者都不扣款、不占编号。
+
+**重复成功编号。** 编号一旦成功，再次提交（即使改变金额等付款字段或费率）
+一律返回 `rejected`（原因 `duplicate settlement attempt`），**不返回原成功
+记录**，也没有本地账本提交功能的 `duplicate` / `conflict` 分类——旧功能只有
+上述三种状态。需要原样重试结果（`duplicate` 携带原记录、字段不符报
+`conflict`）的调用者应使用本地账本 `submit`。
+
+下面的完整示例围绕同一账户（`aa-1`）、同一资产（`usdc`）连续付款：起始余额
+2000、费率 30 基点。注意每次调用传入的 `balance` 都是上一笔成功扣减后的
+余额，不能把起始余额 2000 重复当作后续付款的可用余额：
+
+```go
+package main
+
+import (
+	"fmt"
+
+	"github.com/gzhysuiioo/payflow-settlement/payflow"
+)
+
+func main() {
+	const feeBps = 30 // 30 基点 = 0.30%
+
+	// 调用者自己保存的可用余额：Execute 不会替调用者更新它。
+	balance := int64(2000)
+
+	// 调用者创建并保留的编号标记表：多次调用共用同一份，
+	// 只有成功付款才写入编号。
+	spent := map[string]bool{}
+
+	// 第一笔：付款 1500，手续费 1500*30/10000 向下取整 = 4，扣款 1504。
+	s1 := payflow.Execute(payflow.Intent{
+		ID: "pay-1", Account: "aa-1", Paymaster: "pm-1",
+		Amount: 1500, Asset: "usdc", Nonce: 1, State: "pending",
+	}, feeBps, spent, balance)
+	fmt.Printf("%s: status=%s charged=%d\n", s1.Intent, s1.Status, s1.Charged)
+	if s1.Status == "settled" {
+		balance -= s1.Charged // 扣 1504（含手续费）：余额 2000 -> 496
+	}
+
+	// 第二笔：换新编号付款 900，需扣 902，超过当前余额 496，failed。
+	s2 := payflow.Execute(payflow.Intent{
+		ID: "pay-2", Account: "aa-1", Paymaster: "pm-1",
+		Amount: 900, Asset: "usdc", Nonce: 2, State: "pending",
+	}, feeBps, spent, balance)
+	fmt.Printf("%s: status=%s reason=%q\n", s2.Intent, s2.Status, s2.Reason)
+	// failed 不扣款、不标记编号：balance 仍为 496，spent 里仍只有 pay-1。
+
+	// 把这笔失败请求的金额改成 400，用原失败编号 pay-2 重新提交：
+	// 需扣 401，不超过 496，成功。
+	s3 := payflow.Execute(payflow.Intent{
+		ID: "pay-2", Account: "aa-1", Paymaster: "pm-1",
+		Amount: 400, Asset: "usdc", Nonce: 2, State: "pending",
+	}, feeBps, spent, balance)
+	fmt.Printf("%s: status=%s charged=%d\n", s3.Intent, s3.Status, s3.Charged)
+	if s3.Status == "settled" {
+		balance -= s3.Charged // 扣 401：余额 496 -> 95
+	}
+
+	// 重复已成功的编号 pay-1：即使改了金额和费率，也只是 rejected，
+	// 不返回原结算记录，也没有账本提交功能的 conflict 分类。
+	dup := payflow.Execute(payflow.Intent{
+		ID: "pay-1", Account: "aa-1", Paymaster: "pm-1",
+		Amount: 100, Asset: "usdc", Nonce: 9, State: "pending",
+	}, 50, spent, balance)
+	fmt.Printf("%s again: status=%s reason=%q\n", dup.Intent, dup.Status, dup.Reason)
+
+	fmt.Printf("final balance=%d spent=%v\n", balance, spent)
+}
+```
+
+输出：
+
+```text
+pay-1: status=settled charged=1504
+pay-2: status=failed reason="insufficient balance for amount plus fee"
+pay-2: status=settled charged=401
+pay-1 again: status=rejected reason="duplicate settlement attempt"
+final balance=95 spent=map[pay-1:true pay-2:true]
+```
+
+可以看到同一份 `spent` 标记表留下的状态：失败的 900 付款没有占用 `pay-2`，
+所以改金额后能以原编号成功；最终 `spent` 只包含两笔成功付款的编号。
+
+**关于 `payflow demo` 的余额**：demo 为每次 `Execute` 调用都传入固定余额
+2000，各次调用互不影响，因此演示中 pay-1（扣 1504）与 pay-2（扣 902）都
+成功——这只是两次各自独立的单笔结算，不是共用 2000 余额的批次结果（若共用，
+第二笔应因 902 超过剩余 496 而失败）。需要自动保存余额、保留成功记录、
+原样重试返回 `duplicate`/`conflict` 结果的调用者，请使用本地账本提交功能
+（`payflow submit` 命令或 `payflow.Ledger.Submit`），账本会在同一个原子写入
+中落盘余额变化与成功记录。
+
 ## 技术方向
 
 wallet, paymaster, eip4337, account-abstraction, payment-channel, bundler, custody
