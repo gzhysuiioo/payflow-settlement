@@ -735,6 +735,195 @@ context.plan: duplicate field "plan"
 
 也就是说，先保证整份上下文是一份合法、无重复字段的 JSON 对象，再按文件次序逐个把属性值改成字符串，两类问题不会互相遮盖。
 
+### 在 Go 程序中直接调用
+
+上面的命令行用法只是 `payflow` 包的一层外壳；同样的读取、校验与求值可以在自己的 Go 程序里直接调用。导入路径为：
+
+```go
+import "github.com/gzhysuiioo/payflow-settlement/payflow"
+```
+
+输入有两组入口，校验与求值含义完全相同，区别只在来源：
+
+- `payflow.LoadConfig(path)` / `payflow.LoadContext(path)`：读取本地文件（UTF-8 JSON），文件读不到时返回带路径的错误；
+- `payflow.ParseConfig(raw []byte)` / `payflow.ParseContext(raw []byte)`：直接接受 JSON 字节，适合配置已在内存中的场景。
+
+求值入口是 `(*Flag).Evaluate`（普通模式，返回 `EvalResult`）与 `(*Flag).EvaluateExplain`（解释模式，返回 `ExplainedResult`，前四个字段与普通模式逐字一致，另带 `Explanation`）；`MarshalResult` / `MarshalExplain` 把结果渲染成与命令行输出相同的单行 JSON。
+
+#### 完整示例：缺失属性与显式空字符串
+
+`config-go.json`——开关 `new-checkout` 已启用、默认 `true`，唯一规则 `r-block` 命中时返回 `false`，两个条件分别用 `eq` 和 `in`，`in` 的候选列表含空字符串与重复成员：
+
+```json
+{
+  "flags": [
+    {
+      "key": "new-checkout",
+      "enabled": true,
+      "default": true,
+      "rules": [
+        {
+          "id": "r-block",
+          "value": false,
+          "conditions": [
+            {"attribute": "plan", "op": "eq", "value": "pro"},
+            {"attribute": "tier", "op": "in", "value": ["", "a", "a"]}
+          ]
+        }
+      ]
+    }
+  ]
+}
+```
+
+同一份配置配两个上下文，其他属性保持一致，唯一差别是 `tier` 缺失还是显式空字符串：
+
+```json
+// context-go-missing.json：没有 tier 属性
+{"plan": "pro", "region": "cn"}
+```
+
+```json
+// context-go-empty.json：tier 显式为空字符串
+{"plan": "pro", "tier": "", "region": "cn"}
+```
+
+完整程序（保存为 `main.go`，与三份 JSON 放在同一目录运行）：
+
+```go
+package main
+
+import (
+	"fmt"
+	"os"
+
+	"github.com/gzhysuiioo/payflow-settlement/payflow"
+)
+
+func strPtr(p *string) string {
+	if p == nil {
+		return "<nil>"
+	}
+	return fmt.Sprintf("%q", *p)
+}
+
+func run(flag *payflow.Flag, path string) {
+	ctx, err := payflow.LoadContext(path)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	plain, _ := payflow.MarshalResult(flag.Evaluate(ctx))
+	explained := flag.EvaluateExplain(ctx)
+	full, _ := payflow.MarshalExplain(explained)
+
+	fmt.Printf("== %s ==\n", path)
+	fmt.Printf("plain:     %s\n", plain)
+	fmt.Printf("explained: %s\n", full)
+	fmt.Printf("value=%v reason=%s ruleId=%s\n",
+		explained.Value, explained.Reason, strPtr(explained.RuleID))
+	tier := explained.Explanation.Rules[0].Conditions[1]
+	fmt.Printf("tier: compareValue=%#v (%T) actual=%s missing=%v match=%v\n",
+		tier.CompareValue, tier.CompareValue, strPtr(tier.ActualValue), tier.Missing, tier.Match)
+}
+
+func main() {
+	cfg, err := payflow.LoadConfig("config-go.json")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	flag := cfg.Find("new-checkout")
+	if flag == nil {
+		fmt.Fprintln(os.Stderr, `flag "new-checkout" not found`)
+		os.Exit(1)
+	}
+	run(flag, "context-go-missing.json")
+	run(flag, "context-go-empty.json")
+}
+```
+
+运行输出：
+
+```
+== context-go-missing.json ==
+plain:     {"key":"new-checkout","value":true,"reason":"default","ruleId":null}
+explained: {"key":"new-checkout","value":true,"reason":"default","ruleId":null,"explanation":{"outcome":"no rule matched; the flag default is used","rules":[{"ruleId":"r-block","match":false,"conditions":[{"attribute":"plan","op":"eq","compareValue":"pro","actualValue":"pro","missing":false,"match":true},{"attribute":"tier","op":"in","compareValue":["","a","a"],"actualValue":null,"missing":true,"match":false}]}]}}
+value=true reason=default ruleId=<nil>
+tier: compareValue=[]string{"", "a", "a"} ([]string) actual=<nil> missing=true match=false
+== context-go-empty.json ==
+plain:     {"key":"new-checkout","value":false,"reason":"rule","ruleId":"r-block"}
+explained: {"key":"new-checkout","value":false,"reason":"rule","ruleId":"r-block","explanation":{"outcome":"first matching rule \"r-block\" decides the result; later rules are not considered","rules":[{"ruleId":"r-block","match":true,"conditions":[{"attribute":"plan","op":"eq","compareValue":"pro","actualValue":"pro","missing":false,"match":true},{"attribute":"tier","op":"in","compareValue":["","a","a"],"actualValue":"","missing":false,"match":true}]}]}}
+value=false reason=rule ruleId="r-block"
+tier: compareValue=[]string{"", "a", "a"} ([]string) actual="" missing=false match=true
+```
+
+两次求值的差异确实只来自缺失与空字符串：`tier` 缺失时 `in` 条件不成立，规则不命中，取默认值 `true`（`reason` 为 `default`）；显式给出 `""` 时它正是候选列表的第一个成员，规则命中，结果为 `false`（`reason` 为 `rule`）。普通结果与解释中的最终结果严格对应：`plain` 一行的四个字段与 `explained` 一行的前四个字段逐字相同，解释只是把定案过程附加在后面。
+
+Go 对象层面的对应关系：
+
+- `EvalResult.RuleID` 是 `*string`：命中规则时指向规则 id（如 `"r-block"`）；没有规则命中（`default`）或开关关闭（`disabled`）时为 `nil`，JSON 里对应 `"ruleId":null`。
+- `ConditionExplanation.ActualValue` 同样是 `*string`：属性缺失时为 `nil` 且 `Missing` 为 `true`；显式空字符串时指向 `""` 且 `Missing` 为 `false`——两者在 Go 对象里就可区分，不必等 JSON。
+- `ConditionExplanation.CompareValue` 是 `any`：`eq` 条件装 `string`（上例 `"pro"`），`in` 条件装 `[]string`（上例 `[]string{"", "a", "a"}`）；候选的先后次序、空字符串与重复成员原样保留，不排序、不去重。
+
+#### 解释记录彼此独立，也与配置和上下文独立
+
+每次 `EvaluateExplain` 返回的 `ExplainedResult` 都是一份独立记录：调用方可以长期保存、任意改写其中的文字、实际值或候选列表用于自己的展示，改动只属于手里这一份——不会回流到 `Config` 或 `Context`，不会串到另一份已取得的记录，也不会改变之后的任何求值。反过来，换用上下文再次求值时，之前保存的记录仍保留当时的内容。前后对照：
+
+```go
+saved := flag.EvaluateExplain(ctxEmpty)   // ctxEmpty 是“显式空字符串”的上下文
+snap, _ := payflow.MarshalExplain(saved)  // 保存当时的完整输出
+other := flag.EvaluateExplain(ctxEmpty)   // 同配置同上下文的另一份记录
+
+// 按展示需要改写 saved：依据文字、in 候选列表、实际值
+saved.Explanation.Outcome = "rewritten by the caller for display"
+saved.Explanation.Rules[0].Conditions[1].CompareValue = []string{"z"}
+*saved.Explanation.Rules[0].Conditions[1].ActualValue = "HACKED"
+
+// other 与重新求值都不受影响；换上下文求值也不覆盖 saved
+fresh, _ := payflow.MarshalExplain(flag.EvaluateExplain(ctxMissing))
+fmt.Println(string(fresh)) // 仍是 missing 上下文的真实结果（见下）
+fmt.Println(string(snap))  // saved 保存时的内容，逐字不变
+```
+
+输出（与上文两次求值的结果逐字一致）：
+
+```
+{"key":"new-checkout","value":true,"reason":"default","ruleId":null,"explanation":{"outcome":"no rule matched; the flag default is used","rules":[{"ruleId":"r-block","match":false,"conditions":[{"attribute":"plan","op":"eq","compareValue":"pro","actualValue":"pro","missing":false,"match":true},{"attribute":"tier","op":"in","compareValue":["","a","a"],"actualValue":null,"missing":true,"match":false}]}]}}
+{"key":"new-checkout","value":false,"reason":"rule","ruleId":"r-block","explanation":{"outcome":"first matching rule \"r-block\" decides the result; later rules are not considered","rules":[{"ruleId":"r-block","match":true,"conditions":[{"attribute":"plan","op":"eq","compareValue":"pro","actualValue":"pro","missing":false,"match":true},{"attribute":"tier","op":"in","compareValue":["","a","a"],"actualValue":"","missing":false,"match":true}]}]}}
+```
+
+注意“独立记录”指的是**两次调用各自返回的对象**。普通的 Go 结构赋值只是浅拷贝：
+
+```go
+alias := saved // 不是第二份记录：嵌套的切片、指针仍与 saved 共享
+```
+
+`alias` 与 `saved` 的 `Explanation.Rules` 切片、`ActualValue` 指针指向同一份底层数据，改一个另一个跟着变。要两份互不影响的记录，必须像上面的 `saved` 与 `other` 那样各自调用一次 `EvaluateExplain`。
+
+#### 失败时如何结束
+
+求值只在输入完整通过校验之后发生；任何一步失败都通过 `error`（或 `Find` 的 `nil`）结束，不产出求值结果：
+
+```go
+_, err := payflow.LoadConfig("no-such-file.json")
+// cannot read config file "no-such-file.json": open no-such-file.json: no such file or directory
+
+_, err = payflow.ParseContext([]byte(`{"plan":1}`))
+// context.plan: value must be a string
+```
+
+读取与校验给出的具体错误原样返回给调用方，此时**不要**继续求值——没有可用的 `Config`/`Context`。查不到指定开关时 `Find` 返回 `nil`：
+
+```go
+flag := cfg.Find("no-such-flag")
+if flag == nil {
+	// 明确按“未找到”处理：它不是 false，也不存在可求值的开关
+}
+```
+
+未找到不是求值结果：不要把 `nil` 当成“开关返回 false”继续走业务逻辑。反过来，合法规则命中返回 `false`（如上例 `context-go-empty.json` 的 `{"value":false,"reason":"rule",...}`）是一次**成功**的求值——`Evaluate`/`EvaluateExplain` 不返回错误，它与“输入被拒绝”或“开关不存在”是三件不同的事。
+
 ## 技术方向
 
 wallet, paymaster, eip4337, account-abstraction, payment-channel, bundler, custody
