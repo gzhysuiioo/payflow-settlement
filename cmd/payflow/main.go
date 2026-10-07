@@ -376,12 +376,17 @@ func cmdReconcile(args []string, stdin io.Reader, stdout, stderr io.Writer) int 
 	defer l.Close()
 
 	// 对账只读：不改余额、历史或账本文件。边界非法同样整次拒绝、不输出部分
-	// 报告；输入有差异仍是正常结果，退出码 0。
+	// 报告；输入有差异（字段差异、重复流水、缺失记录）仍是正常结果，退出码 0。
+	// 报告交付阶段失败（写错误或短写，含末尾换行；即使全部流水完全匹配）：
+	// 退出码 1，storage_error 信封只写标准错误；已交付的部分报告留在标准输出，
+	// 不追加错误 JSON、空报告或成功提示，也不重新输出整份报告。
 	report, err := l.ReconcileFlowRanged(entries, bounds)
 	if err != nil {
 		return failWithError(stderr, err)
 	}
-	writeJSON(stdout, report)
+	if err := writeJSON(stdout, report); err != nil {
+		return failEnvelope(stderr, payflow.ErrStorage, "write reconcile report to standard output: "+err.Error())
+	}
 	return 0
 }
 
