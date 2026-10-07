@@ -155,6 +155,13 @@ func failOutput(stderr io.Writer, err error) int {
 	return failEnvelope(stderr, payflow.ErrStorage, "write result to standard output: "+err.Error())
 }
 
+// failReconcileOutput 报告对账报告交付阶段（写标准输出）的失败：与 failOutput
+// 同样只把错误信封写到标准错误；接收方可能已拿到一段报告，标准输出保持已交付
+// 内容原样，不追加错误 JSON、空报告或成功提示，也不重新输出整份报告。
+func failReconcileOutput(stderr io.Writer, err error) int {
+	return failEnvelope(stderr, payflow.ErrStorage, "write reconcile report to standard output: "+err.Error())
+}
+
 // ledgerFlagSet 构造 -l/--ledger、-f/--file 标志。
 func ledgerFlagSet(name string) (*flag.FlagSet, *string, *string) {
 	fs := flag.NewFlagSet(name, flag.ContinueOnError)
@@ -381,7 +388,12 @@ func cmdReconcile(args []string, stdin io.Reader, stdout, stderr io.Writer) int 
 	if err != nil {
 		return failWithError(stderr, err)
 	}
-	writeJSON(stdout, report)
+	// 报告交付阶段失败（写错误或短写，含末尾换行）：退出码 1，错误信封只写
+	// 标准错误；已交付的部分报告保留在标准输出，不补写也不重发。只有整份
+	// 报告及末尾换行都完整写出才算交付成功，返回退出码 0。
+	if err := writeJSON(stdout, report); err != nil {
+		return failReconcileOutput(stderr, err)
+	}
 	return 0
 }
 
