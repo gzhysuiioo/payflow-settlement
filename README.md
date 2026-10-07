@@ -196,6 +196,172 @@ payflow query -l ./ledger.json
 每条退款可追溯原结算（`settlement_id`），并记录退回的账户、资产、金额、
 手续费、退款总额与原因。
 
+### Go：直接调用 Ledger.Submit 用本地账本付款
+
+不想经过命令行的 Go 调用者可以直接用 `payflow.CreateLedger` /
+`payflow.Open` / `(*Ledger).Submit` / `(*Ledger).Query`。**余额和成功
+记录都由账本保存**：每次成功付款都在同一个原子写入中扣减余额并追加结算
+记录，程序关闭后重新 `Open` 仍是扣款后的状态；调用者从查询结果读余额即可，
+无须像下文旧版 `Execute` 示例那样自己维护和扣减余额。
+
+注意 `Submit` 返回的 `error == nil` **只代表批次本身合法**，不代表每项
+付款都成功：合法批次中的逐项成败（余额不足、超限等）都在
+`BatchResult.Results` 里，必须按输入顺序逐个读取 `Status`。
+
+```go
+package main
+
+import (
+	"fmt"
+	"log"
+	"os"
+	"path/filepath"
+
+	"github.com/gzhysuiioo/payflow-settlement/payflow"
+)
+
+// PaymentIntent.Amount 是 *int64：用辅助函数传值。
+// 缺省（nil）与 0 语义不同，nil 会被判为参数错误。
+func amount(v int64) *int64 { return &v }
+
+func main() {
+	// 1) 在尚未占用的路径初始化账本：一个账户、一种资产、余额 100。
+	dir, err := os.MkdirTemp("", "payflow-submit-")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+	path := filepath.Join(dir, "ledger.json")
+
+	if err := payflow.CreateLedger(path, []payflow.BalanceInit{
+		{Account: "aa-1", Asset: "usdc", Balance: 100},
+	}); err != nil {
+		log.Fatalf("init: kind=%s: %v", payflow.KindOf(err), err)
+	}
+
+	// 2) 打开账本。余额与成功记录都由账本保存，进程退出后重开仍在。
+	ledger, err := payflow.Open(path)
+	if err != nil {
+		log.Fatalf("open: kind=%s: %v", payflow.KindOf(err), err)
+	}
+	defer ledger.Close() // 结束时关闭句柄
+
+	// 3) 提交有序批次：费率 1000 基点（10%），本批次扣款上限 88。
+	//    ChargeLimit.MaxCharged 同样是 *int64，必须显式提供：
+	//    nil 表示“没有这条限额”，0 才是“禁止该组合新增扣款”。
+	maxCharged := int64(88)
+	result, err := ledger.Submit(payflow.FeeBatch{
+		FeeBps: 1000,
+		Limits: []payflow.ChargeLimit{
+			{Account: "aa-1", Asset: "usdc", MaxCharged: &maxCharged},
+		},
+		Intents: []payflow.PaymentIntent{
+			{ID: "p1", Account: "aa-1", Paymaster: "pm-1", Asset: "usdc", Amount: amount(60), Nonce: 1, State: "pending"},
+			{ID: "p1", Account: "aa-1", Paymaster: "pm-1", Asset: "usdc", Amount: amount(60), Nonce: 1, State: "pending"},
+			{ID: "p2", Account: "aa-1", Paymaster: "pm-1", Asset: "usdc", Amount: amount(30), Nonce: 1, State: "pending"},
+			{ID: "p2", Account: "aa-1", Paymaster: "pm-1", Asset: "usdc", Amount: amount(20), Nonce: 1, State: "pending"},
+		},
+	})
+	if err != nil {
+		// 批次级错误：整批未执行，没有逐项结果。err 是 *payflow.LedgerError，
+		// KindOf 取可机读分类（如 invalid_parameter），Error() 含说明。
+		log.Fatalf("submit: kind=%s: %v", payflow.KindOf(err), err)
+	}
+
+	// 4) 按输入顺序读取逐项结果。err == nil 只代表批次本身合法，
+	//    不代表每项都成功：必须逐个读 Status。失败项 Record 为 nil，
+	//    要先区分 settled / duplicate / 失败，再访问记录详情。
+	for _, item := range result.Results {
+		switch item.Status {
+		case payflow.StatusSettled:
+			fmt.Printf("%s status=settled amount=%d fee=%d charged=%d seq=%d\n",
+				item.ID, item.Record.Amount, item.Record.Fee, item.Record.Charged, item.Record.Seq)
+		case payflow.StatusDuplicate:
+			// 幂等重试：携带 p1 的原结算记录，不再扣款。
+			fmt.Printf("%s status=duplicate original_seq=%d original_charged=%d\n",
+				item.ID, item.Record.Seq, item.Record.Charged)
+		default:
+			// limit_exceeded 等失败项没有 Record，只有状态与原因。
+			fmt.Printf("%s status=%s reason=%q\n", item.ID, item.Status, item.Reason)
+		}
+	}
+
+	// 5) 费率越界是批次级错误：即使一项意图都没有，整批也返回
+	//    invalid_parameter，不执行任何付款、不产生逐项结果。限额不合法同理。
+	if _, err := ledger.Submit(payflow.FeeBatch{FeeBps: 10001}); err != nil {
+		fmt.Printf("bad batch kind=%s\n", payflow.KindOf(err))
+	}
+
+	// 6) 余额和成功记录直接查账本：扣款已经由账本完成，
+	//    调用者不需要像旧版 Execute 那样自己保存、扣减余额。
+	snap, err := ledger.Query()
+	if err != nil {
+		log.Fatalf("query: kind=%s: %v", payflow.KindOf(err), err)
+	}
+	for _, b := range snap.Balances {
+		fmt.Printf("balance %s/%s=%d\n", b.Account, b.Asset, b.Balance)
+	}
+	for _, rec := range snap.Settlements {
+		fmt.Printf("history %s amount=%d fee=%d charged=%d seq=%d\n",
+			rec.ID, rec.Amount, rec.Fee, rec.Charged, rec.Seq)
+	}
+}
+```
+
+输出（金额、上限都以 `int64` 给出；`Amount` 与 `MaxCharged` 是
+`*int64`，必须显式传指针，缺省 `nil` 与 `0` 是两种不同含义）：
+
+```text
+p1 status=settled amount=60 fee=6 charged=66 seq=1
+p1 status=duplicate original_seq=1 original_charged=66
+p2 status=limit_exceeded reason="charge limit exceeded for aa-1/usdc: max_charged 88, used 66, this item charges 33"
+p2 status=settled amount=20 fee=2 charged=22 seq=2
+bad batch kind=invalid_parameter
+balance aa-1/usdc=12
+history p1 amount=60 fee=6 charged=66 seq=1
+history p2 amount=20 fee=2 charged=22 seq=2
+```
+
+逐项解读（费率 1000 基点，手续费 = `amount * 1000 / 10000` 向下取整，
+上限只统计**本批次成功落账的扣款总额**，且每次提交从零累计）：
+
+1. `p1` 付 60：手续费 6，扣款总额 66。本批次已用额度 0 → 66，成功落账，
+   余额 100 → 34，成功序号 `seq=1`。
+2. 原样重复 `p1`：全部付款字段与费率都与原记录相同，返回 `duplicate` 并
+   **携带 p1 的原结算记录**（`seq=1`、`charged=66`）。重复项不扣款、不留
+   新记录、不占额度，已用额度仍是 66。
+3. `p2` 付 30：手续费 3，需扣 33；66 + 33 = 99 > 88，返回
+   `limit_exceeded`。原因里带有该组合的上限 88、已用 66 与本项需扣 33。
+   该项不扣余额、不留成功记录、不占编号，也**不消耗额度**（已用仍为 66），
+   所以后面的较小请求仍能使用 `p2` 这个编号。
+4. `p2` 改付 20：手续费 2，需扣 22；66 + 22 = 88，**计入手续费后恰好
+   等于上限**，“恰好达到”仍允许成功。余额 34 → 12，`seq=2`。
+
+最终余额 12（100 − 66 − 22）直接来自 `Query`；历史里只有 `p1`、`p2`
+两条成功记录——重复项不新增记录，超限项没有成功记录。
+
+**两层失败的区别与读取方式**：
+
+- **批次级失败**：费率越界（不在 0–10000 基点）或限额不合法（账户/资产为空、
+  同一组合重复、`max_charged` 缺省或为负）时，`Submit` 直接返回非空
+  `error`，分类为 `invalid_parameter`，**整批不执行任何付款**，也没有逐项
+  结果（空意图列表同样检查费率和限额）。读取方式：`err` 是
+  `*payflow.LedgerError`，用 `errors.As` 取 `Kind`/`Message`，或直接用
+  `payflow.KindOf(err)` 拿分类字符串。示例中费率 10001 的提交即打印
+  `bad batch kind=invalid_parameter`。
+- **逐项失败**：批次合法时，`Submit` 返回 `nil` error，超限、余额不足等
+  出现在 `Results[i]` 中，整批正常返回、后项继续处理。读取方式：按输入
+  顺序检查每项的 `Status`（如 `payflow.StatusLimitExceeded`），失败原因在
+  `Reason`；失败项 `Record` 为 `nil`，所以要先区分 `settled`、`duplicate`
+  与失败状态，再访问记录详情。
+
+**与旧版 `Execute` 的区别**：旧版 `Execute` 遇到已成功的编号一律返回
+`rejected`（原因 `duplicate settlement attempt`），**不返回原结算记录**，
+改不改字段都一样；本地账本把原样重试识别为 `duplicate` 并**附回原记录**，
+字段有变则报 `conflict`，原记录保持不变。此外 `Execute` 不保存余额，
+连续付款要调用者自己 `balance -= settlement.Charged`；本地账本已完成扣款
+与持久化，调用者查 `Query`/`Balance` 即可。
+
 ### reconcile — 离线流水对账
 
 把外部渠道的有序流水与指定账本逐笔核对。**只读**：不改变余额、历史或账本文件，
