@@ -31,6 +31,7 @@ go test ./...
 - 上下文为属性名到字符串的对象，可为 `{}`，空字符串是合法值；属性缺失即条件不成立。比较区分大小写、不裁剪空白。
 - 字符串中的 `\uXXXX` 转义必须组成完整字符：高代理项只能与紧接着的低代理项配对，孤立的高/低代理项或不完整、顺序错误的配对（无论出现在字段名还是字符串值中）都会使读取失败；真正的 `�`（U+FFFD）仍是合法字符串。
 - 开关键按 JSON 解码后的文字精确查找：配置中同一名称的直接字符写法与合法 `\uXXXX` 转义写法等价，命令行参数则按传入的字面字符串查找、不会再次解码；大小写、首尾空白与组合字符序列都不自动合并。详见下文“开关键的写法与精确查找”。
+- 规则编号 `id` 的唯一性**以单个开关为界**：只要求在同一个开关的 `rules` 内不重复，跨开关可以复用同一编号（开关键的唯一性范围则是整个 `flags` 数组）。因此把规则复制到另一个开关可以保留原 id；在同一个开关中再加入同名规则会让整份配置读取失败。完整配置、命令与报错示例见下文“规则 id 的唯一性范围：复制规则时要不要改编号”。
 - 两个文件会先完整校验（含未选中或已关闭的开关）；任何参数/文件/JSON/字段/唯一性错误都以非零状态退出，标准输出为空，标准错误指出具体字段与位置。
 
 ### 完整示例：多条规则与命中优先级
@@ -245,6 +246,275 @@ config.flags[1].default: field is required
 （用 `go run` 运行时它会在标准错误追加自己的一行 `exit status 1`；程序本身只输出上面那一行。）
 
 把请求的开关键换成合法但已关闭的开关也不会绕过这一步：只要配置中任何开关校验失败，整个命令同样非零退出。只有整份配置通过校验后，关闭的开关才按上一条所述固定返回 `false`。
+
+### 规则 id 的唯一性范围：复制规则时要不要改编号
+
+维护配置时经常要把一条规则复制到别处。结论先给出：
+
+- **复制到另一个开关**：编号可以原样保留。规则 id 的唯一性只在**同一个开关的 `rules` 数组内**检查，不同开关各自维护一套编号，互不相干。
+- **复制到同一个开关**（即该开关出现两条同 id 规则）：整份配置读取失败，任何开关都无法求值。
+- 对照：开关键 `key` 的唯一性范围是整个 `flags` 数组，比规则 id 大一层。规则 id **不是**全局唯一的，复制到新开关不需要改名。
+
+下面用一份贯穿始终的完整配置演示。
+
+#### 跨开关复用同一 id：合法，同一上下文分别命中
+
+把下面这份配置保存为 `config-same-rule-id.json`：两个启用的开关 `auto-sweep` 与 `gas-sponsorship` 各有**一条**规则，两条规则使用**相同的 id `r-plan-pro`**、相同的条件（`plan` 等于 `pro`），但 `value` 相反——前者返回 `true`，后者返回 `false`；两者的 `default` 也特意不同：
+
+```json
+{
+  "flags": [
+    {
+      "key": "auto-sweep",
+      "enabled": true,
+      "default": false,
+      "rules": [
+        {
+          "id": "r-plan-pro",
+          "value": true,
+          "conditions": [
+            {"attribute": "plan", "op": "eq", "value": "pro"}
+          ]
+        }
+      ]
+    },
+    {
+      "key": "gas-sponsorship",
+      "enabled": true,
+      "default": true,
+      "rules": [
+        {
+          "id": "r-plan-pro",
+          "value": false,
+          "conditions": [
+            {"attribute": "plan", "op": "eq", "value": "pro"}
+          ]
+        }
+      ]
+    }
+  ]
+}
+```
+
+`context-plan-pro.json`（两个开关的规则都能命中）：
+
+```json
+{"plan": "pro"}
+```
+
+同一份上下文分别对两个开关求值：
+
+```bash
+go run ./cmd/payflow evaluate config-same-rule-id.json auto-sweep context-plan-pro.json
+go run ./cmd/payflow evaluate config-same-rule-id.json gas-sponsorship context-plan-pro.json
+```
+
+两条结果：
+
+```json
+{"key":"auto-sweep","value":true,"reason":"rule","ruleId":"r-plan-pro"}
+```
+
+```json
+{"key":"gas-sponsorship","value":false,"reason":"rule","ruleId":"r-plan-pro"}
+```
+
+对照着读这两个结果：
+
+- `key` 各不相同，标明结果属于哪个开关；
+- `reason` 都是 `rule`，说明两边都由规则定案，而不是取默认值；
+- `ruleId` 字符串完全相同，都是 `r-plan-pro`——编号重复没有让求值跨开关选择规则，每个开关只在自己的 `rules` 里按条件匹配；
+- 布尔值相反（`true` 与 `false`），各自来自本开关内那条同编号规则的 `value`，而不是默认值（两边的 `default` 都没有被采用）。
+
+因此阅读结果时要**结合开关键识别规则**：`ruleId` 只是“该开关内命中规则的编号”，单凭 `ruleId` 不能把两个开关中的同编号规则当成同一条配置。配对身份是 `key`＋`ruleId`。加 `--explain` 时同样各自独立——例如对 `gas-sponsorship` 解释，记录的仍是它自己那条返回 `false` 的规则：
+
+```bash
+go run ./cmd/payflow evaluate config-same-rule-id.json gas-sponsorship context-plan-pro.json --explain
+```
+
+```json
+{"key":"gas-sponsorship","value":false,"reason":"rule","ruleId":"r-plan-pro","explanation":{"outcome":"first matching rule \"r-plan-pro\" decides the result; later rules are not considered","rules":[{"ruleId":"r-plan-pro","match":true,"conditions":[{"attribute":"plan","op":"eq","compareValue":"pro","actualValue":"pro","missing":false,"match":true}]}]}}
+```
+
+#### 同一开关内重复 id：配置读取失败，没有求值结果
+
+现在把第二条规则加到**同一个开关**里（其余字段都合法，条件也合法），保存为 `config-dup-rule-id.json`：
+
+```json
+{
+  "flags": [
+    {
+      "key": "auto-sweep",
+      "enabled": true,
+      "default": false,
+      "rules": [
+        {
+          "id": "r-plan-pro",
+          "value": true,
+          "conditions": [
+            {"attribute": "plan", "op": "eq", "value": "pro"}
+          ]
+        },
+        {
+          "id": "r-plan-pro",
+          "value": false,
+          "conditions": [
+            {"attribute": "plan", "op": "eq", "value": "pro"}
+          ]
+        }
+      ]
+    }
+  ]
+}
+```
+
+```bash
+go run ./cmd/payflow evaluate config-dup-rule-id.json auto-sweep context-plan-pro.json
+```
+
+这次没有任何求值结果：命令以状态 1 退出，**标准输出为空**，标准错误为一行（用 `go run` 运行时它还会在标准错误追加一行 `exit status 1`；程序本身只输出下面这一行）：
+
+```
+config.flags[0].rules[1].id: duplicate rule id "r-plan-pro" (first at rules[0])
+```
+
+错误指向**第二次出现**该编号的字段 `config.flags[0].rules[1].id`，并提示**第一次出现**的位置 `rules[0]`。这与上一节跨开关的合法情形形成直接对比：两条规则分属不同开关时编号可以相同；同处一个 `rules` 数组时则是错误。
+
+`--explain` 不能跳过或放宽这个唯一性检查，它发生在一切求值之前：
+
+```bash
+go run ./cmd/payflow evaluate config-dup-rule-id.json auto-sweep context-plan-pro.json --explain
+# 退出码仍为 1；标准输出仍为空；标准错误仍是：
+# config.flags[0].rules[1].id: duplicate rule id "r-plan-pro" (first at rules[0])
+```
+
+既没有四字段结果，也没有半截 `explanation`。特别注意：这**不是**“开关返回 `false`”。合法返回 `false` 是退出码 0、标准输出打印 `{"...","value":false,...}` 的成功求值；这里是输入被拒绝、根本没有结果对象。
+
+#### 只改第二条规则的 id：配置重新被接受，首条匹配规则定案
+
+保持规则顺序与条件不变，只把第二条规则的编号改成不同文字，保存为 `config-rule-id-renamed.json`：
+
+```json
+{
+  "flags": [
+    {
+      "key": "auto-sweep",
+      "enabled": true,
+      "default": false,
+      "rules": [
+        {
+          "id": "r-plan-pro",
+          "value": true,
+          "conditions": [
+            {"attribute": "plan", "op": "eq", "value": "pro"}
+          ]
+        },
+        {
+          "id": "r-deny-pro",
+          "value": false,
+          "conditions": [
+            {"attribute": "plan", "op": "eq", "value": "pro"}
+          ]
+        }
+      ]
+    }
+  ]
+}
+```
+
+```bash
+go run ./cmd/payflow evaluate config-rule-id-renamed.json auto-sweep context-plan-pro.json
+```
+
+```json
+{"key":"auto-sweep","value":true,"reason":"rule","ruleId":"r-plan-pro"}
+```
+
+配置重新被接受。同一上下文对两条规则都成立，但结果仍是第一条 `r-plan-pro` 的 `true`：**编号只用于识别规则**（体现在结果的 `ruleId` 与唯一性检查上），求值严格按 `rules` 数组的书写顺序逐条匹配，第一条全部条件成立的规则立即定案。编号不参与排序——即使把第二条命名为字典序更靠前的 `r-aaa`，它也不会被排到前面；把两条规则在数组中的位置互换，结果才会变成第二条的 `false`。`--explain` 的规则列表同样只含首条命中规则：
+
+```json
+{"key":"auto-sweep","value":true,"reason":"rule","ruleId":"r-plan-pro","explanation":{"outcome":"first matching rule \"r-plan-pro\" decides the result; later rules are not considered","rules":[{"ruleId":"r-plan-pro","match":true,"conditions":[{"attribute":"plan","op":"eq","compareValue":"pro","actualValue":"pro","missing":false,"match":true}]}]}}
+```
+
+#### 换一种 JSON 写法不能解决同一开关内的重名
+
+与开关键一样，规则 id 是否同名按 JSON **解码后**的文字判定。在 `config-dup-rule-id.json` 中把第二条规则的 id 改成 `r-plan-\u0070ro`（`\u0070` 是字母 `p` 的合法 Unicode 转义），文件里的写法与第一条不同：
+
+```json
+        {
+          "id": "r-plan-\u0070ro",
+          "value": false,
+          "conditions": [
+            {"attribute": "plan", "op": "eq", "value": "pro"}
+          ]
+        }
+```
+
+但解码后 `r-plan-\u0070ro` 就是 `r-plan-pro`，与直接写字符的第一条同名，得到的仍是同一条重复错误（错误信息引用解码后的文字）：
+
+```
+config.flags[0].rules[1].id: duplicate rule id "r-plan-pro" (first at rules[0])
+```
+
+所以同一开关内的重名冲突无法靠“把某个字母改写成 `\uXXXX`”绕过——直接字符与合法 Unicode 转义是同一编号的两种 JSON 写法而已，必须真正改成不同文字（如上一节的 `r-deny-pro`）。（反过来，用双反斜杠写出的字面文本 `r-plan-\\u0070ro` 解码后含真实反斜杠，是另一个不同的名字；这层区别与开关键完全一致，见下文“字面 `\uXXXX` 文本本身也可以是合法开关键”。）
+
+#### 重复规则位于未选中或已关闭的开关，也会阻止整份配置
+
+规则 id 唯一性是**整份配置**的校验项，对所有开关一视同仁。把重复放进一个本次不会选中、而且已关闭的开关，保存为 `config-dup-in-other-flag.json`——请求目标 `auto-sweep` 本身完全合法，问题出在已关闭的 `legacy-batch` 内部：
+
+```json
+{
+  "flags": [
+    {
+      "key": "auto-sweep",
+      "enabled": true,
+      "default": false,
+      "rules": [
+        {
+          "id": "r-plan-pro",
+          "value": true,
+          "conditions": [
+            {"attribute": "plan", "op": "eq", "value": "pro"}
+          ]
+        }
+      ]
+    },
+    {
+      "key": "legacy-batch",
+      "enabled": false,
+      "default": true,
+      "rules": [
+        {
+          "id": "r-shared",
+          "value": true,
+          "conditions": [
+            {"attribute": "plan", "op": "eq", "value": "pro"}
+          ]
+        },
+        {
+          "id": "r-shared",
+          "value": false,
+          "conditions": [
+            {"attribute": "plan", "op": "eq", "value": "free"}
+          ]
+        }
+      ]
+    }
+  ]
+}
+```
+
+即使请求的是无关且启用的 `auto-sweep`，也拿不到它本来应有的结果：
+
+```bash
+go run ./cmd/payflow evaluate config-dup-in-other-flag.json auto-sweep context-plan-pro.json
+```
+
+```
+config.flags[1].rules[1].id: duplicate rule id "r-shared" (first at rules[0])
+```
+
+退出码 1、标准输出为空；直接请求已关闭的 `legacy-batch`、或给命令加 `--explain`，得到的都是同一行错误。这与上文“关闭的开关与配置校验”一致：未选中、已关闭都不豁免校验，必须先消除同一开关内的重名规则，整份配置才能用于任何求值。
 
 ### 开关键的写法与精确查找
 
