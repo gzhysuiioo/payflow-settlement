@@ -98,6 +98,161 @@ JSON
 已完成的前项不回滚；同一进程多次打开同一路径并发提交按同一本账本串行处理，
 相同编号最终只有一笔成功记录，争用仅够一笔的余额时只有一笔成功。
 
+### Go 示例：直接使用 Ledger.Submit 用本地账本付款
+
+Go 调用者不必经过命令行：`CreateLedger` 在尚未占用的路径初始化余额，
+`Open` 打开账本，`Ledger.Submit(FeeBatch)` 提交有序批次，`Query` 读回
+余额与成功记录。**账本自己保存余额和成功记录并在每笔成功时原子落盘**，
+调用者只需在结束时 `Close` 句柄。
+
+特别注意：`Submit` 返回的错误为 `nil` 只表示**批次本身合法并被受理**，
+绝不代表每项付款都成功——重复、超限、余额不足等都出现在逐项结果中，
+调用者仍必须按输入顺序读取每一项的 `Status`。
+
+```go
+package main
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+
+	"github.com/gzhysuiioo/payflow-settlement/payflow"
+)
+
+// PaymentIntent.Amount 与 ChargeLimit.MaxCharged 在公开类型中都是 *int64：
+// 用指针区分“未提供/null”与显式给出的 0（显式 0 金额非法；
+// 显式 max_charged=0 表示禁止该组合新增扣款）。构造时取 int64 变量地址即可。
+func intPtr(v int64) *int64 { return &v }
+
+func main() {
+	// 在尚未占用的路径初始化：只用一个账户的一种资产，余额 100。
+	path := filepath.Join(os.TempDir(), "payflow-submit-example.json")
+	_ = os.Remove(path) // 仅为让示例可重复运行；真实程序不要删除已有账本
+	if err := payflow.CreateLedger(path, []payflow.BalanceInit{
+		{Account: "aa-1", Asset: "usdc", Balance: 100},
+	}); err != nil {
+		panic(err) // 路径已占用时分类是 ledger_exists
+	}
+
+	l, err := payflow.Open(path)
+	if err != nil {
+		panic(err)
+	}
+	defer l.Close() // 结束时关闭账本句柄
+
+	// 费率 1000 基点（10%），本批次 aa-1/usdc 扣款上限 88（含手续费）。
+	// 有序请求：p1 支付 60 → 原样重复 p1 → p2 支付 30 → 同一 p2 支付 20。
+	res, err := l.Submit(payflow.FeeBatch{
+		FeeBps: 1000,
+		Limits: []payflow.ChargeLimit{
+			{Account: "aa-1", Asset: "usdc", MaxCharged: intPtr(88)},
+		},
+		Intents: []payflow.PaymentIntent{
+			{ID: "p1", Account: "aa-1", Paymaster: "pm-1", Asset: "usdc", Amount: intPtr(60)},
+			{ID: "p1", Account: "aa-1", Paymaster: "pm-1", Asset: "usdc", Amount: intPtr(60)},
+			{ID: "p2", Account: "aa-1", Paymaster: "pm-1", Asset: "usdc", Amount: intPtr(30)},
+			{ID: "p2", Account: "aa-1", Paymaster: "pm-1", Asset: "usdc", Amount: intPtr(20)},
+		},
+	})
+	if err != nil {
+		panic(err) // 整批被拒（费率越界、限额不合法等）时 res 为 nil
+	}
+
+	// 按输入顺序逐项处理：先区分成功、重复与失败，再访问记录详情。
+	for _, r := range res.Results {
+		switch r.Status {
+		case payflow.StatusSettled, payflow.StatusDuplicate:
+			// 只有 settled / duplicate 保证 Record 非 nil；
+			// duplicate 携带的就是 p1 的原记录（同一 seq、同一扣款额）。
+			fmt.Printf("%-3s %-15s amount=%d fee=%d charged=%d seq=%d\n",
+				r.ID, r.Status, r.Record.Amount, r.Record.Fee, r.Record.Charged, r.Record.Seq)
+		default:
+			// 其余状态没有记录：失败原因读 r.Reason，不要解引用 r.Record。
+			fmt.Printf("%-3s %-15s reason=%q\n", r.ID, r.Status, r.Reason)
+		}
+	}
+
+	// 余额与成功记录都已由账本保存并落盘：直接查询读回，
+	// 无须像旧版 Execute 示例那样自行维护和扣减余额。
+	snap, err := l.Query()
+	if err != nil {
+		panic(err)
+	}
+	for _, b := range snap.Balances {
+		fmt.Printf("balance %s/%s=%d\n", b.Account, b.Asset, b.Balance)
+	}
+	fmt.Printf("settlement history: %d record(s)\n", len(snap.Settlements))
+	for _, r := range snap.Settlements {
+		fmt.Printf("  seq=%d %s amount=%d fee=%d charged=%d\n", r.Seq, r.ID, r.Amount, r.Fee, r.Charged)
+	}
+}
+```
+
+输出（手续费 = 金额×1000/10000，向下取整）：
+
+```text
+p1  settled         amount=60 fee=6 charged=66 seq=1
+p1  duplicate       amount=60 fee=6 charged=66 seq=1
+p2  limit_exceeded  reason="charge limit exceeded for aa-1/usdc: max_charged 88, used 66, this item charges 33"
+p2  settled         amount=20 fee=2 charged=22 seq=2
+balance aa-1/usdc=12
+settlement history: 2 record(s)
+  seq=1 p1 amount=60 fee=6 charged=66
+  seq=2 p2 amount=20 fee=2 charged=22
+```
+
+**限额如何累计**：上限只统计本次批次内**成功落账**的扣款（付款金额连同
+手续费），从零累计：
+
+1. `p1` 付 60：手续费 6，扣款总额 66 ≤ 88，成功；本批次已用 66，余额 100 → 34。
+2. 原样重复的 `p1`：全部付款字段与费率都与原请求相同，判为 `duplicate`，
+   **返回 p1 的原记录**（seq、金额、手续费、扣款额完全一致），不发生新扣款，
+   已用额度仍为 66。
+3. `p2` 付 30：手续费 3，需扣 33；66 + 33 = 99 > 88，判为
+   `limit_exceeded`，原因里带有该组合的上限 88、已用 66 与本项需扣 33。
+   该项不扣余额、不留成功记录、不占编号也不消耗额度——已用仍是 66。
+4. 同一编号 `p2` 改成付 20：失败不占编号，所以这是一项全新请求；
+   手续费 2，需扣 22，66 + 22 = 88 **恰好等于上限**——累计等于上限仍允许
+   成功，于是判为 `settled`，余额 34 → 12，已用额度到 88 用满。
+
+最终查询：余额 12，成功历史只有 `p1`、`p2` 两条（重复项不新增记录，
+超限项没有成功记录）。这也印证了余额来自查询结果、账本早已完成扣款，
+调用者不需要自己保存或扣减余额。
+
+**两层失败要分开处理**：
+
+- **整批错误（`Submit` 返回非 nil error，结果为 nil，不执行任何付款）**：
+  费率越界（不在 0–10000 基点）或限额不合法（账户/资产为空、同一组合重复、
+  `max_charged` 缺省或为负）都在批次执行前校验，整批返回
+  `invalid_parameter`，即使意图列表为空也一样检查，任何一项都不会执行。
+  分类与说明这样读取：
+
+  ```go
+  res, err := l.Submit(batch)
+  if err != nil {
+      var le *payflow.LedgerError
+      if errors.As(err, &le) {
+          // le.Kind 是可机读分类，如 invalid_parameter / ledger_closed；
+          // le.Message 是人类可读说明。也可以直接用 payflow.KindOf(err)。
+      }
+      return // 没有逐项结果可读
+  }
+  ```
+
+- **逐项失败（`Submit` 正常返回，error 为 nil）**：合法批次中的
+  `limit_exceeded`、`insufficient_balance`、`state_error`、`conflict` 等
+  都只落在对应项的 `Status` 上，原因读该项的 `Reason` 字段；整批照常返回，
+  后项继续处理，前面成功的扣款也已落盘。访问 `Record` 前必须先确认状态是
+  `settled` 或 `duplicate`，其余状态 `Record` 为 nil。
+
+**与旧版 `Execute` 的区别**：旧版 `Execute` 对已成功的重复编号一律返回
+`rejected`（原因 `duplicate settlement attempt`），且**不返回原结算记录**，
+改不改字段都一样；本地账本把“原样重试”识别为 `duplicate` 并**附回原记录**、
+不新增扣款，把“同编号但字段或费率变化”识别为 `conflict`、原记录保持不变。
+此外旧接口的余额与编号表要调用者自己维护，本地账本则由 `Query` 直接读回
+已持久化的余额与成功历史。
+
 ### submit --dry-run — 扣款前预览结算结果
 
 在真正扣款前，可在 `submit` 命令上添加 `--dry-run`，沿用账本路径、
